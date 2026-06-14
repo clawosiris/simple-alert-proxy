@@ -1201,7 +1201,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "signoz-alert-proxy"
+name = "simple-alert-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",

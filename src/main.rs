@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_app(Arc::clone(&config), webhook_path.clone())?;
 
-    info!(%bind_addr, %webhook_path, tls = config.server.tls.is_some(), "starting signoz-alert-proxy");
+    info!(%bind_addr, %webhook_path, tls = config.server.tls.is_some(), "starting simple-alert-proxy");
 
     if let Some(tls_config) = &config.server.tls {
         tls::serve_tls(bind_addr, app, tls_config).await?;

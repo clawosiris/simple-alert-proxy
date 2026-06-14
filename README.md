@@ -1,4 +1,4 @@
-# signoz-alert-proxy
+# simple-alert-proxy
 
 A small Rust service that accepts SigNoz alert webhooks, evaluates configurable routing rules, and forwards matching notifications to Google Chat webhooks.
 
@@ -31,10 +31,10 @@ curl -X POST http://127.0.0.1:8080/webhooks/signoz \
 ## Container Build
 
 ```bash
-podman build -t signoz-alert-proxy:local .
+podman build -t simple-alert-proxy:local .
 podman run --rm -p 8080:8080 \
-  -v ./examples/config.yaml:/etc/signoz-alert-proxy/config.yaml:ro,Z \
-  signoz-alert-proxy:local
+  -v ./examples/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z \
+  simple-alert-proxy:local
 ```
 
 ## Configuration

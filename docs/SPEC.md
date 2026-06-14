@@ -1,4 +1,4 @@
-# SigNoz Alert Proxy Spec
+# Simple Alert Proxy Spec
 
 ## Goal
 
@@ -60,8 +60,8 @@ TLS is optional.
 server:
   bind: "0.0.0.0:8443"
   tls:
-    cert_path: "/etc/signoz-alert-proxy/tls.crt"
-    key_path: "/etc/signoz-alert-proxy/tls.key"
+    cert_path: "/etc/simple-alert-proxy/tls.crt"
+    key_path: "/etc/simple-alert-proxy/tls.key"
 ```
 
 If `server.tls` is omitted, the service listens over plain HTTP. In production, either enable native TLS or run behind a TLS-terminating reverse proxy.

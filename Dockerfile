@@ -10,12 +10,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --create-home --home-dir /var/lib/signoz-alert-proxy signoz-alert-proxy
+RUN useradd --system --create-home --home-dir /var/lib/simple-alert-proxy simple-alert-proxy
 
-COPY --from=build /app/target/release/signoz-alert-proxy /usr/local/bin/signoz-alert-proxy
+COPY --from=build /app/target/release/simple-alert-proxy /usr/local/bin/simple-alert-proxy
 
-USER signoz-alert-proxy
+USER simple-alert-proxy
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/signoz-alert-proxy"]
-CMD ["--config", "/etc/signoz-alert-proxy/config.yaml"]
+ENTRYPOINT ["/usr/local/bin/simple-alert-proxy"]
+CMD ["--config", "/etc/simple-alert-proxy/config.yaml"]
