@@ -1,6 +1,7 @@
 use crate::{config::GoogleChatReceiverConfig, routing::Delivery, signoz::SigNozAlert};
 use reqwest::StatusCode;
 use serde_json::json;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct GoogleChatClient {
@@ -27,6 +28,7 @@ impl GoogleChatClient {
         let response = self
             .http
             .post(&receiver.webhook_url)
+            .timeout(Duration::from_secs(receiver.timeout_secs))
             .json(&message)
             .send()
             .await?;

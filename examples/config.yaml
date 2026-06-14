@@ -1,6 +1,9 @@
 server:
   bind: "127.0.0.1:8080"
   webhook_path: "/webhooks/signoz"
+  max_body_bytes: 1048576
+  auth:
+    bearer_token: "replace-me"
   # tls:
   #   cert_path: "/etc/signoz-alert-proxy/tls.crt"
   #   key_path: "/etc/signoz-alert-proxy/tls.key"
@@ -28,13 +31,16 @@ receivers:
     type: "google_chat"
     webhook_url: "https://chat.googleapis.com/v1/spaces/example/messages?key=example&token=example"
     title_template: "[{{status}}] {{alertname}}"
+    timeout_secs: 10
 
   critical-chat:
     type: "google_chat"
     webhook_url: "https://chat.googleapis.com/v1/spaces/critical/messages?key=example&token=example"
     title_template: "CRITICAL {{alertname}}"
+    timeout_secs: 10
 
   database-chat:
     type: "google_chat"
     webhook_url: "https://chat.googleapis.com/v1/spaces/database/messages?key=example&token=example"
     title_template: "DB {{alertname}}"
+    timeout_secs: 10

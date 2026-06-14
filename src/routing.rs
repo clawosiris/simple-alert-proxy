@@ -177,6 +177,8 @@ mod tests {
             server: crate::config::ServerConfig {
                 bind: "127.0.0.1:0".to_string(),
                 webhook_path: "/webhooks/signoz".to_string(),
+                max_body_bytes: 1024 * 1024,
+                auth: None,
                 tls: None,
             },
             routing: RoutingConfig {
@@ -199,6 +201,7 @@ mod tests {
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "https://chat.googleapis.test/prod".to_string(),
                         title_template: "[{{status}}] {{alertname}}".to_string(),
+                        timeout_secs: 10,
                     }),
                 ),
                 (
@@ -206,6 +209,7 @@ mod tests {
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "https://chat.googleapis.test/default".to_string(),
                         title_template: "[{{status}}] {{alertname}}".to_string(),
+                        timeout_secs: 10,
                     }),
                 ),
             ]),

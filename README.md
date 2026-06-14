@@ -8,6 +8,8 @@ This repo starts as a spec-backed scaffold: the application shape, config schema
 
 - Accept SigNoz alert webhook payloads at `POST /webhooks/signoz`
 - Optional HTTPS listener with certificate/key paths
+- Optional bearer-token authentication for inbound webhooks
+- Request body size limits and outbound receiver timeouts
 - Parse Alertmanager-style SigNoz alert payloads
 - Route alerts by status, labels, annotations, or JSON payload fields
 - Send routed alerts to Google Chat incoming webhooks
@@ -22,6 +24,7 @@ cargo run -- --config examples/config.yaml
 ```bash
 curl -X POST http://127.0.0.1:8080/webhooks/signoz \
   -H 'content-type: application/json' \
+  -H 'authorization: Bearer replace-me' \
   --data @examples/signoz-webhook.json
 ```
 
@@ -39,11 +42,14 @@ Implemented:
 - Routing engine with exact, contains, and regex matchers
 - Google Chat webhook client
 - TLS config loading path
+- Bearer auth, body limits, and receiver timeouts
+- Unit/integration-style tests with a local mock Google Chat endpoint
+- GitHub Actions CI
+- Dockerfile
 
 Still expected before production use:
 
-- Integration tests against a local HTTP receiver
 - More exact SigNoz payload fixtures from a real deployment
 - Structured Google Chat cards instead of plain text only
 - Delivery retry policy and dead-letter handling
-- Authentication for inbound webhooks
+- HMAC request signing if SigNoz can support it

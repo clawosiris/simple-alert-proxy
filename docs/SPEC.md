@@ -20,6 +20,7 @@ The service is a single Rust binary.
 - Config format: YAML
 - Outbound HTTP: Reqwest using Rustls
 - TLS serving: Rustls with PEM certificate and private key files
+- Inbound authentication: optional bearer token
 
 ## HTTP API
 
@@ -49,6 +50,8 @@ Success returns `202 Accepted` with a delivery summary:
 
 Invalid payloads return `400`. Receiver failures return `502`.
 
+If bearer authentication is enabled, missing or invalid credentials return `401`.
+
 ## TLS
 
 TLS is optional.
@@ -62,6 +65,42 @@ server:
 ```
 
 If `server.tls` is omitted, the service listens over plain HTTP. In production, either enable native TLS or run behind a TLS-terminating reverse proxy.
+
+## Inbound Authentication
+
+Bearer authentication is optional but recommended for every exposed deployment.
+
+```yaml
+server:
+  auth:
+    bearer_token: "replace-me"
+```
+
+SigNoz should send:
+
+```http
+Authorization: Bearer replace-me
+```
+
+The current implementation uses a shared secret. If SigNoz can emit signed webhooks in the target deployment, HMAC verification should replace or complement this.
+
+## Limits And Timeouts
+
+The service rejects request bodies larger than `server.max_body_bytes`.
+
+```yaml
+server:
+  max_body_bytes: 1048576
+```
+
+Google Chat receivers use `timeout_secs` to bound outbound delivery time.
+
+```yaml
+receivers:
+  default-chat:
+    type: google_chat
+    timeout_secs: 10
+```
 
 ## Routing
 
@@ -105,6 +144,7 @@ receivers:
     type: google_chat
     webhook_url: "https://chat.googleapis.com/v1/spaces/..."
     title_template: "[{{status}}] {{alertname}}"
+    timeout_secs: 10
 ```
 
 The first implementation sends plain text messages. A later iteration should support Google Chat cards with sections for labels, annotations, and instance links.
@@ -113,11 +153,11 @@ The first implementation sends plain text messages. A later iteration should sup
 
 Required before production:
 
-- Add shared-secret or HMAC verification for inbound SigNoz webhooks
+- Configure bearer authentication for inbound SigNoz webhooks
+- Prefer HMAC verification if the deployed SigNoz webhook path supports it
 - Redact webhook URLs in logs
 - Avoid logging full alert payloads by default
-- Set request body size limits
-- Add receiver timeout and retry limits
+- Add receiver retry limits and optional dead-letter handling
 
 ## Observability
 

@@ -24,12 +24,31 @@ impl AppConfig {
             bail!("at least one receiver must be configured");
         }
 
+        if self.server.max_body_bytes == 0 {
+            bail!("server.max_body_bytes must be greater than zero");
+        }
+
+        if let Some(auth) = &self.server.auth
+            && auth.bearer_token.is_empty()
+        {
+            bail!("server.auth.bearer_token must not be empty");
+        }
+
         if let Some(default_receiver) = &self.routing.default_receiver {
             self.require_receiver(default_receiver)?;
         }
 
         for route in &self.routing.routes {
             self.require_receiver(&route.receiver)?;
+        }
+
+        for (name, receiver) in &self.receivers {
+            match receiver {
+                ReceiverConfig::GoogleChat(receiver) if receiver.timeout_secs == 0 => {
+                    bail!("receiver {name} timeout_secs must be greater than zero")
+                }
+                ReceiverConfig::GoogleChat(_) => {}
+            }
         }
 
         Ok(())
@@ -50,7 +69,15 @@ pub struct ServerConfig {
     pub bind: String,
     #[serde(default = "default_webhook_path")]
     pub webhook_path: String,
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+    pub auth: Option<AuthConfig>,
     pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    pub bearer_token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +122,8 @@ pub struct GoogleChatReceiverConfig {
     pub webhook_url: String,
     #[serde(default = "default_title_template")]
     pub title_template: String,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 fn default_bind() -> String {
@@ -105,6 +134,14 @@ fn default_webhook_path() -> String {
     "/webhooks/signoz".to_string()
 }
 
+fn default_max_body_bytes() -> usize {
+    1024 * 1024
+}
+
 fn default_title_template() -> String {
     "[{{status}}] {{alertname}}".to_string()
+}
+
+fn default_timeout_secs() -> u64 {
+    10
 }
