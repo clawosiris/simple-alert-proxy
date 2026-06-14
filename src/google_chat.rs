@@ -20,10 +20,15 @@ impl GoogleChatClient {
         receiver: &GoogleChatReceiverConfig,
         alert: &SigNozAlert,
         delivery: &Delivery,
+        debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
         let message = json!({
             "text": format_message(receiver, alert, delivery),
         });
+
+        if let Some(debug) = debug {
+            log_outgoing_alert(&message, debug);
+        }
 
         let response = self
             .http
@@ -37,6 +42,27 @@ impl GoogleChatClient {
             Ok(())
         } else {
             Err(GoogleChatError::Rejected(response.status()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DebugDeliveryLog<'a> {
+    pub route_name: &'a str,
+    pub receiver_name: &'a str,
+}
+
+fn log_outgoing_alert(message: &serde_json::Value, debug: DebugDeliveryLog<'_>) {
+    let log = json!({
+        "route": debug.route_name,
+        "receiver": debug.receiver_name,
+        "payload": message,
+    });
+
+    match serde_json::to_string_pretty(&log) {
+        Ok(json) => eprintln!("simple-alert-proxy debug outgoing alert:\n{json}"),
+        Err(error) => {
+            eprintln!("simple-alert-proxy debug outgoing alert: failed to render JSON: {error}")
         }
     }
 }

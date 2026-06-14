@@ -13,6 +13,7 @@ This repo starts as a spec-backed scaffold: the application shape, config schema
 - Parse Alertmanager-style SigNoz alert payloads
 - Route alerts by status, labels, annotations, or JSON payload fields
 - Send routed alerts to Google Chat incoming webhooks
+- Optional debug mode that logs incoming and outgoing alert payloads to stderr
 - Configure the service from a YAML file
 
 ## Quick Start
@@ -63,6 +64,15 @@ sudo systemctl enable --now simple-alert-proxy.service
 
 See [examples/config.yaml](examples/config.yaml) for a working example and [docs/SPEC.md](docs/SPEC.md) for the full contract.
 
+To log incoming webhook payloads and outgoing receiver payloads to stderr:
+
+```yaml
+debug:
+  log_alerts: true
+```
+
+Only enable this while debugging. Alert payloads can contain sensitive labels, annotations, and incident context.
+
 ## Current Status
 
 Implemented:
@@ -74,6 +84,7 @@ Implemented:
 - Google Chat webhook client
 - TLS config loading path
 - Bearer auth, body limits, and receiver timeouts
+- Debug alert payload logging
 - Unit/integration-style tests with a local mock Google Chat endpoint
 - GitHub Actions CI
 - Dockerfile

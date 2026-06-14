@@ -8,6 +8,9 @@ server:
   #   cert_env: "SIMPLE_ALERT_PROXY_TLS_CERT_PEM"
   #   key_env: "SIMPLE_ALERT_PROXY_TLS_KEY_PEM"
 
+debug:
+  log_alerts: false
+
 routing:
   default_receiver: "default-chat"
   routes:

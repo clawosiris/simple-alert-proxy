@@ -109,6 +109,19 @@ receivers:
     timeout_secs: 10
 ```
 
+## Debug Logging
+
+Debug alert logging is disabled by default.
+
+```yaml
+debug:
+  log_alerts: true
+```
+
+When enabled, the service writes the raw incoming webhook payload and each outgoing receiver payload to stderr as pretty-printed JSON. Outgoing logs include the route and receiver names but do not include receiver webhook URLs.
+
+Only enable this for debugging. Alert payloads can contain sensitive labels, annotations, and incident context.
+
 ## Routing
 
 Routes are evaluated in order. Every matcher on a route must match. A route can stop evaluation or allow later routes with `continue_matching`.

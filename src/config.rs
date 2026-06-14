@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, env, fs, path::Path};
 pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
+    pub debug: DebugConfig,
+    #[serde(default)]
     pub routing: RoutingConfig,
     #[serde(default)]
     pub receivers: BTreeMap<String, ReceiverConfig>,
@@ -82,6 +84,12 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     pub bearer_token: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DebugConfig {
+    #[serde(default)]
+    pub log_alerts: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

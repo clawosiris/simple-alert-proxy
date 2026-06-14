@@ -21,7 +21,7 @@ mod tls;
 
 use crate::{
     config::AppConfig,
-    google_chat::GoogleChatClient,
+    google_chat::{DebugDeliveryLog, GoogleChatClient},
     routing::{DeliveryPlan, RouteEngine},
     signoz::SigNozAlert,
 };
@@ -106,6 +106,10 @@ async fn handle_signoz_webhook(
     authorize(&state, &headers)?;
 
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
+    if state.config.debug.log_alerts {
+        log_debug_json("incoming alert", &payload);
+    }
+
     let alert = SigNozAlert::from_value(payload)?;
     let plan = state.router.plan(&alert);
 
@@ -124,7 +128,14 @@ async fn handle_signoz_webhook(
 
         match receiver {
             config::ReceiverConfig::GoogleChat(receiver) => {
-                state.google_chat.send(receiver, &alert, delivery).await?;
+                let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
+                    route_name: delivery.route_name.as_str(),
+                    receiver_name: delivery.receiver.as_str(),
+                });
+                state
+                    .google_chat
+                    .send(receiver, &alert, delivery, debug)
+                    .await?;
             }
         }
     }
@@ -146,6 +157,13 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), WebhookError> 
         Ok(())
     } else {
         Err(WebhookError::Unauthorized)
+    }
+}
+
+fn log_debug_json(label: &str, value: &Value) {
+    match serde_json::to_string_pretty(value) {
+        Ok(json) => eprintln!("simple-alert-proxy debug {label}:\n{json}"),
+        Err(error) => eprintln!("simple-alert-proxy debug {label}: failed to render JSON: {error}"),
     }
 }
 
@@ -190,7 +208,8 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AuthConfig, GoogleChatReceiverConfig, ReceiverConfig, RoutingConfig, ServerConfig,
+        AuthConfig, DebugConfig, GoogleChatReceiverConfig, ReceiverConfig, RoutingConfig,
+        ServerConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -285,6 +304,7 @@ mod tests {
                 }),
                 tls: None,
             },
+            debug: DebugConfig { log_alerts: false },
             routing: RoutingConfig {
                 default_receiver: Some("default-chat".to_string()),
                 routes: vec![config::RouteConfig {
