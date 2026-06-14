@@ -1,0 +1,25 @@
+{
+  "status": "firing",
+  "commonLabels": {
+    "alertname": "HighErrorRate",
+    "environment": "production",
+    "service": "api",
+    "severity": "critical"
+  },
+  "commonAnnotations": {
+    "summary": "API error rate is above threshold",
+    "description": "5xx rate exceeded 5% for 10 minutes."
+  },
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "instance": "api-1"
+      },
+      "annotations": {
+        "summary": "api-1 has elevated 5xx responses"
+      },
+      "startsAt": "2026-06-14T15:00:00Z"
+    }
+  ]
+}
