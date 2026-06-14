@@ -28,6 +28,15 @@ curl -X POST http://127.0.0.1:8080/webhooks/signoz \
   --data @examples/signoz-webhook.json
 ```
 
+## Container Build
+
+```bash
+podman build -t signoz-alert-proxy:local .
+podman run --rm -p 8080:8080 \
+  -v ./examples/config.yaml:/etc/signoz-alert-proxy/config.yaml:ro,Z \
+  signoz-alert-proxy:local
+```
+
 ## Configuration
 
 See [examples/config.yaml](examples/config.yaml) for a working example and [docs/SPEC.md](docs/SPEC.md) for the full contract.
