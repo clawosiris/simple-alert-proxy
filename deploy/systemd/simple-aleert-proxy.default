@@ -1,0 +1,2 @@
+SIMPLE_ALERT_PROXY_TLS_CERT_PATH=/run/secrets/simple-alert-proxy/tls.crt
+SIMPLE_ALERT_PROXY_TLS_KEY_PATH=/run/secrets/simple-alert-proxy/tls.key

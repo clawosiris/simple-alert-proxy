@@ -37,6 +37,29 @@ podman run --rm -p 8080:8080 \
   simple-alert-proxy:local
 ```
 
+## Quadlet Deployment
+
+The repo includes a Quadlet unit at `deploy/systemd/simple-alert-proxy.container`.
+
+It reads TLS path variables from `/etc/defaults/simple-aleert-proxy`:
+
+```bash
+sudo install -D -m 0644 deploy/systemd/simple-alert-proxy.container \
+  /etc/containers/systemd/simple-alert-proxy.container
+sudo install -D -m 0600 deploy/systemd/simple-aleert-proxy.default \
+  /etc/defaults/simple-aleert-proxy
+sudo install -D -m 0644 examples/config.yaml \
+  /etc/simple-alert-proxy/config.yaml
+sudo install -d -m 0750 /etc/simple-alert-proxy/tls
+```
+
+Put `tls.crt` and `tls.key` in `/etc/simple-alert-proxy/tls/`, build or pull the `localhost/simple-alert-proxy:latest` image, then run:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now simple-alert-proxy.service
+```
+
 ## Configuration
 
 See [examples/config.yaml](examples/config.yaml) for a working example and [docs/SPEC.md](docs/SPEC.md) for the full contract.

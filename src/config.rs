@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use serde::Deserialize;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, env, fs, path::Path};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -86,6 +86,36 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
+impl TlsConfig {
+    pub fn resolved_cert_path(&self) -> anyhow::Result<String> {
+        resolve_env_reference(&self.cert_path)
+    }
+
+    pub fn resolved_key_path(&self) -> anyhow::Result<String> {
+        resolve_env_reference(&self.key_path)
+    }
+}
+
+fn resolve_env_reference(value: &str) -> anyhow::Result<String> {
+    if let Some(name) = value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        return env::var(name).with_context(|| format!("environment variable {name} is not set"));
+    }
+
+    if let Some(name) = value.strip_prefix('$')
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return env::var(name).with_context(|| format!("environment variable {name} is not set"));
+    }
+
+    Ok(value.to_string())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RoutingConfig {
     pub default_receiver: Option<String>,
@@ -144,4 +174,24 @@ fn default_title_template() -> String {
 
 fn default_timeout_secs() -> u64 {
     10
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_tls_path_from_env_reference() {
+        let expected = env::var("PATH").unwrap();
+
+        assert_eq!(resolve_env_reference("$PATH").unwrap(), expected);
+    }
+
+    #[test]
+    fn leaves_literal_tls_path_unchanged() {
+        assert_eq!(
+            resolve_env_reference("/etc/simple-alert-proxy/tls.crt").unwrap(),
+            "/etc/simple-alert-proxy/tls.crt"
+        );
+    }
 }

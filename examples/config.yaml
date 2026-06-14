@@ -5,8 +5,8 @@ server:
   auth:
     bearer_token: "replace-me"
   # tls:
-  #   cert_path: "/etc/simple-alert-proxy/tls.crt"
-  #   key_path: "/etc/simple-alert-proxy/tls.key"
+  #   cert_path: "$SIMPLE_ALERT_PROXY_TLS_CERT_PATH"
+  #   key_path: "$SIMPLE_ALERT_PROXY_TLS_KEY_PATH"
 
 routing:
   default_receiver: "default-chat"

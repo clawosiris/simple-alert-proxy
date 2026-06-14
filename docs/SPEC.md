@@ -60,11 +60,13 @@ TLS is optional.
 server:
   bind: "0.0.0.0:8443"
   tls:
-    cert_path: "/etc/simple-alert-proxy/tls.crt"
-    key_path: "/etc/simple-alert-proxy/tls.key"
+    cert_path: "$SIMPLE_ALERT_PROXY_TLS_CERT_PATH"
+    key_path: "$SIMPLE_ALERT_PROXY_TLS_KEY_PATH"
 ```
 
 If `server.tls` is omitted, the service listens over plain HTTP. In production, either enable native TLS or run behind a TLS-terminating reverse proxy.
+
+`cert_path` and `key_path` can be literal paths or whole-value environment references in `$VAR` or `${VAR}` form.
 
 ## Inbound Authentication
 
