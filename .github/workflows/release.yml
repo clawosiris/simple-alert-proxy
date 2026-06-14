@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release artifact
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="simple-alert-proxy-${version}-linux-x86_64"
+          mkdir -p "dist/${asset}"
+          cp target/release/simple-alert-proxy "dist/${asset}/"
+          cp README.md LICENSE "dist/${asset}/"
+          tar -C dist -czf "${asset}.tar.gz" "${asset}"
+          sha256sum "${asset}.tar.gz" > "${asset}.tar.gz.sha256"
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push container image
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          image="$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          sudo podman build \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.version=${version}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${image}:${version}" \
+            -t "${image}:latest" \
+            .
+          sudo podman push "${image}:${version}"
+          sudo podman push "${image}:latest"
+
+      - name: Create release notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          image="$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          cat > release-notes.md <<EOF
+          ## Container Images
+
+          \`\`\`bash
+          podman pull ${image}:${version}
+          podman pull ${image}:latest
+          \`\`\`
+
+          ## Binary Asset
+
+          This release includes a Linux x86_64 binary tarball and SHA-256 checksum.
+          EOF
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            simple-alert-proxy-*.tar.gz \
+            simple-alert-proxy-*.tar.gz.sha256 \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            --verify-tag

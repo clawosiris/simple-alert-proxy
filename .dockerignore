@@ -1,6 +1,9 @@
-target
 .git
 .github
+target
 .env
 config.yaml
 *.log
+*.tar.gz
+*.sha256
+release-notes.md

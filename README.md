@@ -38,6 +38,13 @@ podman run --rm -p 8080:8080 \
   simple-alert-proxy:local
 ```
 
+Release images are published to GitHub Container Registry:
+
+```bash
+podman pull ghcr.io/clawosiris/simple-alert-proxy:0.0.1
+podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
+```
+
 ## Quadlet Deployment
 
 The repo includes a Quadlet unit at `deploy/systemd/simple-alert-proxy.container`.
