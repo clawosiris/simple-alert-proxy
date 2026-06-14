@@ -1,2 +1,2 @@
-SIMPLE_ALERT_PROXY_TLS_CERT_PATH=/run/secrets/simple-alert-proxy/tls.crt
-SIMPLE_ALERT_PROXY_TLS_KEY_PATH=/run/secrets/simple-alert-proxy/tls.key
+SIMPLE_ALERT_PROXY_TLS_CERT_PEM="-----BEGIN CERTIFICATE-----\nreplace-me\n-----END CERTIFICATE-----"
+SIMPLE_ALERT_PROXY_TLS_KEY_PEM="-----BEGIN PRIVATE KEY-----\nreplace-me\n-----END PRIVATE KEY-----"

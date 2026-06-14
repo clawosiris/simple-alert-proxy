@@ -9,7 +9,6 @@ Image=localhost/simple-alert-proxy:latest
 EnvironmentFile=/etc/defaults/simple-aleert-proxy
 PublishPort=8443:8443
 Volume=/etc/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z
-Volume=/etc/simple-alert-proxy/tls:/run/secrets/simple-alert-proxy:ro,Z
 
 [Service]
 Restart=on-failure

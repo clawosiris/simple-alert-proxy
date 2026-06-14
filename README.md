@@ -41,7 +41,7 @@ podman run --rm -p 8080:8080 \
 
 The repo includes a Quadlet unit at `deploy/systemd/simple-alert-proxy.container`.
 
-It reads TLS path variables from `/etc/defaults/simple-aleert-proxy`:
+It reads TLS PEM content variables from `/etc/defaults/simple-aleert-proxy`:
 
 ```bash
 sudo install -D -m 0644 deploy/systemd/simple-alert-proxy.container \
@@ -50,10 +50,9 @@ sudo install -D -m 0600 deploy/systemd/simple-aleert-proxy.default \
   /etc/defaults/simple-aleert-proxy
 sudo install -D -m 0644 examples/config.yaml \
   /etc/simple-alert-proxy/config.yaml
-sudo install -d -m 0750 /etc/simple-alert-proxy/tls
 ```
 
-Put `tls.crt` and `tls.key` in `/etc/simple-alert-proxy/tls/`, build or pull the `localhost/simple-alert-proxy:latest` image, then run:
+Set `SIMPLE_ALERT_PROXY_TLS_CERT_PEM` and `SIMPLE_ALERT_PROXY_TLS_KEY_PEM` in `/etc/defaults/simple-aleert-proxy`. PEM newlines can be escaped as `\n`, which is friendlier for environment files. Build or pull the `localhost/simple-alert-proxy:latest` image, then run:
 
 ```bash
 sudo systemctl daemon-reload

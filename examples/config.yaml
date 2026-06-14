@@ -5,8 +5,8 @@ server:
   auth:
     bearer_token: "replace-me"
   # tls:
-  #   cert_path: "$SIMPLE_ALERT_PROXY_TLS_CERT_PATH"
-  #   key_path: "$SIMPLE_ALERT_PROXY_TLS_KEY_PATH"
+  #   cert_env: "SIMPLE_ALERT_PROXY_TLS_CERT_PEM"
+  #   key_env: "SIMPLE_ALERT_PROXY_TLS_KEY_PEM"
 
 routing:
   default_receiver: "default-chat"
