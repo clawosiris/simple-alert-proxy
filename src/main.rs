@@ -10,6 +10,7 @@ use axum::{
 use clap::Parser;
 use serde_json::Value;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use subtle::ConstantTimeEq;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
@@ -152,12 +153,29 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), WebhookError> 
         return Err(WebhookError::Unauthorized);
     };
 
-    let expected = format!("Bearer {}", auth.bearer_token);
-    if value.as_bytes() == expected.as_bytes() {
+    let presented = parse_bearer_token(value).ok_or(WebhookError::Unauthorized)?;
+    let expected = auth.bearer_token.as_bytes();
+
+    if presented.len() != expected.len() {
+        return Err(WebhookError::Unauthorized);
+    }
+
+    if bool::from(presented.ct_eq(expected)) {
         Ok(())
     } else {
         Err(WebhookError::Unauthorized)
     }
+}
+
+fn parse_bearer_token(value: &header::HeaderValue) -> Option<&[u8]> {
+    let value = value.as_bytes();
+    let prefix = b"Bearer ";
+
+    if value.len() <= prefix.len() || &value[..prefix.len()] != prefix {
+        return None;
+    }
+
+    Some(&value[prefix.len()..])
 }
 
 fn log_debug_json(label: &str, value: &Value) {
@@ -269,6 +287,48 @@ mod tests {
                 .unwrap()
                 .contains("HighErrorRate")
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_bearer_authorization_scheme() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/signoz")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Basic dGVzdDp0b2tlbg==")
+                    .body(Body::from(include_str!("../examples/signoz-webhook.json")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_bearer_token() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/signoz")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-tokenx")
+                    .body(Body::from(include_str!("../examples/signoz-webhook.json")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     async fn spawn_mock_google_chat(received: Arc<Mutex<Vec<Value>>>) -> String {
