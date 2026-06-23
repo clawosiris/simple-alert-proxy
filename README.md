@@ -49,18 +49,20 @@ podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
 
 The repo includes a Quadlet unit at `deploy/systemd/simple-alert-proxy.container`.
 
-It mounts the config and TLS files from fixed host paths:
+It uses an environment file to point at the source certificate/key, then a pre-start helper copies them into fixed host paths that the container mounts:
 
 ```bash
 sudo install -D -m 0644 deploy/systemd/simple-alert-proxy.container \
   /etc/containers/systemd/simple-alert-proxy.container
+sudo install -D -m 0755 deploy/systemd/prepare-simple-alert-proxy-tls.sh \
+  /usr/local/libexec/simple-alert-proxy/prepare-simple-alert-proxy-tls.sh
+sudo install -D -m 0600 deploy/systemd/simple-alert-proxy.default \
+  /etc/default/simple-alert-proxy
 sudo install -D -m 0644 examples/config.yaml \
   /etc/simple-alert-proxy/config.yaml
-sudo install -D -m 0600 /path/to/tls.crt \
-  /etc/simple-alert-proxy/tls.crt
-sudo install -D -m 0600 /path/to/tls.key \
-  /etc/simple-alert-proxy/tls.key
 ```
+
+Set `SIMPLE_ALERT_PROXY_TLS_CERT_FILE` and `SIMPLE_ALERT_PROXY_TLS_KEY_FILE` in `/etc/default/simple-alert-proxy` to the real host-side source paths. On startup, the helper copies them into `/etc/simple-alert-proxy/tls.crt` and `/etc/simple-alert-proxy/tls.key` with ownership and permissions that allow the containerized service to read them.
 
 Then point the app config at the mounted in-container paths:
 

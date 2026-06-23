@@ -12,6 +12,8 @@ Volume=/etc/simple-alert-proxy/tls.crt:/run/simple-alert-proxy/tls/tls.crt:ro,Z
 Volume=/etc/simple-alert-proxy/tls.key:/run/simple-alert-proxy/tls/tls.key:ro,Z
 
 [Service]
+EnvironmentFile=/etc/default/simple-alert-proxy
+ExecStartPre=/usr/local/libexec/simple-alert-proxy/prepare-simple-alert-proxy-tls.sh
 Restart=on-failure
 TimeoutStartSec=180
 

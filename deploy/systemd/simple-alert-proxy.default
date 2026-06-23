@@ -1,0 +1,4 @@
+SIMPLE_ALERT_PROXY_TLS_CERT_FILE="/absolute/path/on/host/to/tls.crt"
+SIMPLE_ALERT_PROXY_TLS_KEY_FILE="/absolute/path/on/host/to/tls.key"
+# Optional override if your Quadlet Image= uses something other than localhost/simple-alert-proxy:latest
+# SIMPLE_ALERT_PROXY_IMAGE="ghcr.io/clawosiris/simple-alert-proxy:latest"

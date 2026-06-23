@@ -71,7 +71,7 @@ TLS supports two source modes:
 - `cert_path` and `key_path`: read PEM files from disk. Values can be literal paths or whole-value environment references in `$VAR` or `${VAR}` form.
 - `cert_env` and `key_env`: read PEM content directly from environment variables. Literal `\n` sequences are converted into real newlines before parsing.
 
-The bundled Quadlet deployment uses the file-path mode. It mounts `/etc/simple-alert-proxy/tls.crt` and `/etc/simple-alert-proxy/tls.key` from the host into the container at `/run/simple-alert-proxy/tls/tls.crt` and `/run/simple-alert-proxy/tls/tls.key`.
+The bundled Quadlet deployment uses the file-path mode. A pre-start helper reads the real certificate and key paths from `/etc/default/simple-alert-proxy`, copies them into `/etc/simple-alert-proxy/tls.crt` and `/etc/simple-alert-proxy/tls.key` with container-readable ownership and permissions, and the unit mounts those prepared copies into `/run/simple-alert-proxy/tls/tls.crt` and `/run/simple-alert-proxy/tls/tls.key`.
 
 Do not mix file path and environment-content sources for the same TLS config.
 
