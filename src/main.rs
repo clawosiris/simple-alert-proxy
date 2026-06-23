@@ -46,11 +46,21 @@ struct AppState {
     google_chat: GoogleChatClient,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn init_crypto_provider() -> anyhow::Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_crypto_provider()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -237,6 +247,58 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::{collections::BTreeMap, sync::Mutex};
     use tower::ServiceExt;
+
+    #[test]
+    fn installs_rustls_crypto_provider() {
+        init_crypto_provider().unwrap();
+
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_no_content() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn accepts_webhook_without_auth_when_auth_disabled() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/signoz")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(include_str!("../examples/signoz-webhook.json")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+    }
 
     #[tokio::test]
     async fn rejects_missing_bearer_token() {
