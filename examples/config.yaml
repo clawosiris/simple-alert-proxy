@@ -5,8 +5,8 @@ server:
   auth:
     bearer_token: "replace-me"
   # tls:
-  #   cert_env: "SIMPLE_ALERT_PROXY_TLS_CERT_PEM"
-  #   key_env: "SIMPLE_ALERT_PROXY_TLS_KEY_PEM"
+  #   cert_path: "/run/simple-alert-proxy/tls/tls.crt"
+  #   key_path: "/run/simple-alert-proxy/tls/tls.key"
 
 debug:
   log_alerts: false

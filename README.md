@@ -49,7 +49,7 @@ podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
 
 The repo includes a Quadlet unit at `deploy/systemd/simple-alert-proxy.container`.
 
-It reads TLS PEM content variables from `/etc/defaults/simple-aleert-proxy`:
+It reads host TLS file paths from `/etc/defaults/simple-aleert-proxy` and mounts them into the container at fixed locations:
 
 ```bash
 sudo install -D -m 0644 deploy/systemd/simple-alert-proxy.container \
@@ -60,7 +60,16 @@ sudo install -D -m 0644 examples/config.yaml \
   /etc/simple-alert-proxy/config.yaml
 ```
 
-Set `SIMPLE_ALERT_PROXY_TLS_CERT_PEM` and `SIMPLE_ALERT_PROXY_TLS_KEY_PEM` in `/etc/defaults/simple-aleert-proxy`. PEM newlines can be escaped as `\n`, which is friendlier for environment files. Build or pull the `localhost/simple-alert-proxy:latest` image, then run:
+Set `SIMPLE_ALERT_PROXY_TLS_CERT_FILE` and `SIMPLE_ALERT_PROXY_TLS_KEY_FILE` in `/etc/defaults/simple-aleert-proxy` to absolute host paths. Then point the app config at the mounted in-container paths:
+
+```yaml
+server:
+  tls:
+    cert_path: "/run/simple-alert-proxy/tls/tls.crt"
+    key_path: "/run/simple-alert-proxy/tls/tls.key"
+```
+
+Build or pull the `localhost/simple-alert-proxy:latest` image, then run:
 
 ```bash
 sudo systemctl daemon-reload

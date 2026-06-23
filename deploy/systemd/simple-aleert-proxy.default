@@ -1,2 +1,2 @@
-SIMPLE_ALERT_PROXY_TLS_CERT_PEM="-----BEGIN CERTIFICATE-----\nreplace-me\n-----END CERTIFICATE-----"
-SIMPLE_ALERT_PROXY_TLS_KEY_PEM="-----BEGIN PRIVATE KEY-----\nreplace-me\n-----END PRIVATE KEY-----"
+SIMPLE_ALERT_PROXY_TLS_CERT_FILE="/absolute/path/on/host/to/tls.crt"
+SIMPLE_ALERT_PROXY_TLS_KEY_FILE="/absolute/path/on/host/to/tls.key"

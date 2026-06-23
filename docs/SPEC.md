@@ -60,8 +60,8 @@ TLS is optional.
 server:
   bind: "0.0.0.0:8443"
   tls:
-    cert_env: "SIMPLE_ALERT_PROXY_TLS_CERT_PEM"
-    key_env: "SIMPLE_ALERT_PROXY_TLS_KEY_PEM"
+    cert_path: "/run/simple-alert-proxy/tls/tls.crt"
+    key_path: "/run/simple-alert-proxy/tls/tls.key"
 ```
 
 If `server.tls` is omitted, the service listens over plain HTTP. In production, either enable native TLS or run behind a TLS-terminating reverse proxy.
@@ -70,6 +70,8 @@ TLS supports two source modes:
 
 - `cert_path` and `key_path`: read PEM files from disk. Values can be literal paths or whole-value environment references in `$VAR` or `${VAR}` form.
 - `cert_env` and `key_env`: read PEM content directly from environment variables. Literal `\n` sequences are converted into real newlines before parsing.
+
+The bundled Quadlet deployment uses the file-path mode. Its environment file stores absolute host paths for the certificate and key, and the unit mounts those files into the container at `/run/simple-alert-proxy/tls/tls.crt` and `/run/simple-alert-proxy/tls/tls.key`.
 
 Do not mix file path and environment-content sources for the same TLS config.
 
