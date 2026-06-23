@@ -52,6 +52,18 @@ Invalid payloads return `400`. Receiver failures return `502`.
 
 If bearer authentication is enabled, missing or invalid credentials return `401`.
 
+## SigNoz Integration
+
+SigNoz's webhook notification channel posts Alertmanager-style webhook payloads to the proxy. In current SigNoz docs, the setup flow is:
+
+1. `Settings -> Account Settings -> Notification Channels`
+2. `New Channel`
+3. choose `Webhook`
+4. set the proxy URL, for example `https://proxy.example.com/webhooks/signoz`
+5. use `Test` to send a sample alert
+
+The webhook-channel docs describe a webhook URL and optional username/password fields. This proxy's native inbound auth uses a bearer token, so deployments that enable `server.auth.bearer_token` may need a reverse proxy or another hop that injects `Authorization: Bearer ...` before forwarding to `simple-alert-proxy`.
+
 ## TLS
 
 TLS is optional.

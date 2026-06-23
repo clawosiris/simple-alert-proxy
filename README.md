@@ -93,6 +93,46 @@ debug:
 
 Only enable this while debugging. Alert payloads can contain sensitive labels, annotations, and incident context.
 
+## Set Up SigNoz Notification Channel
+
+SigNoz's current docs route webhook setup through `Settings -> Account Settings -> Notification Channels`, then `New Channel`, then `Webhook`.
+
+For this proxy:
+
+1. Deploy `simple-alert-proxy` somewhere SigNoz can reach it.
+2. Decide whether the proxy will listen on plain HTTP or HTTPS.
+3. Note the full webhook URL for SigNoz:
+
+```text
+https://your-proxy.example.com/webhooks/signoz
+```
+
+Or, if you changed the path in config:
+
+```text
+https://your-proxy.example.com/<your-webhook-path>
+```
+
+4. In SigNoz, go to `Settings -> Account Settings -> Notification Channels`.
+5. Click `New Channel`.
+6. Enter a name like `simple-alert-proxy`.
+7. Select `Webhook` as the channel type.
+8. Paste the proxy URL into the `Webhook URL` field.
+9. Use SigNoz's `Test` button to send a sample payload to the proxy.
+10. Attach that notification channel to the alert rule or alert policy you want to forward.
+
+Auth note:
+
+- SigNoz's webhook-channel docs describe a webhook URL and optional username/password fields.
+- This proxy's built-in auth expects `Authorization: Bearer ...` when `server.auth.bearer_token` is set.
+- The simplest setup is to leave `server.auth` unset for the SigNoz-facing endpoint, or put a reverse proxy in front that adds the bearer header before forwarding to `simple-alert-proxy`.
+
+Routing note:
+
+- SigNoz sends Alertmanager-style webhook payloads.
+- `simple-alert-proxy` routes those alerts using `routing.default_receiver` and `routing.routes` from `config.yaml`.
+- You do not need a separate SigNoz notification channel per Google Chat space unless you want different SigNoz rules to target different proxy instances.
+
 ## Current Status
 
 Implemented:
