@@ -12,7 +12,7 @@ Volume=${SIMPLE_ALERT_PROXY_TLS_CERT_FILE}:/run/simple-alert-proxy/tls/tls.crt:r
 Volume=${SIMPLE_ALERT_PROXY_TLS_KEY_FILE}:/run/simple-alert-proxy/tls/tls.key:ro,Z
 
 [Service]
-EnvironmentFile=/etc/defaults/simple-aleert-proxy
+EnvironmentFile=/etc/defaults/simple-alert-proxy
 Restart=on-failure
 TimeoutStartSec=180
 
