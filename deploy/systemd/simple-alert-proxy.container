@@ -8,11 +8,10 @@ ContainerName=simple-alert-proxy
 Image=localhost/simple-alert-proxy:latest
 PublishPort=8443:8443
 Volume=/etc/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z
-Volume=${SIMPLE_ALERT_PROXY_TLS_CERT_FILE}:/run/simple-alert-proxy/tls/tls.crt:ro,Z
-Volume=${SIMPLE_ALERT_PROXY_TLS_KEY_FILE}:/run/simple-alert-proxy/tls/tls.key:ro,Z
+Volume=/etc/simple-alert-proxy/tls.crt:/run/simple-alert-proxy/tls/tls.crt:ro,Z
+Volume=/etc/simple-alert-proxy/tls.key:/run/simple-alert-proxy/tls/tls.key:ro,Z
 
 [Service]
-EnvironmentFile=/etc/default/simple-alert-proxy
 Restart=on-failure
 TimeoutStartSec=180
 

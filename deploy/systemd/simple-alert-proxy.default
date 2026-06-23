@@ -1,2 +1,0 @@
-SIMPLE_ALERT_PROXY_TLS_CERT_FILE="/absolute/path/on/host/to/tls.crt"
-SIMPLE_ALERT_PROXY_TLS_KEY_FILE="/absolute/path/on/host/to/tls.key"

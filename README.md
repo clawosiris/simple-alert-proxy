@@ -49,18 +49,20 @@ podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
 
 The repo includes a Quadlet unit at `deploy/systemd/simple-alert-proxy.container`.
 
-It reads host TLS file paths from `/etc/default/simple-alert-proxy` and mounts them into the container at fixed locations:
+It mounts the config and TLS files from fixed host paths:
 
 ```bash
 sudo install -D -m 0644 deploy/systemd/simple-alert-proxy.container \
   /etc/containers/systemd/simple-alert-proxy.container
-sudo install -D -m 0600 deploy/systemd/simple-alert-proxy.default \
-  /etc/default/simple-alert-proxy
 sudo install -D -m 0644 examples/config.yaml \
   /etc/simple-alert-proxy/config.yaml
+sudo install -D -m 0600 /path/to/tls.crt \
+  /etc/simple-alert-proxy/tls.crt
+sudo install -D -m 0600 /path/to/tls.key \
+  /etc/simple-alert-proxy/tls.key
 ```
 
-Set `SIMPLE_ALERT_PROXY_TLS_CERT_FILE` and `SIMPLE_ALERT_PROXY_TLS_KEY_FILE` in `/etc/default/simple-alert-proxy` to absolute host paths. Then point the app config at the mounted in-container paths:
+Then point the app config at the mounted in-container paths:
 
 ```yaml
 server:
