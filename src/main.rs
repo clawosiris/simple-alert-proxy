@@ -353,6 +353,7 @@ mod tests {
                 .unwrap()
                 .contains("HighErrorRate")
         );
+        assert!(received[0]["cardsV2"].is_array());
     }
 
     #[tokio::test]

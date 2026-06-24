@@ -216,13 +216,15 @@ mod tests {
             ]),
         };
         let engine = RouteEngine::new(config).unwrap();
-        let alert = SigNozAlert {
-            status: Some("firing".to_string()),
-            common_labels: BTreeMap::from([("severity".to_string(), "critical".to_string())]),
-            common_annotations: BTreeMap::new(),
-            alerts: vec![],
-            raw: serde_json::json!({}),
-        };
+        let alert = SigNozAlert::from_value(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "severity": "critical"
+            },
+            "commonAnnotations": {},
+            "alerts": []
+        }))
+        .unwrap();
 
         let plan = engine.plan(&alert);
 

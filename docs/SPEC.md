@@ -181,7 +181,7 @@ receivers:
     timeout_secs: 10
 ```
 
-The first implementation sends plain text messages. A later iteration should support Google Chat cards with sections for labels, annotations, and instance links.
+The current implementation sends a fallback plain-text summary plus a Google Chat card payload with a summary section, per-severity counts, grouped instance details, and a source link when present.
 
 ## Security
 
@@ -214,7 +214,7 @@ Future metrics:
 
 1. Compile and run with YAML config
 2. Accept real SigNoz webhook payloads
-3. Deliver plain text Google Chat messages
+3. Deliver Google Chat messages with fallback text and structured cards
 4. Add route tests and config validation tests
 5. Add inbound auth and request limits
 6. Package as a container image
