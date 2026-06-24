@@ -152,7 +152,6 @@ Implemented:
 Still expected before production use:
 
 - More exact SigNoz payload fixtures from a real deployment
-- Structured Google Chat cards instead of plain text only
 - Delivery retry policy and dead-letter handling
 - HMAC request signing if SigNoz can support it
 
