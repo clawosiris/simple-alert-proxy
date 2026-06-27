@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -13,17 +13,15 @@ pub struct SigNozAlert {
 }
 
 impl SigNozAlert {
+    #[cfg(test)]
     pub fn from_value(raw: Value) -> Result<Self, AlertParseError> {
         let decoded: SigNozAlertPayload = serde_json::from_value(raw.clone())?;
-        let enrichment = AlertEnrichment::from_payload(&decoded);
-        Ok(Self {
-            status: decoded.status,
-            common_labels: decoded.common_labels,
-            common_annotations: decoded.common_annotations,
-            alerts: decoded.alerts,
-            enrichment,
-            raw,
-        })
+        Ok(decoded.into_alert(raw))
+    }
+
+    pub fn from_value_grouped_by_rule_id(raw: Value) -> Result<Vec<Self>, AlertParseError> {
+        let decoded: SigNozAlertPayload = serde_json::from_value(raw)?;
+        decoded.into_rule_id_groups()
     }
 
     pub fn alert_name(&self) -> String {
@@ -31,7 +29,7 @@ impl SigNozAlert {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SigNozAlertPayload {
     status: Option<String>,
@@ -45,7 +43,66 @@ struct SigNozAlertPayload {
     external_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl SigNozAlertPayload {
+    fn into_alert(self, raw: Value) -> SigNozAlert {
+        let enrichment = AlertEnrichment::from_payload(&self);
+        SigNozAlert {
+            status: self.status,
+            common_labels: self.common_labels,
+            common_annotations: self.common_annotations,
+            alerts: self.alerts,
+            enrichment,
+            raw,
+        }
+    }
+
+    fn into_rule_id_groups(self) -> Result<Vec<SigNozAlert>, AlertParseError> {
+        if self.alerts.len() <= 1 {
+            let raw = serde_json::to_value(&self)?;
+            return Ok(vec![self.into_alert(raw)]);
+        }
+
+        let mut grouped_alerts: BTreeMap<Option<String>, Vec<AlertInstance>> = BTreeMap::new();
+        for alert in &self.alerts {
+            grouped_alerts
+                .entry(alert.rule_id().or_else(|| self.common_rule_id()))
+                .or_default()
+                .push(alert.clone());
+        }
+
+        if grouped_alerts.len() <= 1 {
+            let raw = serde_json::to_value(&self)?;
+            return Ok(vec![self.into_alert(raw)]);
+        }
+
+        grouped_alerts
+            .into_iter()
+            .map(|(rule_id, alerts)| {
+                let mut payload = self.clone();
+                payload.alerts = alerts;
+                payload.common_labels =
+                    grouped_common_map(&self.common_labels, &payload.alerts, |alert| &alert.labels);
+                payload.common_annotations =
+                    grouped_common_map(&self.common_annotations, &payload.alerts, |alert| {
+                        &alert.annotations
+                    });
+
+                if let Some(rule_id) = rule_id {
+                    payload.common_labels.insert("ruleId".to_string(), rule_id);
+                }
+
+                let raw = serde_json::to_value(&payload)?;
+                Ok(payload.into_alert(raw))
+            })
+            .collect()
+    }
+
+    fn common_rule_id(&self) -> Option<String> {
+        map_value(&self.common_labels, &["ruleId", "rule_id"])
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlertInstance {
     #[serde(default)]
@@ -63,6 +120,12 @@ pub struct AlertInstance {
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub generator_url: Option<String>,
+}
+
+impl AlertInstance {
+    fn rule_id(&self) -> Option<String> {
+        map_value(&self.labels, &["ruleId", "rule_id"])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +320,31 @@ fn map_value(map: &BTreeMap<String, String>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| map.get(*key).cloned())
 }
 
+fn grouped_common_map<F>(
+    original_common: &BTreeMap<String, String>,
+    alerts: &[AlertInstance],
+    map_for_alert: F,
+) -> BTreeMap<String, String>
+where
+    F: Fn(&AlertInstance) -> &BTreeMap<String, String>,
+{
+    let Some((first, rest)) = alerts.split_first() else {
+        return original_common.clone();
+    };
+
+    let mut common = original_common.clone();
+    for (key, value) in map_for_alert(first) {
+        if rest
+            .iter()
+            .all(|alert| map_for_alert(alert).get(key) == Some(value))
+        {
+            common.insert(key.clone(), value.clone());
+        }
+    }
+
+    common
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AlertParseError {
     #[error(transparent)]
@@ -291,5 +379,60 @@ mod tests {
         );
         assert_eq!(alert.enrichment.instances[0].resource, "/");
         assert_eq!(alert.enrichment.instances[1].resource, "/var/cache/fscache");
+    }
+
+    #[test]
+    fn splits_mixed_payloads_by_rule_id() {
+        let alerts = SigNozAlert::from_value_grouped_by_rule_id(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "environment": "production"
+            },
+            "commonAnnotations": {},
+            "alerts": [
+                {
+                    "status": "firing",
+                    "labels": {
+                        "alertname": "Disk Space Low",
+                        "host.name": "host-a",
+                        "mountpoint": "/",
+                        "ruleId": "rule-disk",
+                        "severity": "warning"
+                    },
+                    "annotations": {}
+                },
+                {
+                    "status": "firing",
+                    "labels": {
+                        "alertname": "Disk Space Low",
+                        "host.name": "host-b",
+                        "mountpoint": "/var",
+                        "ruleId": "rule-disk",
+                        "severity": "warning"
+                    },
+                    "annotations": {}
+                },
+                {
+                    "status": "firing",
+                    "labels": {
+                        "alertname": "CPU Saturated",
+                        "host.name": "host-a",
+                        "ruleId": "rule-cpu",
+                        "severity": "critical"
+                    },
+                    "annotations": {}
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].common_labels.get("ruleId").unwrap(), "rule-cpu");
+        assert_eq!(alerts[0].alert_name(), "CPU Saturated");
+        assert_eq!(alerts[0].alerts.len(), 1);
+        assert_eq!(alerts[1].common_labels.get("ruleId").unwrap(), "rule-disk");
+        assert_eq!(alerts[1].alert_name(), "Disk Space Low");
+        assert_eq!(alerts[1].alerts.len(), 2);
+        assert_eq!(alerts[1].enrichment.instances.len(), 2);
     }
 }

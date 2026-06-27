@@ -39,6 +39,8 @@ Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 
 The raw payload is retained for routing rules that need JSON pointer access.
 
+When one webhook payload contains alerts for multiple `ruleId` values, the proxy splits the payload by `ruleId` before routing and delivery. Alerts with the same `ruleId` stay together in one outgoing notification as separate instances.
+
 Success returns `202 Accepted` with a delivery summary:
 
 ```json

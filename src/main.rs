@@ -23,7 +23,7 @@ mod tls;
 use crate::{
     config::AppConfig,
     google_chat::{DebugDeliveryLog, GoogleChatClient},
-    routing::{DeliveryPlan, RouteEngine},
+    routing::RouteEngine,
     signoz::SigNozAlert,
 };
 
@@ -125,37 +125,45 @@ async fn handle_signoz_webhook(
         log_debug_json("incoming alert", &payload);
     }
 
-    let alert = SigNozAlert::from_value(payload)?;
-    let plan = state.router.plan(&alert);
+    let alerts = SigNozAlert::from_value_grouped_by_rule_id(payload)?;
+    let mut delivered_receivers = Vec::new();
 
-    if plan.deliveries.is_empty() {
+    for alert in &alerts {
+        let plan = state.router.plan(alert);
+
+        for delivery in &plan.deliveries {
+            let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
+                error!(receiver = %delivery.receiver, "route selected missing receiver");
+                continue;
+            };
+
+            match receiver {
+                config::ReceiverConfig::GoogleChat(receiver) => {
+                    let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
+                        route_name: delivery.route_name.as_str(),
+                        receiver_name: delivery.receiver.as_str(),
+                    });
+                    state
+                        .google_chat
+                        .send(receiver, alert, delivery, debug)
+                        .await?;
+                    delivered_receivers.push(delivery.receiver.clone());
+                }
+            }
+        }
+    }
+
+    if delivered_receivers.is_empty() {
         return Ok((
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "delivered": 0 })),
         ));
     }
 
-    for delivery in &plan.deliveries {
-        let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
-            error!(receiver = %delivery.receiver, "route selected missing receiver");
-            continue;
-        };
-
-        match receiver {
-            config::ReceiverConfig::GoogleChat(receiver) => {
-                let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
-                    route_name: delivery.route_name.as_str(),
-                    receiver_name: delivery.receiver.as_str(),
-                });
-                state
-                    .google_chat
-                    .send(receiver, &alert, delivery, debug)
-                    .await?;
-            }
-        }
-    }
-
-    Ok((StatusCode::ACCEPTED, Json(delivery_summary(&plan))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(delivery_summary(&delivered_receivers)),
+    ))
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), WebhookError> {
@@ -199,10 +207,10 @@ fn log_debug_json(label: &str, value: &Value) {
     }
 }
 
-fn delivery_summary(plan: &DeliveryPlan) -> Value {
+fn delivery_summary(receivers: &[String]) -> Value {
     serde_json::json!({
-        "delivered": plan.deliveries.len(),
-        "receivers": plan.deliveries.iter().map(|item| &item.receiver).collect::<Vec<_>>(),
+        "delivered": receivers.len(),
+        "receivers": receivers,
     })
 }
 
@@ -353,6 +361,94 @@ mod tests {
             Some("[firing] HighErrorRate via critical-production")
         );
         assert!(received[0]["cardsV2"].is_array());
+    }
+
+    #[tokio::test]
+    async fn groups_incoming_alerts_by_rule_id_before_delivery() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let config = test_config(&chat_url);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/signoz")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "status": "firing",
+                            "commonLabels": {
+                                "environment": "production"
+                            },
+                            "commonAnnotations": {},
+                            "alerts": [
+                                {
+                                    "status": "firing",
+                                    "labels": {
+                                        "alertname": "Disk Space Low",
+                                        "host.name": "host-a",
+                                        "mountpoint": "/",
+                                        "ruleId": "rule-disk",
+                                        "severity": "critical"
+                                    },
+                                    "annotations": {}
+                                },
+                                {
+                                    "status": "firing",
+                                    "labels": {
+                                        "alertname": "Disk Space Low",
+                                        "host.name": "host-b",
+                                        "mountpoint": "/var",
+                                        "ruleId": "rule-disk",
+                                        "severity": "critical"
+                                    },
+                                    "annotations": {}
+                                },
+                                {
+                                    "status": "firing",
+                                    "labels": {
+                                        "alertname": "CPU Saturated",
+                                        "host.name": "host-c",
+                                        "ruleId": "rule-cpu",
+                                        "severity": "critical"
+                                    },
+                                    "annotations": {}
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let summary: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(summary["delivered"], 2);
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] CPU Saturated via critical-production")
+        );
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["subtitle"].as_str(),
+            Some("1 instance | critical: 1")
+        );
+        assert_eq!(
+            received[1]["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] Disk Space Low via critical-production")
+        );
+        assert_eq!(
+            received[1]["cardsV2"][0]["card"]["header"]["subtitle"].as_str(),
+            Some("2 instances | critical: 2")
+        );
     }
 
     #[tokio::test]
