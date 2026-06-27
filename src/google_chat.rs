@@ -72,10 +72,8 @@ fn build_message(
     delivery: &Delivery,
 ) -> serde_json::Value {
     let title = format_title(receiver, alert, delivery);
-    let fallback_text = format_text_message(&title, alert);
 
     json!({
-        "text": fallback_text,
         "cardsV2": [{
             "cardId": "signoz-alert",
             "card": {
@@ -107,36 +105,6 @@ fn format_title(
     title
 }
 
-fn format_text_message(title: &str, alert: &SigNozAlert) -> String {
-    let mut lines = vec![title.to_string()];
-
-    if let Some(summary) = alert
-        .enrichment
-        .summary
-        .as_deref()
-        .or(alert.enrichment.description.as_deref())
-    {
-        lines.push(summary.to_string());
-    }
-
-    lines.push(format!(
-        "Status: {} | Instances: {} | Severity: {}",
-        alert.enrichment.overall_status,
-        alert.alerts.len(),
-        format_severity_counts(&alert.enrichment.severity_counts)
-    ));
-
-    for line in grouped_instance_lines(alert) {
-        lines.push(line);
-    }
-
-    if let Some(source_url) = &alert.enrichment.source_url {
-        lines.push(format!("Source: {source_url}"));
-    }
-
-    lines.join("\n")
-}
-
 fn format_subtitle(alert: &SigNozAlert) -> String {
     format!(
         "{} instance{} | {}",
@@ -148,32 +116,32 @@ fn format_subtitle(alert: &SigNozAlert) -> String {
 
 fn build_sections(alert: &SigNozAlert) -> Vec<serde_json::Value> {
     let mut sections = Vec::new();
-    let mut summary_lines = vec![format!("Status: {}", alert.enrichment.overall_status)];
-    summary_lines.push(format!(
-        "Severity counts: {}",
-        format_severity_counts(&alert.enrichment.severity_counts)
-    ));
-
-    if let Some(summary) = alert
-        .enrichment
-        .summary
-        .as_deref()
-        .or(alert.enrichment.description.as_deref())
-    {
-        summary_lines.push(summary.to_string());
-    }
+    let mut summary_widgets = vec![
+        json!({
+            "decoratedText": {
+                "text": format!("Status: {}", alert.enrichment.overall_status),
+            }
+        }),
+        json!({
+            "decoratedText": {
+                "text": format!(
+                    "Severity counts: {}",
+                    format_severity_counts(&alert.enrichment.severity_counts)
+                ),
+            }
+        }),
+    ];
 
     if let Some(source_url) = &alert.enrichment.source_url {
-        summary_lines.push(format!("Source: {source_url}"));
+        summary_widgets.push(json!({
+            "textParagraph": {
+                "text": format!("Source: <a href=\"{}\">SOURCE</a>", escape_chat_html(source_url)),
+            }
+        }));
     }
 
     sections.push(json!({
-        "header": "Summary",
-        "widgets": [{
-            "textParagraph": {
-                "text": summary_lines.join("\n"),
-            }
-        }]
+        "widgets": summary_widgets,
     }));
 
     let instance_widgets = grouped_instance_lines(alert)
@@ -198,7 +166,7 @@ fn build_sections(alert: &SigNozAlert) -> Vec<serde_json::Value> {
 }
 
 fn grouped_instance_lines(alert: &SigNozAlert) -> Vec<String> {
-    let mut groups: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, String), usize> = BTreeMap::new();
 
     for instance in &alert.enrichment.instances {
         let key = (
@@ -206,27 +174,28 @@ fn grouped_instance_lines(alert: &SigNozAlert) -> Vec<String> {
             instance.severity.clone(),
             instance.resource.clone(),
         );
-        let detail = instance
-            .description
-            .clone()
-            .or_else(|| instance.summary.clone())
-            .unwrap_or_else(|| "No details provided.".to_string());
-        groups.entry(key).or_default().push(detail);
+        *groups.entry(key).or_insert(0) += 1;
     }
 
     groups
         .into_iter()
-        .map(|((host, severity, resource), details)| {
+        .map(|((host, severity, resource), count)| {
             let mut line = format!("{host} | {severity} | {resource}");
-            if let Some(first_detail) = details.first() {
-                line.push_str(&format!(" - {first_detail}"));
-            }
-            if details.len() > 1 {
-                line.push_str(&format!(" ({})", details.len()));
+            if count > 1 {
+                line.push_str(&format!(" ({count})"));
             }
             line
         })
         .collect()
+}
+
+fn escape_chat_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn format_severity_counts(counts: &BTreeMap<String, usize>) -> String {
@@ -268,14 +237,22 @@ mod tests {
         };
 
         let payload = build_message(&receiver, &alert, &delivery);
-        let text = payload["text"].as_str().unwrap();
+        let summary_widgets = payload["cardsV2"][0]["card"]["sections"][0]["widgets"]
+            .as_array()
+            .unwrap();
         let instances = payload["cardsV2"][0]["card"]["sections"][1]["widgets"]
             .as_array()
             .unwrap();
 
-        assert!(text.contains("warning: 2"));
-        assert!(text.contains("host000.het.example.com | warning | /"));
-        assert!(text.contains("Source: https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f"));
+        assert!(payload.get("text").is_none());
+        assert_eq!(
+            summary_widgets[2]["textParagraph"]["text"].as_str(),
+            Some("Source: <a href=\"https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f\">SOURCE</a>")
+        );
         assert_eq!(instances.len(), 2);
+        assert_eq!(
+            instances[0]["textParagraph"]["text"].as_str(),
+            Some("host000.het.example.com | warning | /")
+        );
     }
 }

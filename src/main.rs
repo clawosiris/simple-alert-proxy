@@ -347,11 +347,10 @@ mod tests {
 
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
-        assert!(
-            received[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("HighErrorRate")
+        assert!(received[0].get("text").is_none());
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] HighErrorRate via critical-production")
         );
         assert!(received[0]["cardsV2"].is_array());
     }
