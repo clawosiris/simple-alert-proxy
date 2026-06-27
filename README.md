@@ -93,7 +93,7 @@ debug:
 
 Only enable this while debugging. Alert payloads can contain sensitive labels, annotations, and incident context.
 
-Alert grouping is enabled by default. The proxy waits briefly before sending outbound notifications so multiple SigNoz webhook calls for the same `ruleId` can be combined into one Google Chat card with multiple instances:
+Alert grouping is enabled by default. The proxy accepts matching webhook requests, waits briefly before sending outbound notifications, and combines multiple SigNoz webhook calls for the same `ruleId` into one Google Chat card with multiple instances:
 
 ```yaml
 alert_grouping:

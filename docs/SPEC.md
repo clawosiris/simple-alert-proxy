@@ -39,9 +39,9 @@ Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 
 The raw payload is retained for routing rules that need JSON pointer access.
 
-The proxy groups alerts by `ruleId` before delivery. When one webhook payload contains alerts for multiple `ruleId` values, the proxy splits the payload by `ruleId`. When SigNoz emits separate webhook requests for instances of the same rule, the proxy holds them for the configured debounce window and sends one outgoing notification with the instances combined.
+The proxy groups alerts by `ruleId` before delivery. When one webhook payload contains alerts for multiple `ruleId` values, the proxy splits the payload by `ruleId`. When SigNoz emits separate webhook requests for instances of the same rule, the proxy accepts each request, holds grouped alerts for the configured debounce window, and then sends one outgoing notification with the instances combined.
 
-Success returns `202 Accepted` with a delivery summary:
+Success returns `202 Accepted` with an accepted delivery summary:
 
 ```json
 {
@@ -50,7 +50,7 @@ Success returns `202 Accepted` with a delivery summary:
 }
 ```
 
-Invalid payloads return `400`. Receiver failures return `502`.
+Invalid payloads return `400`. Ungrouped receiver failures return `502`. Grouped delivery failures happen after the webhook response and are logged.
 
 If bearer authentication is enabled, missing or invalid credentials return `401`.
 
@@ -125,7 +125,7 @@ receivers:
     timeout_secs: 10
 ```
 
-Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery.
+Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery. Grouped alerts are enqueued before the webhook response returns, then flushed in the background after the debounce window.
 
 ```yaml
 alert_grouping:

@@ -11,7 +11,7 @@ use clap::Parser;
 use serde_json::Value;
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
@@ -67,7 +67,6 @@ struct PendingAggregation {
     receiver: GoogleChatReceiverConfig,
     delivery: Delivery,
     alerts: Vec<SigNozAlert>,
-    waiters: Vec<oneshot::Sender<Result<(), String>>>,
     debug_enabled: bool,
 }
 
@@ -81,7 +80,7 @@ impl AlertAggregator {
         }
     }
 
-    async fn deliver_google_chat(
+    async fn enqueue_google_chat(
         &self,
         receiver: &GoogleChatReceiverConfig,
         alert: SigNozAlert,
@@ -108,7 +107,6 @@ impl AlertAggregator {
             status: alert.enrichment.overall_status.clone(),
             rule_id,
         };
-        let (waiter, delivered) = oneshot::channel();
         let mut should_spawn = false;
 
         {
@@ -121,7 +119,6 @@ impl AlertAggregator {
                         receiver: receiver.clone(),
                         delivery,
                         alerts: vec![alert],
-                        waiters: vec![waiter],
                         debug_enabled,
                     });
                     should_spawn = true;
@@ -129,7 +126,6 @@ impl AlertAggregator {
                 Entry::Occupied(mut entry) => {
                     let bucket = entry.get_mut();
                     bucket.alerts.push(alert);
-                    bucket.waiters.push(waiter);
                 }
             }
         }
@@ -141,10 +137,7 @@ impl AlertAggregator {
             });
         }
 
-        delivered
-            .await
-            .map_err(|_| WebhookError::AggregatedDelivery("alert grouping task ended".to_string()))?
-            .map_err(WebhookError::AggregatedDelivery)
+        Ok(())
     }
 
     async fn flush_after(&self, key: AggregationKey) {
@@ -154,9 +147,8 @@ impl AlertAggregator {
             return;
         };
 
-        let result = self.flush_bucket(&bucket).await;
-        for waiter in bucket.waiters {
-            let _ = waiter.send(result.clone());
+        if let Err(error) = self.flush_bucket(&bucket).await {
+            error!(%error, "grouped alert delivery failed");
         }
     }
 
@@ -271,7 +263,7 @@ async fn handle_signoz_webhook(
                 config::ReceiverConfig::GoogleChat(receiver) => {
                     state
                         .aggregator
-                        .deliver_google_chat(
+                        .enqueue_google_chat(
                             receiver,
                             alert.clone(),
                             delivery.clone(),
@@ -357,8 +349,6 @@ enum WebhookError {
     InvalidPayload(#[from] signoz::AlertParseError),
     #[error("delivery failed: {0}")]
     Delivery(#[from] google_chat::GoogleChatError),
-    #[error("delivery failed: {0}")]
-    AggregatedDelivery(String),
 }
 
 impl IntoResponse for WebhookError {
@@ -367,9 +357,7 @@ impl IntoResponse for WebhookError {
         let status = match self {
             WebhookError::Unauthorized => StatusCode::UNAUTHORIZED,
             WebhookError::InvalidPayload(_) => StatusCode::BAD_REQUEST,
-            WebhookError::Delivery(_) | WebhookError::AggregatedDelivery(_) => {
-                StatusCode::BAD_GATEWAY
-            }
+            WebhookError::Delivery(_) => StatusCode::BAD_GATEWAY,
         };
         (
             status,
@@ -439,6 +427,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
+        wait_for_received_count(&received, 1).await;
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
     }
@@ -488,6 +477,7 @@ mod tests {
         let summary: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(summary["receivers"][0], "critical-chat");
 
+        wait_for_received_count(&received, 1).await;
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
         assert!(received[0].get("text").is_none());
@@ -566,6 +556,7 @@ mod tests {
         let summary: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(summary["delivered"], 2);
 
+        wait_for_received_count(&received, 2).await;
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 2);
         assert_eq!(
@@ -593,51 +584,59 @@ mod tests {
         let config = test_config(&chat_url);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
 
-        let first = app.clone().oneshot(signoz_request(serde_json::json!({
-            "status": "firing",
-            "commonLabels": {
-                "alertname": "Disk Space Low",
-                "environment": "production",
-                "severity": "critical",
-                "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
-            },
-            "commonAnnotations": {},
-            "alerts": [{
+        let first = app
+            .clone()
+            .oneshot(signoz_request(serde_json::json!({
                 "status": "firing",
-                "labels": {
-                    "host.name": "host-a",
-                    "mountpoint": "/",
-                    "severity": "critical"
+                "commonLabels": {
+                    "alertname": "Disk Space Low",
+                    "environment": "production",
+                    "severity": "critical",
+                    "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
                 },
-                "annotations": {},
-                "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
-            }]
-        })));
-        let second = app.oneshot(signoz_request(serde_json::json!({
-            "status": "firing",
-            "commonLabels": {
-                "alertname": "Disk Space Low",
-                "environment": "production",
-                "severity": "critical",
-                "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
-            },
-            "commonAnnotations": {},
-            "alerts": [{
+                "commonAnnotations": {},
+                "alerts": [{
+                    "status": "firing",
+                    "labels": {
+                        "host.name": "host-a",
+                        "mountpoint": "/",
+                        "severity": "critical"
+                    },
+                    "annotations": {},
+                    "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+                }]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let second = app
+            .oneshot(signoz_request(serde_json::json!({
                 "status": "firing",
-                "labels": {
-                    "host.name": "host-b",
-                    "mountpoint": "/var",
-                    "severity": "critical"
+                "commonLabels": {
+                    "alertname": "Disk Space Low",
+                    "environment": "production",
+                    "severity": "critical",
+                    "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
                 },
-                "annotations": {},
-                "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
-            }]
-        })));
+                "commonAnnotations": {},
+                "alerts": [{
+                    "status": "firing",
+                    "labels": {
+                        "host.name": "host-b",
+                        "mountpoint": "/var",
+                        "severity": "critical"
+                    },
+                    "annotations": {},
+                    "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+                }]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
 
-        let (first, second) = tokio::join!(first, second);
-        assert_eq!(first.unwrap().status(), StatusCode::ACCEPTED);
-        assert_eq!(second.unwrap().status(), StatusCode::ACCEPTED);
-
+        wait_for_received_count(&received, 1).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(
@@ -716,6 +715,19 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}/chat")
+    }
+
+    async fn wait_for_received_count(received: &Arc<Mutex<Vec<Value>>>, expected: usize) {
+        for _ in 0..100 {
+            if received.lock().unwrap().len() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for {expected} Google Chat payloads; received {}",
+            received.lock().unwrap().len()
+        );
     }
 
     fn signoz_request(payload: Value) -> Request<Body> {
