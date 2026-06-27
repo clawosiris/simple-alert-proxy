@@ -247,7 +247,9 @@ mod tests {
         assert!(payload.get("text").is_none());
         assert_eq!(
             summary_widgets[2]["textParagraph"]["text"].as_str(),
-            Some("Source: <a href=\"https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f\">SOURCE</a>")
+            Some(
+                "Source: <a href=\"https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f\">SOURCE</a>"
+            )
         );
         assert_eq!(instances.len(), 2);
         assert_eq!(
