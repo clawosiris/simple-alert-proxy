@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, env, fs, path::Path};
 pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
+    pub alert_grouping: AlertGroupingConfig,
+    #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
@@ -38,6 +40,10 @@ impl AppConfig {
 
         if let Some(tls) = &self.server.tls {
             tls.validate()?;
+        }
+
+        if self.alert_grouping.enabled && self.alert_grouping.debounce_millis == 0 {
+            bail!("alert_grouping.debounce_millis must be greater than zero when enabled");
         }
 
         if let Some(default_receiver) = &self.routing.default_receiver {
@@ -84,6 +90,23 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     pub bearer_token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AlertGroupingConfig {
+    #[serde(default = "default_alert_grouping_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_alert_grouping_debounce_millis")]
+    pub debounce_millis: u64,
+}
+
+impl Default for AlertGroupingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_alert_grouping_enabled(),
+            debounce_millis: default_alert_grouping_debounce_millis(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -225,6 +248,14 @@ fn default_webhook_path() -> String {
 
 fn default_max_body_bytes() -> usize {
     1024 * 1024
+}
+
+fn default_alert_grouping_enabled() -> bool {
+    true
+}
+
+fn default_alert_grouping_debounce_millis() -> u64 {
+    1_000
 }
 
 fn default_title_template() -> String {

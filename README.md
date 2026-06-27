@@ -93,6 +93,14 @@ debug:
 
 Only enable this while debugging. Alert payloads can contain sensitive labels, annotations, and incident context.
 
+Alert grouping is enabled by default. The proxy waits briefly before sending outbound notifications so multiple SigNoz webhook calls for the same `ruleId` can be combined into one Google Chat card with multiple instances:
+
+```yaml
+alert_grouping:
+  enabled: true
+  debounce_millis: 1000
+```
+
 ## Set Up SigNoz Notification Channel
 
 SigNoz's current docs route webhook setup through `Settings -> Account Settings -> Notification Channels`, then `New Channel`, then `Webhook`.

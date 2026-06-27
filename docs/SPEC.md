@@ -39,7 +39,7 @@ Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 
 The raw payload is retained for routing rules that need JSON pointer access.
 
-When one webhook payload contains alerts for multiple `ruleId` values, the proxy splits the payload by `ruleId` before routing and delivery. Alerts with the same `ruleId` stay together in one outgoing notification as separate instances.
+The proxy groups alerts by `ruleId` before delivery. When one webhook payload contains alerts for multiple `ruleId` values, the proxy splits the payload by `ruleId`. When SigNoz emits separate webhook requests for instances of the same rule, the proxy holds them for the configured debounce window and sends one outgoing notification with the instances combined.
 
 Success returns `202 Accepted` with a delivery summary:
 
@@ -124,6 +124,16 @@ receivers:
     type: google_chat
     timeout_secs: 10
 ```
+
+Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery.
+
+```yaml
+alert_grouping:
+  enabled: true
+  debounce_millis: 1000
+```
+
+The grouping key includes receiver, route, status, and `ruleId`, so unrelated routes and firing/resolved transitions are not merged into the same outgoing notification.
 
 ## Debug Logging
 

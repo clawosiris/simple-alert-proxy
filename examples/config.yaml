@@ -11,6 +11,10 @@ server:
 debug:
   log_alerts: false
 
+alert_grouping:
+  enabled: true
+  debounce_millis: 1000
+
 routing:
   default_receiver: "default-chat"
   routes:

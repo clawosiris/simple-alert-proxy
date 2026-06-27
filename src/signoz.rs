@@ -27,9 +27,66 @@ impl SigNozAlert {
     pub fn alert_name(&self) -> String {
         self.enrichment.alert_name.clone()
     }
+
+    pub fn rule_id(&self) -> Option<String> {
+        map_value(&self.common_labels, &["ruleId", "rule_id"])
+            .or_else(|| map_value(&self.common_annotations, &["ruleId", "rule_id"]))
+            .or_else(|| {
+                map_value(
+                    &self.common_labels,
+                    &["ruleSource", "source", "source_url", "generatorURL"],
+                )
+                .and_then(|url| rule_id_from_url(&url))
+            })
+            .or_else(|| {
+                self.enrichment
+                    .source_url
+                    .as_deref()
+                    .and_then(rule_id_from_url)
+            })
+            .or_else(|| self.alerts.iter().find_map(AlertInstance::rule_id))
+    }
+
+    pub fn merged_for_delivery(alerts: &[Self]) -> Result<Self, AlertParseError> {
+        let Some((first, _)) = alerts.split_first() else {
+            let payload = SigNozAlertPayload::default();
+            let raw = serde_json::to_value(&payload)?;
+            return Ok(payload.into_alert(raw));
+        };
+
+        if alerts.len() == 1 {
+            return Ok(first.clone());
+        }
+
+        let mut instances = Vec::new();
+        for alert in alerts {
+            instances.extend(alert.alerts.iter().cloned());
+        }
+
+        let mut payload = SigNozAlertPayload {
+            status: first.status.clone(),
+            common_labels: grouped_common_map(&first.common_labels, &instances, |alert| {
+                &alert.labels
+            }),
+            common_annotations: grouped_common_map(
+                &first.common_annotations,
+                &instances,
+                |alert| &alert.annotations,
+            ),
+            alerts: instances,
+            external_url: first.enrichment.source_url.clone(),
+        };
+
+        if let Some(rule_id) = first.rule_id() {
+            payload.common_labels.insert("ruleId".to_string(), rule_id);
+        }
+
+        let raw = serde_json::to_value(&payload)?;
+        Ok(payload.into_alert(raw))
+    }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SigNozAlertPayload {
     status: Option<String>,
@@ -99,6 +156,14 @@ impl SigNozAlertPayload {
 
     fn common_rule_id(&self) -> Option<String> {
         map_value(&self.common_labels, &["ruleId", "rule_id"])
+            .or_else(|| map_value(&self.common_annotations, &["ruleId", "rule_id"]))
+            .or_else(|| {
+                map_value(
+                    &self.common_labels,
+                    &["ruleSource", "source", "source_url", "generatorURL"],
+                )
+                .and_then(|url| rule_id_from_url(&url))
+            })
     }
 }
 
@@ -125,6 +190,15 @@ pub struct AlertInstance {
 impl AlertInstance {
     fn rule_id(&self) -> Option<String> {
         map_value(&self.labels, &["ruleId", "rule_id"])
+            .or_else(|| map_value(&self.annotations, &["ruleId", "rule_id"]))
+            .or_else(|| {
+                map_value(
+                    &self.labels,
+                    &["ruleSource", "source", "source_url", "generatorURL"],
+                )
+                .and_then(|url| rule_id_from_url(&url))
+            })
+            .or_else(|| self.generator_url.as_deref().and_then(rule_id_from_url))
     }
 }
 
@@ -320,6 +394,15 @@ fn map_value(map: &BTreeMap<String, String>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| map.get(*key).cloned())
 }
 
+fn rule_id_from_url(url: &str) -> Option<String> {
+    url.split(['?', '&'])
+        .skip(1)
+        .find_map(|part| part.strip_prefix("ruleId="))
+        .and_then(|value| value.split(['&', '#']).next())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn grouped_common_map<F>(
     original_common: &BTreeMap<String, String>,
     alerts: &[AlertInstance],
@@ -379,6 +462,79 @@ mod tests {
         );
         assert_eq!(alert.enrichment.instances[0].resource, "/");
         assert_eq!(alert.enrichment.instances[1].resource, "/var/cache/fscache");
+    }
+
+    #[test]
+    fn extracts_rule_id_from_source_urls() {
+        let alert = SigNozAlert::from_value(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            },
+            "commonAnnotations": {},
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "host.name": "host-a",
+                    "severity": "critical"
+                },
+                "annotations": {},
+                "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(alert.rule_id().as_deref(), Some("rule-disk"));
+    }
+
+    #[test]
+    fn merges_alerts_for_delivery() {
+        let first = SigNozAlert::from_value(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            },
+            "commonAnnotations": {},
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "host.name": "host-a",
+                    "mountpoint": "/",
+                    "severity": "warning"
+                },
+                "annotations": {},
+                "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            }]
+        }))
+        .unwrap();
+        let second = SigNozAlert::from_value(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            },
+            "commonAnnotations": {},
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "host.name": "host-b",
+                    "mountpoint": "/var",
+                    "severity": "warning"
+                },
+                "annotations": {},
+                "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            }]
+        }))
+        .unwrap();
+
+        let merged = SigNozAlert::merged_for_delivery(&[first, second]).unwrap();
+
+        assert_eq!(merged.rule_id().as_deref(), Some("rule-disk"));
+        assert_eq!(merged.alert_name(), "Disk Space Low");
+        assert_eq!(merged.alerts.len(), 2);
+        assert_eq!(merged.enrichment.severity_counts.get("warning"), Some(&2));
     }
 
     #[test]

@@ -9,8 +9,9 @@ use axum::{
 };
 use clap::Parser;
 use serde_json::Value;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
@@ -21,9 +22,9 @@ mod signoz;
 mod tls;
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, GoogleChatReceiverConfig},
     google_chat::{DebugDeliveryLog, GoogleChatClient},
-    routing::RouteEngine,
+    routing::{Delivery, RouteEngine},
     signoz::SigNozAlert,
 };
 
@@ -43,7 +44,135 @@ struct Args {
 struct AppState {
     config: Arc<AppConfig>,
     router: Arc<RouteEngine>,
+    aggregator: AlertAggregator,
+}
+
+#[derive(Clone)]
+struct AlertAggregator {
+    enabled: bool,
+    debounce: Duration,
     google_chat: GoogleChatClient,
+    pending: Arc<AsyncMutex<BTreeMap<AggregationKey, PendingAggregation>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AggregationKey {
+    receiver: String,
+    route_name: String,
+    status: String,
+    rule_id: String,
+}
+
+struct PendingAggregation {
+    receiver: GoogleChatReceiverConfig,
+    delivery: Delivery,
+    alerts: Vec<SigNozAlert>,
+    waiters: Vec<oneshot::Sender<Result<(), String>>>,
+    debug_enabled: bool,
+}
+
+impl AlertAggregator {
+    fn new(config: &AppConfig, google_chat: GoogleChatClient) -> Self {
+        Self {
+            enabled: config.alert_grouping.enabled,
+            debounce: Duration::from_millis(config.alert_grouping.debounce_millis),
+            google_chat,
+            pending: Arc::new(AsyncMutex::new(BTreeMap::new())),
+        }
+    }
+
+    async fn deliver_google_chat(
+        &self,
+        receiver: &GoogleChatReceiverConfig,
+        alert: SigNozAlert,
+        delivery: Delivery,
+        debug_enabled: bool,
+    ) -> Result<(), WebhookError> {
+        let Some(rule_id) = alert
+            .rule_id()
+            .filter(|rule_id| self.enabled && !rule_id.is_empty())
+        else {
+            let debug = debug_enabled.then_some(DebugDeliveryLog {
+                route_name: delivery.route_name.as_str(),
+                receiver_name: delivery.receiver.as_str(),
+            });
+            self.google_chat
+                .send(receiver, &alert, &delivery, debug)
+                .await?;
+            return Ok(());
+        };
+
+        let key = AggregationKey {
+            receiver: delivery.receiver.clone(),
+            route_name: delivery.route_name.clone(),
+            status: alert.enrichment.overall_status.clone(),
+            rule_id,
+        };
+        let (waiter, delivered) = oneshot::channel();
+        let mut should_spawn = false;
+
+        {
+            use std::collections::btree_map::Entry;
+
+            let mut pending = self.pending.lock().await;
+            match pending.entry(key.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(PendingAggregation {
+                        receiver: receiver.clone(),
+                        delivery,
+                        alerts: vec![alert],
+                        waiters: vec![waiter],
+                        debug_enabled,
+                    });
+                    should_spawn = true;
+                }
+                Entry::Occupied(mut entry) => {
+                    let bucket = entry.get_mut();
+                    bucket.alerts.push(alert);
+                    bucket.waiters.push(waiter);
+                }
+            }
+        }
+
+        if should_spawn {
+            let aggregator = self.clone();
+            tokio::spawn(async move {
+                aggregator.flush_after(key).await;
+            });
+        }
+
+        delivered
+            .await
+            .map_err(|_| WebhookError::AggregatedDelivery("alert grouping task ended".to_string()))?
+            .map_err(WebhookError::AggregatedDelivery)
+    }
+
+    async fn flush_after(&self, key: AggregationKey) {
+        tokio::time::sleep(self.debounce).await;
+
+        let Some(bucket) = self.pending.lock().await.remove(&key) else {
+            return;
+        };
+
+        let result = self.flush_bucket(&bucket).await;
+        for waiter in bucket.waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+
+    async fn flush_bucket(&self, bucket: &PendingAggregation) -> Result<(), String> {
+        let alert =
+            SigNozAlert::merged_for_delivery(&bucket.alerts).map_err(|error| error.to_string())?;
+        let debug = bucket.debug_enabled.then_some(DebugDeliveryLog {
+            route_name: bucket.delivery.route_name.as_str(),
+            receiver_name: bucket.delivery.receiver.as_str(),
+        });
+
+        self.google_chat
+            .send(&bucket.receiver, &alert, &bucket.delivery, debug)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn init_crypto_provider() -> anyhow::Result<()> {
@@ -95,9 +224,10 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Router> {
     let max_body_bytes = config.server.max_body_bytes;
+    let google_chat = GoogleChatClient::new();
     let state = AppState {
         router: Arc::new(RouteEngine::new(config.as_ref().clone())?),
-        google_chat: GoogleChatClient::new(),
+        aggregator: AlertAggregator::new(&config, google_chat),
         config: Arc::clone(&config),
     };
 
@@ -139,13 +269,14 @@ async fn handle_signoz_webhook(
 
             match receiver {
                 config::ReceiverConfig::GoogleChat(receiver) => {
-                    let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
-                        route_name: delivery.route_name.as_str(),
-                        receiver_name: delivery.receiver.as_str(),
-                    });
                     state
-                        .google_chat
-                        .send(receiver, alert, delivery, debug)
+                        .aggregator
+                        .deliver_google_chat(
+                            receiver,
+                            alert.clone(),
+                            delivery.clone(),
+                            state.config.debug.log_alerts,
+                        )
                         .await?;
                     delivered_receivers.push(delivery.receiver.clone());
                 }
@@ -226,6 +357,8 @@ enum WebhookError {
     InvalidPayload(#[from] signoz::AlertParseError),
     #[error("delivery failed: {0}")]
     Delivery(#[from] google_chat::GoogleChatError),
+    #[error("delivery failed: {0}")]
+    AggregatedDelivery(String),
 }
 
 impl IntoResponse for WebhookError {
@@ -234,7 +367,9 @@ impl IntoResponse for WebhookError {
         let status = match self {
             WebhookError::Unauthorized => StatusCode::UNAUTHORIZED,
             WebhookError::InvalidPayload(_) => StatusCode::BAD_REQUEST,
-            WebhookError::Delivery(_) => StatusCode::BAD_GATEWAY,
+            WebhookError::Delivery(_) | WebhookError::AggregatedDelivery(_) => {
+                StatusCode::BAD_GATEWAY
+            }
         };
         (
             status,
@@ -248,8 +383,8 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AuthConfig, DebugConfig, GoogleChatReceiverConfig, ReceiverConfig, RoutingConfig,
-        ServerConfig,
+        AlertGroupingConfig, AuthConfig, DebugConfig, GoogleChatReceiverConfig, ReceiverConfig,
+        RoutingConfig, ServerConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -452,6 +587,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn groups_separate_webhooks_by_rule_id_before_delivery() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let config = test_config(&chat_url);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let first = app.clone().oneshot(signoz_request(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "environment": "production",
+                "severity": "critical",
+                "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            },
+            "commonAnnotations": {},
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "host.name": "host-a",
+                    "mountpoint": "/",
+                    "severity": "critical"
+                },
+                "annotations": {},
+                "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            }]
+        })));
+        let second = app.oneshot(signoz_request(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "environment": "production",
+                "severity": "critical",
+                "ruleSource": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            },
+            "commonAnnotations": {},
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "host.name": "host-b",
+                    "mountpoint": "/var",
+                    "severity": "critical"
+                },
+                "annotations": {},
+                "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            }]
+        })));
+
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().status(), StatusCode::ACCEPTED);
+        assert_eq!(second.unwrap().status(), StatusCode::ACCEPTED);
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] Disk Space Low via critical-production")
+        );
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["subtitle"].as_str(),
+            Some("2 instances | critical: 2")
+        );
+        let instances = received[0]["cardsV2"][0]["card"]["sections"][1]["widgets"]
+            .as_array()
+            .unwrap();
+        assert_eq!(instances.len(), 2);
+    }
+
+    #[tokio::test]
     async fn rejects_non_bearer_authorization_scheme() {
         let config = test_config("http://127.0.0.1:1");
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -515,6 +718,16 @@ mod tests {
         format!("http://{addr}/chat")
     }
 
+    fn signoz_request(payload: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/webhooks/signoz")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer test-token")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
     fn test_config(webhook_url: &str) -> AppConfig {
         AppConfig {
             server: ServerConfig {
@@ -525,6 +738,10 @@ mod tests {
                     bearer_token: "test-token".to_string(),
                 }),
                 tls: None,
+            },
+            alert_grouping: AlertGroupingConfig {
+                enabled: true,
+                debounce_millis: 10,
             },
             debug: DebugConfig { log_alerts: false },
             routing: RoutingConfig {

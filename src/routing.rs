@@ -168,7 +168,9 @@ fn field_value(alert: &SigNozAlert, field: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DebugConfig, GoogleChatReceiverConfig, ReceiverConfig, RoutingConfig};
+    use crate::config::{
+        AlertGroupingConfig, DebugConfig, GoogleChatReceiverConfig, ReceiverConfig, RoutingConfig,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -181,6 +183,7 @@ mod tests {
                 auth: None,
                 tls: None,
             },
+            alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig { log_alerts: false },
             routing: RoutingConfig {
                 default_receiver: Some("default".to_string()),
