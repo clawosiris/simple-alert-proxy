@@ -7,6 +7,8 @@ pub struct SigNozAlert {
     pub status: Option<String>,
     pub common_labels: BTreeMap<String, String>,
     pub common_annotations: BTreeMap<String, String>,
+    pub group_labels: BTreeMap<String, String>,
+    pub group_key: Option<String>,
     pub alerts: Vec<AlertInstance>,
     pub enrichment: AlertEnrichment,
     pub raw: Value,
@@ -30,7 +32,9 @@ impl SigNozAlert {
 
     pub fn rule_id(&self) -> Option<String> {
         map_value(&self.common_labels, &["ruleId", "rule_id"])
+            .or_else(|| map_value(&self.group_labels, &["ruleId", "rule_id"]))
             .or_else(|| map_value(&self.common_annotations, &["ruleId", "rule_id"]))
+            .or_else(|| self.group_key.as_deref().and_then(rule_id_from_group_key))
             .or_else(|| {
                 map_value(
                     &self.common_labels,
@@ -73,6 +77,8 @@ impl SigNozAlert {
                 &instances,
                 |alert| &alert.annotations,
             ),
+            group_labels: first.group_labels.clone(),
+            group_key: first.group_key.clone(),
             alerts: instances,
             external_url: first.enrichment.source_url.clone(),
         };
@@ -95,6 +101,10 @@ struct SigNozAlertPayload {
     #[serde(default)]
     common_annotations: BTreeMap<String, String>,
     #[serde(default)]
+    group_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    group_key: Option<String>,
+    #[serde(default)]
     alerts: Vec<AlertInstance>,
     #[serde(default)]
     external_url: Option<String>,
@@ -107,6 +117,8 @@ impl SigNozAlertPayload {
             status: self.status,
             common_labels: self.common_labels,
             common_annotations: self.common_annotations,
+            group_labels: self.group_labels,
+            group_key: self.group_key,
             alerts: self.alerts,
             enrichment,
             raw,
@@ -156,7 +168,9 @@ impl SigNozAlertPayload {
 
     fn common_rule_id(&self) -> Option<String> {
         map_value(&self.common_labels, &["ruleId", "rule_id"])
+            .or_else(|| map_value(&self.group_labels, &["ruleId", "rule_id"]))
             .or_else(|| map_value(&self.common_annotations, &["ruleId", "rule_id"]))
+            .or_else(|| self.group_key.as_deref().and_then(rule_id_from_group_key))
             .or_else(|| {
                 map_value(
                     &self.common_labels,
@@ -403,6 +417,24 @@ fn rule_id_from_url(url: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn rule_id_from_group_key(group_key: &str) -> Option<String> {
+    group_key
+        .split('{')
+        .skip(1)
+        .filter_map(|labels| labels.split('}').next())
+        .find_map(|labels| {
+            labels.split(',').find_map(|label| {
+                let (key, value) = label.trim().split_once('=')?;
+                if key.trim_matches('"') == "ruleId" || key.trim_matches('"') == "rule_id" {
+                    Some(value.trim().trim_matches('"').to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .filter(|value| !value.is_empty())
+}
+
 fn grouped_common_map<F>(
     original_common: &BTreeMap<String, String>,
     alerts: &[AlertInstance],
@@ -481,6 +513,56 @@ mod tests {
                 },
                 "annotations": {},
                 "generatorURL": "https://signoz.example.test/alerts/edit?ruleId=rule-disk"
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(alert.rule_id().as_deref(), Some("rule-disk"));
+    }
+
+    #[test]
+    fn extracts_rule_id_from_group_labels() {
+        let alert = SigNozAlert::from_value(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "severity": "critical"
+            },
+            "groupLabels": {
+                "ruleId": "rule-disk"
+            },
+            "commonAnnotations": {},
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "host.name": "host-a",
+                    "severity": "critical"
+                },
+                "annotations": {}
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(alert.rule_id().as_deref(), Some("rule-disk"));
+    }
+
+    #[test]
+    fn extracts_rule_id_from_group_key() {
+        let alert = SigNozAlert::from_value(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "severity": "critical"
+            },
+            "groupKey": "{__receiver__=\"ops\"}:{ruleId=\"rule-disk\"}",
+            "commonAnnotations": {},
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "host.name": "host-a",
+                    "severity": "critical"
+                },
+                "annotations": {}
             }]
         }))
         .unwrap();

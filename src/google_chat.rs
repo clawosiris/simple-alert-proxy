@@ -166,25 +166,15 @@ fn build_sections(alert: &SigNozAlert) -> Vec<serde_json::Value> {
 }
 
 fn grouped_instance_lines(alert: &SigNozAlert) -> Vec<String> {
-    let mut groups: BTreeMap<(String, String, String), usize> = BTreeMap::new();
-
-    for instance in &alert.enrichment.instances {
-        let key = (
-            instance.host.clone(),
-            instance.severity.clone(),
-            instance.resource.clone(),
-        );
-        *groups.entry(key).or_insert(0) += 1;
-    }
-
-    groups
-        .into_iter()
-        .map(|((host, severity, resource), count)| {
-            let mut line = format!("{host} | {severity} | {resource}");
-            if count > 1 {
-                line.push_str(&format!(" ({count})"));
-            }
-            line
+    alert
+        .enrichment
+        .instances
+        .iter()
+        .map(|instance| {
+            format!(
+                "{} | {} | {}",
+                instance.host, instance.severity, instance.resource
+            )
         })
         .collect()
 }
@@ -255,6 +245,63 @@ mod tests {
         assert_eq!(
             instances[0]["textParagraph"]["text"].as_str(),
             Some("host000.het.example.com | warning | /")
+        );
+    }
+
+    #[test]
+    fn renders_each_alert_instance_as_its_own_row() {
+        let alert = SigNozAlert::from_value(serde_json::json!({
+            "status": "firing",
+            "commonLabels": {
+                "alertname": "Disk Space Low",
+                "severity": "critical"
+            },
+            "commonAnnotations": {},
+            "alerts": [
+                {
+                    "status": "firing",
+                    "labels": {
+                        "host.name": "host-a",
+                        "mountpoint": "/",
+                        "severity": "critical"
+                    },
+                    "annotations": {}
+                },
+                {
+                    "status": "firing",
+                    "labels": {
+                        "host.name": "host-a",
+                        "mountpoint": "/",
+                        "severity": "critical"
+                    },
+                    "annotations": {}
+                }
+            ]
+        }))
+        .unwrap();
+        let receiver = GoogleChatReceiverConfig {
+            webhook_url: "https://chat.googleapis.test/ops".to_string(),
+            title_template: "[{{status}}] {{alertname}}".to_string(),
+            timeout_secs: 10,
+        };
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "ops-chat".to_string(),
+        };
+
+        let payload = build_message(&receiver, &alert, &delivery);
+        let instances = payload["cardsV2"][0]["card"]["sections"][1]["widgets"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(instances.len(), 2);
+        assert_eq!(
+            instances[0]["textParagraph"]["text"].as_str(),
+            Some("host-a | critical | /")
+        );
+        assert_eq!(
+            instances[1]["textParagraph"]["text"].as_str(),
+            Some("host-a | critical | /")
         );
     }
 }

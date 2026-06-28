@@ -654,6 +654,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn groups_separate_webhooks_by_group_labels_rule_id() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let config = test_config(&chat_url);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let first = app
+            .clone()
+            .oneshot(signoz_request(serde_json::json!({
+                "status": "firing",
+                "commonLabels": {
+                    "alertname": "Disk Space Low",
+                    "environment": "production",
+                    "severity": "critical"
+                },
+                "groupLabels": {
+                    "ruleId": "rule-disk"
+                },
+                "commonAnnotations": {},
+                "alerts": [{
+                    "status": "firing",
+                    "labels": {
+                        "host.name": "host-a",
+                        "mountpoint": "/",
+                        "severity": "critical"
+                    },
+                    "annotations": {}
+                }]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        let second = app
+            .oneshot(signoz_request(serde_json::json!({
+                "status": "firing",
+                "commonLabels": {
+                    "alertname": "Disk Space Low",
+                    "environment": "production",
+                    "severity": "critical"
+                },
+                "groupLabels": {
+                    "ruleId": "rule-disk"
+                },
+                "commonAnnotations": {},
+                "alerts": [{
+                    "status": "firing",
+                    "labels": {
+                        "host.name": "host-b",
+                        "mountpoint": "/var",
+                        "severity": "critical"
+                    },
+                    "annotations": {}
+                }]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+
+        wait_for_received_count(&received, 1).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["subtitle"].as_str(),
+            Some("2 instances | critical: 2")
+        );
+        let instances = received[0]["cardsV2"][0]["card"]["sections"][1]["widgets"]
+            .as_array()
+            .unwrap();
+        assert_eq!(instances.len(), 2);
+    }
+
+    #[tokio::test]
     async fn rejects_non_bearer_authorization_scheme() {
         let config = test_config("http://127.0.0.1:1");
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
