@@ -84,6 +84,9 @@ sudo systemctl enable --now simple-alert-proxy.service
 
 See [examples/config.yaml](examples/config.yaml) for a working example and [docs/SPEC.md](docs/SPEC.md) for the full contract.
 
+For the proposed evolution into a source-agnostic alert webhook gateway, see
+[docs/ALERT_WEBHOOK_GATEWAY_PRD.md](docs/ALERT_WEBHOOK_GATEWAY_PRD.md).
+
 To log incoming webhook payloads and outgoing receiver payloads to stderr:
 
 ```yaml
