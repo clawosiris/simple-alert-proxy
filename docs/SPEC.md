@@ -252,6 +252,24 @@ routing:
 External schedule sources such as iCalendar, Google Calendar, CalDAV, GoAlert,
 or static YAML can be represented by generated config or later scheduler inputs.
 
+## Optional Intelligence
+
+Intelligence support is optional and disabled by default. Advisory enrichment is
+stored separately from canonical alert group state, delivery state, and lifecycle
+state.
+
+```yaml
+intelligence:
+  enabled: false
+  provider: "openai"
+  allow_lifecycle_mutation: false
+```
+
+The advisory storage model supports suggested summaries, labels, fingerprints,
+and correlations without changing alert lifecycle state. Lifecycle mutation is
+rejected unless intelligence is enabled and the operator explicitly configures
+`allow_lifecycle_mutation`.
+
 Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery. Grouped alerts are enqueued before the webhook response returns, then flushed in the background after the debounce window.
 
 ```yaml

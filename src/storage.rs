@@ -104,6 +104,16 @@ impl Storage {
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
             );
+
+            CREATE TABLE IF NOT EXISTS advisory_enrichments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_group_id INTEGER,
+                provider TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
+            );
             "#,
         )?;
         add_column_if_missing(&conn, "alert_events", "alert_group_id INTEGER")?;
@@ -387,6 +397,44 @@ impl Storage {
     }
 
     #[cfg(test)]
+    pub fn add_advisory(
+        &self,
+        alert_group_id: Option<i64>,
+        provider: &str,
+        kind: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO advisory_enrichments (
+                alert_group_id, provider, kind, value, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![alert_group_id, provider, kind, value, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_advisories(&self) -> anyhow::Result<Vec<AdvisoryRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, alert_group_id, provider, kind, value, created_at
+            FROM advisory_enrichments
+            ORDER BY created_at DESC, id DESC
+            LIMIT 500
+            "#,
+        )?;
+        let records = stmt
+            .query_map([], advisory_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    #[cfg(test)]
     pub fn audit_actions(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT action FROM audit_entries ORDER BY id")?;
@@ -488,6 +536,16 @@ pub struct DeliveryRecord {
     pub response_summary: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdvisoryRecord {
+    pub id: i64,
+    pub alert_group_id: Option<i64>,
+    pub provider: String,
+    pub kind: String,
+    pub value: String,
+    pub created_at: i64,
 }
 
 fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow::Result<i64> {
@@ -592,6 +650,17 @@ fn delivery_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Deliver
         response_summary: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+    })
+}
+
+fn advisory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdvisoryRecord> {
+    Ok(AdvisoryRecord {
+        id: row.get(0)?,
+        alert_group_id: row.get(1)?,
+        provider: row.get(2)?,
+        kind: row.get(3)?,
+        value: row.get(4)?,
+        created_at: row.get(5)?,
     })
 }
 

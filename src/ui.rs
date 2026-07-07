@@ -176,7 +176,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     </section>
   </main>
   <script>
-    const state = { groups: [], events: [], deliveries: [], routes: [], integrations: [], selected: null };
+    const state = { groups: [], events: [], deliveries: [], advisories: [], routes: [], integrations: [], selected: null };
     const $ = (id) => document.getElementById(id);
     const api = (url, options = {}) => fetch(url, options).then((r) => {
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -188,10 +188,11 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     })[ch]);
 
     async function load() {
-      [state.groups, state.events, state.deliveries, state.integrations, state.routes] = await Promise.all([
+      [state.groups, state.events, state.deliveries, state.advisories, state.integrations, state.routes] = await Promise.all([
         api("/api/alert-groups"),
         api("/api/alert-events"),
         api("/api/deliveries"),
+        api("/api/advisories"),
         api("/api/integrations"),
         api("/api/routes"),
       ]);
@@ -228,6 +229,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
       const deliveries = state.deliveries.filter((delivery) =>
         events.some((event) => event.id === delivery.alert_event_id)
       );
+      const advisories = state.advisories.filter((item) => item.alert_group_id === group.id);
       const latest = events[0];
       $("detail").innerHTML = `
         <div class="actions">
@@ -242,6 +244,16 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
           <div>Source</div><div>${esc(group.source)} / ${esc(group.integration)}</div>
           <div>Fingerprint</div><div>${esc(group.fingerprint)}</div>
           <div>Events</div><div>${group.event_count}</div>
+        </div>
+        <div class="stack">
+          <h2>Advisory</h2>
+          ${advisories.map((item) => `
+            <div class="item">
+              <strong>${esc(item.kind)}</strong>
+              <span class="muted">${esc(item.provider)}</span>
+              <div>${esc(item.value)}</div>
+            </div>
+          `).join("") || `<div class="muted">No advisory enrichment.</div>`}
         </div>
         <div class="stack">
           <h2>Deliveries</h2>

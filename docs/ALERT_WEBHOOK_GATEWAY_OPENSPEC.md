@@ -332,6 +332,15 @@ Add advisory intelligence without making it part of correctness.
 - Advisory summary/correlation records.
 - UI affordances that distinguish suggestions from canonical state.
 
+### Implementation Notes
+
+- `intelligence` config is disabled by default and validates provider presence
+  only when enabled.
+- Advisory enrichment records are stored separately from alert group lifecycle
+  state.
+- The operator UI renders advisories in a separate detail section so suggestions
+  do not look canonical.
+
 ### Acceptance
 
 - Core ingestion, routing, dedupe, delivery, ack, and recovery work with no LLM

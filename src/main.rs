@@ -242,6 +242,7 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         .route("/api/alert-groups", get(list_alert_groups))
         .route("/api/alert-events", get(list_alert_events))
         .route("/api/deliveries", get(list_deliveries))
+        .route("/api/advisories", get(list_advisories))
         .route("/api/integrations", get(list_integrations))
         .route("/api/routes", get(list_routes))
         .route("/api/alert-groups/{id}/ack", post(acknowledge_group))
@@ -283,6 +284,14 @@ async fn list_deliveries(
 ) -> Result<impl IntoResponse, WebhookError> {
     authorize(state.config.server.auth.as_ref(), &headers)?;
     Ok(Json(state.storage.list_deliveries()?))
+}
+
+async fn list_advisories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    Ok(Json(state.storage.list_advisories()?))
 }
 
 async fn list_integrations(
@@ -736,8 +745,8 @@ mod tests {
     use crate::config::{
         AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, EscalationConfig,
         EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
-        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig, ReceiverConfig,
-        RoutingConfig, ServerConfig, StorageConfig,
+        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
+        IntelligenceConfig, ReceiverConfig, RoutingConfig, ServerConfig, StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -1048,6 +1057,38 @@ mod tests {
             storage.audit_actions().unwrap(),
             vec!["acknowledge", "silence", "resolve", "replay"]
         );
+    }
+
+    #[test]
+    fn advisory_enrichment_is_stored_separately_from_group_state() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = AlertEvent::new(
+            "test",
+            "test",
+            "firing",
+            "critical",
+            "Advisory Test",
+            "advisory-test",
+            serde_json::json!({}),
+        );
+        storage.store_event(&event).unwrap();
+        let group_id = storage.list_alert_groups().unwrap()[0].id;
+
+        storage
+            .add_advisory(
+                Some(group_id),
+                "test-provider",
+                "summary",
+                "Likely duplicate",
+            )
+            .unwrap();
+
+        let group = &storage.list_alert_groups().unwrap()[0];
+        let advisory = &storage.list_advisories().unwrap()[0];
+        assert_eq!(group.status, "active");
+        assert_eq!(advisory.alert_group_id, Some(group_id));
+        assert_eq!(advisory.kind, "summary");
+        assert_eq!(advisory.value, "Likely duplicate");
     }
 
     #[tokio::test]
@@ -1729,6 +1770,7 @@ mod tests {
                 max_backoff_millis: 1,
             },
             escalation: EscalationConfig::default(),
+            intelligence: IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig {
                 enabled: true,
                 debounce_millis: 10,

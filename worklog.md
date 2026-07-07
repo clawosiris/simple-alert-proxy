@@ -15,3 +15,5 @@
 - Started Phase 5: generic webhook, Slack, Mattermost, and Discord receiver configs/adapters plus source preset validation.
 - Completed Phase 5 locally, committed `e5769ed`, pushed, and checked Phase 5 boxes in issue #10.
 - Started Phase 6: escalation policy config, route policy selection, persisted escalation tasks, and cancellation on ack/resolve.
+- Completed Phase 6 locally, committed `a6589bf`, pushed, and checked Phase 6 boxes in issue #10.
+- Started Phase 7: optional intelligence config disabled by default, advisory enrichment records/API, and UI advisory section.

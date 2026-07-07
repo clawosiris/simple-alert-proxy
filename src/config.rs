@@ -14,6 +14,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub escalation: EscalationConfig,
     #[serde(default)]
+    pub intelligence: IntelligenceConfig,
+    #[serde(default)]
     pub alert_grouping: AlertGroupingConfig,
     #[serde(default)]
     pub debug: DebugConfig,
@@ -43,6 +45,7 @@ impl AppConfig {
         self.storage.validate()?;
         self.delivery.validate()?;
         self.escalation.validate()?;
+        self.intelligence.validate()?;
 
         if let Some(auth) = &self.server.auth
             && auth.bearer_token.is_empty()
@@ -230,6 +233,34 @@ pub struct EscalationStepConfig {
     pub stop_on_ack: bool,
     #[serde(default = "default_stop_on_resolve")]
     pub stop_on_resolve: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IntelligenceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub allow_lifecycle_mutation: bool,
+}
+
+impl IntelligenceConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.enabled
+            && self
+                .provider
+                .as_deref()
+                .is_none_or(|provider| provider.is_empty())
+        {
+            bail!("intelligence.provider must be set when intelligence.enabled is true");
+        }
+
+        if self.allow_lifecycle_mutation && !self.enabled {
+            bail!("intelligence.allow_lifecycle_mutation requires intelligence.enabled");
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for DeliveryConfig {
@@ -662,6 +693,7 @@ mod tests {
             },
             delivery: DeliveryConfig::default(),
             escalation: EscalationConfig::default(),
+            intelligence: IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig::default(),
             routing: RoutingConfig::default(),

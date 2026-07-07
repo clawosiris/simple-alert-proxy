@@ -202,6 +202,7 @@ mod tests {
             },
             delivery: DeliveryConfig::default(),
             escalation: crate::config::EscalationConfig::default(),
+            intelligence: crate::config::IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig { log_alerts: false },
             routing: RoutingConfig {
