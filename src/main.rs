@@ -1239,6 +1239,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn end_to_end_synthetic_webhooks_route_deliver_and_dedupe_alert_groups() {
+        let critical_received = Arc::new(Mutex::new(Vec::new()));
+        let warning_received = Arc::new(Mutex::new(Vec::new()));
+        let default_received = Arc::new(Mutex::new(Vec::new()));
+        let critical_url = spawn_mock_google_chat(Arc::clone(&critical_received)).await;
+        let warning_url = spawn_mock_google_chat(Arc::clone(&warning_received)).await;
+        let default_url = spawn_mock_google_chat(Arc::clone(&default_received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.integrations = synthetic_test_integrations();
+        config.routing.default_receiver = Some("default-target".to_string());
+        config.routing.routes = vec![
+            config::RouteConfig {
+                name: "critical-synthetic".to_string(),
+                receiver: "critical-target".to_string(),
+                escalation_policy: None,
+                continue_matching: false,
+                matchers: vec![config::MatcherConfig {
+                    field: "severity".to_string(),
+                    equals: Some("critical".to_string()),
+                    regex: None,
+                    contains: None,
+                }],
+            },
+            config::RouteConfig {
+                name: "warning-synthetic".to_string(),
+                receiver: "warning-target".to_string(),
+                escalation_policy: None,
+                continue_matching: false,
+                matchers: vec![config::MatcherConfig {
+                    field: "severity".to_string(),
+                    equals: Some("warning".to_string()),
+                    regex: None,
+                    contains: None,
+                }],
+            },
+        ];
+        config.receivers = BTreeMap::from([
+            (
+                "critical-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: critical_url,
+                    timeout_secs: 10,
+                }),
+            ),
+            (
+                "warning-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: warning_url,
+                    timeout_secs: 10,
+                }),
+            ),
+            (
+                "default-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: default_url,
+                    timeout_secs: 10,
+                }),
+            ),
+        ]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        let mut generator = SyntheticWebhookGenerator::new();
+
+        for payload in [
+            generator.alert("svc-cpu", "firing", "critical", "checkout", "CPU saturated"),
+            generator.alert(
+                "svc-disk",
+                "firing",
+                "warning",
+                "postgres",
+                "Disk space low",
+            ),
+            generator.alert(
+                "svc-latency",
+                "firing",
+                "info",
+                "frontend",
+                "Latency rising",
+            ),
+            generator.alert("svc-cpu", "firing", "critical", "checkout", "CPU saturated"),
+            generator.alert(
+                "svc-cpu",
+                "resolved",
+                "critical",
+                "checkout",
+                "CPU saturated",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(synthetic_request(payload))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        wait_for_received_count(&critical_received, 3).await;
+        wait_for_received_count(&warning_received, 1).await;
+        wait_for_received_count(&default_received, 1).await;
+        wait_for_succeeded_deliveries(app.clone(), 5).await;
+
+        let critical = critical_received.lock().unwrap();
+        assert_eq!(critical.len(), 3);
+        assert!(critical.iter().all(|payload| {
+            payload["event"]["fingerprint"] == "svc-cpu"
+                && payload["event"]["severity"] == "critical"
+                && payload["event"]["source"] == "synthetic-monitor"
+                && payload["event"]["labels"]["service"] == "checkout"
+                && payload["delivery"]["route"] == "critical-synthetic"
+                && payload["delivery"]["receiver"] == "critical-target"
+        }));
+        assert!(
+            critical
+                .iter()
+                .any(|payload| payload["event"]["status"] == "resolved")
+        );
+        drop(critical);
+
+        let warning = warning_received.lock().unwrap();
+        assert_eq!(warning[0]["event"]["fingerprint"], "svc-disk");
+        assert_eq!(warning[0]["event"]["severity"], "warning");
+        assert_eq!(warning[0]["delivery"]["route"], "warning-synthetic");
+        assert_eq!(warning[0]["delivery"]["receiver"], "warning-target");
+        drop(warning);
+
+        let default = default_received.lock().unwrap();
+        assert_eq!(default[0]["event"]["fingerprint"], "svc-latency");
+        assert_eq!(default[0]["event"]["severity"], "info");
+        assert_eq!(default[0]["delivery"]["route"], "default");
+        assert_eq!(default[0]["delivery"]["receiver"], "default-target");
+        drop(default);
+
+        let groups = get_api_json(app.clone(), "/api/alert-groups").await;
+        let critical_group = find_record(&groups, "fingerprint", "svc-cpu");
+        assert_eq!(critical_group["event_count"], 3);
+        assert_eq!(critical_group["status"], "resolved");
+        assert_eq!(critical_group["severity"], "critical");
+        assert_eq!(
+            find_record(&groups, "fingerprint", "svc-disk")["event_count"],
+            1
+        );
+        assert_eq!(
+            find_record(&groups, "fingerprint", "svc-latency")["status"],
+            "active"
+        );
+
+        let events = get_api_json(app.clone(), "/api/alert-events").await;
+        assert_eq!(events.as_array().unwrap().len(), 5);
+        assert_eq!(
+            find_record(&events, "fingerprint", "svc-cpu")["raw_payload"]["asset"]["service"],
+            "checkout"
+        );
+
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        let targets = deliveries
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["target"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| **target == "critical-target")
+                .count(),
+            3
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| **target == "warning-target")
+                .count(),
+            1
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| **target == "default-target")
+                .count(),
+            1
+        );
+        assert!(deliveries.as_array().unwrap().iter().all(|record| {
+            record["status"] == "succeeded" && record["attempt_count"].as_u64() == Some(1)
+        }));
+    }
+
+    #[tokio::test]
     async fn generic_webhook_path_rejects_unknown_integration() {
         let config = test_config("http://127.0.0.1:1");
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -1703,6 +1891,47 @@ mod tests {
         );
     }
 
+    async fn get_api_json(app: Router, uri: &str) -> Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn wait_for_succeeded_deliveries(app: Router, expected: usize) {
+        for _ in 0..100 {
+            let deliveries = get_api_json(app.clone(), "/api/deliveries").await;
+            if deliveries.as_array().is_some_and(|records| {
+                records.len() == expected
+                    && records.iter().all(|record| record["status"] == "succeeded")
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        panic!("timed out waiting for {expected} succeeded deliveries: {deliveries}");
+    }
+
+    fn find_record<'a>(records: &'a Value, field: &str, expected: &str) -> &'a Value {
+        records
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record[field].as_str() == Some(expected))
+            .unwrap_or_else(|| panic!("missing record where {field} is {expected}: {records}"))
+    }
+
     fn signoz_request(payload: Value) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -1720,6 +1949,52 @@ mod tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(payload.to_string()))
             .unwrap()
+    }
+
+    fn synthetic_request(payload: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/webhooks/synthetic")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
+    struct SyntheticWebhookGenerator {
+        sequence: u32,
+    }
+
+    impl SyntheticWebhookGenerator {
+        fn new() -> Self {
+            Self { sequence: 0 }
+        }
+
+        fn alert(
+            &mut self,
+            fingerprint: &str,
+            status: &str,
+            severity: &str,
+            service: &str,
+            title: &str,
+        ) -> Value {
+            self.sequence += 1;
+            serde_json::json!({
+                "state": status,
+                "risk": { "level": severity },
+                "finding": {
+                    "id": fingerprint,
+                    "title": title,
+                    "description": format!("{title} generated by synthetic webhook {}", self.sequence),
+                    "plugin": "synthetic-e2e",
+                    "url": format!("https://alerts.example.test/findings/{fingerprint}")
+                },
+                "asset": {
+                    "service": service,
+                    "host": format!("{service}-{}", self.sequence)
+                },
+                "observed_at": format!("2026-07-07T11:{:02}:00Z", self.sequence)
+            })
+        }
     }
 
     fn generic_test_integrations() -> BTreeMap<String, IntegrationConfig> {
@@ -1740,6 +2015,31 @@ mod tests {
                 labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
                 annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
                 links: BTreeMap::new(),
+            }),
+        )])
+    }
+
+    fn synthetic_test_integrations() -> BTreeMap<String, IntegrationConfig> {
+        BTreeMap::from([(
+            "synthetic".to_string(),
+            IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                preset: None,
+                path: "/webhooks/synthetic".to_string(),
+                auth: None,
+                source: "synthetic-monitor".to_string(),
+                status: "state".to_string(),
+                severity: Some("risk.level".to_string()),
+                title: "finding.title".to_string(),
+                body: Some("finding.description".to_string()),
+                fingerprint: "finding.id".to_string(),
+                starts_at: Some("observed_at".to_string()),
+                ends_at: None,
+                labels: BTreeMap::from([
+                    ("service".to_string(), "asset.service".to_string()),
+                    ("host".to_string(), "asset.host".to_string()),
+                ]),
+                annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
+                links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
             }),
         )])
     }

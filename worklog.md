@@ -17,3 +17,5 @@
 - Started Phase 6: escalation policy config, route policy selection, persisted escalation tasks, and cancellation on ack/resolve.
 - Completed Phase 6 locally, committed `a6589bf`, pushed, and checked Phase 6 boxes in issue #10.
 - Started Phase 7: optional intelligence config disabled by default, advisory enrichment records/API, and UI advisory section.
+- Started E2E core alert proxy test work on `alert-proxy_v2`: synthetic webhook generator, mock receivers, severity routing, canonical output checks, and alert-group dedupe assertions.
+- Completed E2E test locally; `cargo fmt --check`, `cargo test`, and `git diff --check` pass with 44 tests.
