@@ -1,6 +1,6 @@
 use crate::{
+    alert::AlertEvent,
     config::{AppConfig, MatcherConfig, RouteConfig},
-    signoz::SigNozAlert,
 };
 use regex::Regex;
 
@@ -34,11 +34,11 @@ impl RouteEngine {
         })
     }
 
-    pub fn plan(&self, alert: &SigNozAlert) -> DeliveryPlan {
+    pub fn plan(&self, event: &AlertEvent) -> DeliveryPlan {
         let mut deliveries = Vec::new();
 
         for route in &self.routes {
-            if route.matches(alert) {
+            if route.matches(event) {
                 deliveries.push(Delivery {
                     route_name: route.name.clone(),
                     receiver: route.receiver.clone(),
@@ -86,8 +86,8 @@ impl CompiledRoute {
         })
     }
 
-    fn matches(&self, alert: &SigNozAlert) -> bool {
-        self.matchers.iter().all(|matcher| matcher.matches(alert))
+    fn matches(&self, event: &AlertEvent) -> bool {
+        self.matchers.iter().all(|matcher| matcher.matches(event))
     }
 }
 
@@ -110,8 +110,8 @@ impl CompiledMatcher {
         })
     }
 
-    fn matches(&self, alert: &SigNozAlert) -> bool {
-        let Some(value) = field_value(alert, &self.field) else {
+    fn matches(&self, event: &AlertEvent) -> bool {
+        let Some(value) = field_value(event, &self.field) else {
             return false;
         };
 
@@ -137,17 +137,23 @@ impl CompiledMatcher {
     }
 }
 
-fn field_value(alert: &SigNozAlert, field: &str) -> Option<String> {
-    if field == "status" {
-        return alert.status.clone();
+fn field_value(event: &AlertEvent, field: &str) -> Option<String> {
+    match field {
+        "integration" => return Some(event.integration.clone()),
+        "source" => return Some(event.source.clone()),
+        "status" => return Some(event.status.clone()),
+        "severity" => return Some(event.severity.clone()),
+        "title" | "alertname" => return Some(event.title.clone()),
+        "fingerprint" => return Some(event.fingerprint.clone()),
+        _ => {}
     }
 
     if let Some(name) = field.strip_prefix("label.") {
-        return alert.common_labels.get(name).cloned();
+        return event.labels.get(name).cloned();
     }
 
     if let Some(name) = field.strip_prefix("annotation.") {
-        return alert.common_annotations.get(name).cloned();
+        return event.annotations.get(name).cloned();
     }
 
     if let Some(pointer) = field.strip_prefix("payload.") {
@@ -156,8 +162,8 @@ fn field_value(alert: &SigNozAlert, field: &str) -> Option<String> {
         } else {
             format!("/{pointer}")
         };
-        return alert
-            .raw
+        return event
+            .raw_payload
             .pointer(&pointer)
             .and_then(|value| value.as_str().map(ToOwned::to_owned));
     }
@@ -183,6 +189,7 @@ mod tests {
                 auth: None,
                 tls: None,
             },
+            integrations: BTreeMap::new(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig { log_alerts: false },
             routing: RoutingConfig {
@@ -219,7 +226,7 @@ mod tests {
             ]),
         };
         let engine = RouteEngine::new(config).unwrap();
-        let alert = SigNozAlert::from_value(serde_json::json!({
+        let alert = crate::signoz::SigNozAlert::from_value(serde_json::json!({
             "status": "firing",
             "commonLabels": {
                 "severity": "critical"
@@ -228,8 +235,9 @@ mod tests {
             "alerts": []
         }))
         .unwrap();
+        let event = alert.to_alert_event("signoz");
 
-        let plan = engine.plan(&alert);
+        let plan = engine.plan(&event);
 
         assert_eq!(plan.deliveries.len(), 1);
         assert_eq!(plan.deliveries[0].receiver, "prod");

@@ -1,0 +1,17 @@
+{
+  "state": "firing",
+  "risk": {
+    "level": "high"
+  },
+  "finding": {
+    "id": "openvas-finding-42",
+    "title": "TLS certificate expired",
+    "description": "The certificate on edge-1 expired yesterday.",
+    "plugin": "ssl-cert-check",
+    "url": "https://scanner.example.test/findings/42"
+  },
+  "asset": {
+    "host": "edge-1.example.test"
+  },
+  "observed_at": "2026-07-07T10:00:00Z"
+}

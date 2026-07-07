@@ -1,4 +1,6 @@
-use crate::{config::GoogleChatReceiverConfig, routing::Delivery, signoz::SigNozAlert};
+use crate::{
+    alert::AlertEvent, config::GoogleChatReceiverConfig, routing::Delivery, signoz::SigNozAlert,
+};
 use reqwest::StatusCode;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -24,6 +26,34 @@ impl GoogleChatClient {
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
         let message = build_message(receiver, alert, delivery);
+
+        if let Some(debug) = debug {
+            log_outgoing_alert(&message, debug);
+        }
+
+        let response = self
+            .http
+            .post(&receiver.webhook_url)
+            .timeout(Duration::from_secs(receiver.timeout_secs))
+            .json(&message)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(GoogleChatError::Rejected(response.status()))
+        }
+    }
+
+    pub async fn send_event(
+        &self,
+        receiver: &GoogleChatReceiverConfig,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let message = build_event_message(receiver, event, delivery);
 
         if let Some(debug) = debug {
             log_outgoing_alert(&message, debug);
@@ -85,6 +115,118 @@ fn build_message(
             }
         }],
     })
+}
+
+fn build_event_message(
+    receiver: &GoogleChatReceiverConfig,
+    event: &AlertEvent,
+    delivery: &Delivery,
+) -> serde_json::Value {
+    let title = format_event_title(receiver, event, delivery);
+
+    json!({
+        "cardsV2": [{
+            "cardId": "alert-event",
+            "card": {
+                "header": {
+                    "title": title,
+                    "subtitle": format!("{} | {} | {}", event.source, event.status, event.severity),
+                },
+                "sections": build_event_sections(event),
+            }
+        }],
+    })
+}
+
+fn format_event_title(
+    receiver: &GoogleChatReceiverConfig,
+    event: &AlertEvent,
+    delivery: &Delivery,
+) -> String {
+    let mut title = receiver
+        .title_template
+        .replace("{{status}}", &event.status)
+        .replace("{{alertname}}", &event.title)
+        .replace("{{title}}", &event.title)
+        .replace("{{severity}}", &event.severity);
+
+    if !delivery.route_name.is_empty() {
+        title.push_str(&format!(" via {}", delivery.route_name));
+    }
+
+    title
+}
+
+fn build_event_sections(event: &AlertEvent) -> Vec<serde_json::Value> {
+    let mut summary_widgets = vec![
+        json!({
+            "decoratedText": {
+                "text": format!("Status: {}", event.status),
+            }
+        }),
+        json!({
+            "decoratedText": {
+                "text": format!("Severity: {}", event.severity),
+            }
+        }),
+        json!({
+            "decoratedText": {
+                "text": format!("Fingerprint: {}", event.fingerprint),
+            }
+        }),
+    ];
+
+    if let Some(body) = &event.body {
+        summary_widgets.push(json!({
+            "textParagraph": {
+                "text": escape_chat_html(body),
+            }
+        }));
+    }
+
+    for link in &event.links {
+        summary_widgets.push(json!({
+            "textParagraph": {
+                "text": format!(
+                    "{}: <a href=\"{}\">LINK</a>",
+                    escape_chat_html(&link.label),
+                    escape_chat_html(&link.url)
+                ),
+            }
+        }));
+    }
+
+    let mut sections = vec![json!({ "widgets": summary_widgets })];
+
+    if !event.labels.is_empty() {
+        sections.push(json!({
+            "header": "Labels",
+            "widgets": map_lines(&event.labels),
+        }));
+    }
+
+    if !event.annotations.is_empty() {
+        sections.push(json!({
+            "header": "Annotations",
+            "widgets": map_lines(&event.annotations),
+        }));
+    }
+
+    sections
+}
+
+fn map_lines(values: &BTreeMap<String, String>) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            json!({
+                "decoratedText": {
+                    "topLabel": key,
+                    "text": value,
+                }
+            })
+        })
+        .collect()
 }
 
 fn format_title(
@@ -302,6 +444,44 @@ mod tests {
         assert_eq!(
             instances[1]["textParagraph"]["text"].as_str(),
             Some("host-a | critical | /")
+        );
+    }
+
+    #[test]
+    fn builds_generic_event_card_payload() {
+        let mut event = AlertEvent::new(
+            "openvas",
+            "openvas",
+            "firing",
+            "high",
+            "TLS certificate expired",
+            "finding-1",
+            serde_json::json!({}),
+        );
+        event.body = Some("Certificate expired yesterday".to_string());
+        event
+            .labels
+            .insert("asset".to_string(), "edge-1".to_string());
+        let receiver = GoogleChatReceiverConfig {
+            webhook_url: "https://chat.googleapis.test/ops".to_string(),
+            title_template: "[{{status}}] {{alertname}}".to_string(),
+            timeout_secs: 10,
+        };
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "ops-chat".to_string(),
+        };
+
+        let payload = build_event_message(&receiver, &event, &delivery);
+
+        assert_eq!(
+            payload["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] TLS certificate expired via ops")
+        );
+        assert_eq!(
+            payload["cardsV2"][0]["card"]["sections"][1]["widgets"][0]["decoratedText"]["text"]
+                .as_str(),
+            Some("edge-1")
         );
     }
 }

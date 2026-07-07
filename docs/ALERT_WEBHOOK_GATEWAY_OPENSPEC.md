@@ -86,6 +86,16 @@ the current SigNoz flow intact.
 - Generic JSON webhook example config and fixture.
 - Tests for SigNoz compatibility and generic webhook normalization.
 
+### Implementation Notes
+
+- `src/alert.rs` defines the canonical `AlertEvent`.
+- `src/integration.rs` defines the integration normalization abstraction,
+  including the SigNoz compatibility adapter and generic JSON mapper.
+- Generic JSON integrations are configured under `integrations` and are served
+  through `POST /webhooks/{integration}`.
+- Routing now evaluates canonical alert events, while existing SigNoz Google
+  Chat delivery and grouping behavior remain intact.
+
 ### Acceptance
 
 - Existing SigNoz tests pass without weakening assertions.

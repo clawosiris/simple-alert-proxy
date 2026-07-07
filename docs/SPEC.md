@@ -58,6 +58,44 @@ Invalid payloads return `400`. Ungrouped receiver failures return `502`. Grouped
 
 If bearer authentication is enabled, missing or invalid credentials return `401`.
 
+### `POST /webhooks/{integration}`
+
+Generic JSON integrations can be configured under `integrations`. Each
+integration maps fields from an arbitrary JSON payload into the canonical alert
+event model with config only.
+
+```yaml
+integrations:
+  openvas-example:
+    type: generic_json
+    path: "/webhooks/openvas-example"
+    auth:
+      bearer_token: "replace-me"
+    source: "openvas"
+    status: "state"
+    severity: "risk.level"
+    title: "finding.title"
+    body: "finding.description"
+    fingerprint: "finding.id"
+    starts_at: "observed_at"
+    labels:
+      asset: "asset.host"
+    annotations:
+      plugin: "finding.plugin"
+    links:
+      source: "finding.url"
+```
+
+Field mappings accept either dotted paths such as `finding.title` or JSON
+pointers such as `/finding/title`. Required mappings are `source`, `status`,
+`title`, and `fingerprint`; invalid integration config fails at startup with a
+clear validation error. A missing configured integration returns `404`, while a
+payload missing a required mapped field returns `400`.
+
+Integration-specific bearer auth overrides the server-level bearer token for
+that integration. If no integration auth is configured, the server auth setting
+applies.
+
 ## SigNoz Integration
 
 SigNoz's webhook notification channel posts Alertmanager-style webhook payloads to the proxy. In current SigNoz docs, the setup flow is:
@@ -164,7 +202,12 @@ Supported matcher operators:
 
 Supported matcher fields:
 
+- `integration`
+- `source`
 - `status`
+- `severity`
+- `title`
+- `fingerprint`
 - `label.<name>`
 - `annotation.<name>`
 - `payload.<json-pointer-or-path>`

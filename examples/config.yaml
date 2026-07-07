@@ -11,6 +11,26 @@ server:
 debug:
   log_alerts: false
 
+integrations:
+  openvas-example:
+    type: "generic_json"
+    path: "/webhooks/openvas-example"
+    auth:
+      bearer_token: "replace-me"
+    source: "openvas"
+    status: "state"
+    severity: "risk.level"
+    title: "finding.title"
+    body: "finding.description"
+    fingerprint: "finding.id"
+    starts_at: "observed_at"
+    labels:
+      asset: "asset.host"
+    annotations:
+      plugin: "finding.plugin"
+    links:
+      source: "finding.url"
+
 alert_grouping:
   enabled: true
   debounce_millis: 1000

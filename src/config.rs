@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, env, fs, path::Path};
 pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
+    pub integrations: BTreeMap<String, IntegrationConfig>,
+    #[serde(default)]
     pub alert_grouping: AlertGroupingConfig,
     #[serde(default)]
     pub debug: DebugConfig,
@@ -40,6 +42,15 @@ impl AppConfig {
 
         if let Some(tls) = &self.server.tls {
             tls.validate()?;
+        }
+
+        for (name, integration) in &self.integrations {
+            validate_integration_name(name)?;
+            match integration {
+                IntegrationConfig::GenericJson(config) => {
+                    config.validate(name)?;
+                }
+            }
         }
 
         if self.alert_grouping.enabled && self.alert_grouping.debounce_millis == 0 {
@@ -90,6 +101,68 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     pub bearer_token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IntegrationConfig {
+    GenericJson(GenericJsonIntegrationConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenericJsonIntegrationConfig {
+    pub path: String,
+    pub auth: Option<AuthConfig>,
+    pub source: String,
+    pub status: String,
+    pub severity: Option<String>,
+    pub title: String,
+    pub body: Option<String>,
+    pub fingerprint: String,
+    pub starts_at: Option<String>,
+    pub ends_at: Option<String>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+    #[serde(default)]
+    pub links: BTreeMap<String, String>,
+}
+
+impl GenericJsonIntegrationConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        if self.path.is_empty() {
+            bail!("integration {name} path must not be empty");
+        }
+
+        if !self.path.starts_with("/webhooks/") {
+            bail!("integration {name} path must start with /webhooks/");
+        }
+
+        if self.source.is_empty() {
+            bail!("integration {name} source must not be empty");
+        }
+
+        if self.status.is_empty() {
+            bail!("integration {name} status field must not be empty");
+        }
+
+        if self.title.is_empty() {
+            bail!("integration {name} title field must not be empty");
+        }
+
+        if self.fingerprint.is_empty() {
+            bail!("integration {name} fingerprint field must not be empty");
+        }
+
+        if let Some(auth) = &self.auth
+            && auth.bearer_token.is_empty()
+        {
+            bail!("integration {name} auth.bearer_token must not be empty");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,6 +339,21 @@ fn default_timeout_secs() -> u64 {
     10
 }
 
+fn validate_integration_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        bail!("integration name must not be empty");
+    }
+
+    if !name
+        .chars()
+        .all(|ch| ch == '-' || ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        bail!("integration name {name} must contain only letters, numbers, '-' or '_'");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +404,56 @@ mod tests {
             error.to_string().contains(
                 "cert and key must both use file paths or both use environment variables"
             )
+        );
+    }
+
+    #[test]
+    fn validates_generic_json_integration_required_fields() {
+        let config = AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:0".to_string(),
+                webhook_path: "/webhooks/signoz".to_string(),
+                max_body_bytes: 1024 * 1024,
+                auth: None,
+                tls: None,
+            },
+            integrations: BTreeMap::from([(
+                "openvas".to_string(),
+                IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                    path: "/webhooks/openvas".to_string(),
+                    auth: None,
+                    source: "openvas".to_string(),
+                    status: "state".to_string(),
+                    severity: None,
+                    title: "".to_string(),
+                    body: None,
+                    fingerprint: "id".to_string(),
+                    starts_at: None,
+                    ends_at: None,
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    links: BTreeMap::new(),
+                }),
+            )]),
+            alert_grouping: AlertGroupingConfig::default(),
+            debug: DebugConfig::default(),
+            routing: RoutingConfig::default(),
+            receivers: BTreeMap::from([(
+                "default".to_string(),
+                ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
+                    webhook_url: "https://chat.googleapis.test/default".to_string(),
+                    title_template: "[{{status}}] {{alertname}}".to_string(),
+                    timeout_secs: 10,
+                }),
+            )]),
+        };
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("integration openvas title field must not be empty")
         );
     }
 }

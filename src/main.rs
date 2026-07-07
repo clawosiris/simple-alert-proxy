@@ -2,7 +2,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
     routing::post,
@@ -18,6 +18,7 @@ use tracing::{error, info};
 mod alert;
 mod config;
 mod google_chat;
+mod integration;
 mod routing;
 mod signoz;
 mod tls;
@@ -25,6 +26,7 @@ mod tls;
 use crate::{
     config::{AppConfig, GoogleChatReceiverConfig},
     google_chat::{DebugDeliveryLog, GoogleChatClient},
+    integration::{GenericJsonIntegration, Integration, SigNozIntegration},
     routing::{Delivery, RouteEngine},
     signoz::SigNozAlert,
 };
@@ -227,6 +229,7 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     Ok(Router::new()
         .route("/healthz", post(healthz).get(healthz))
         .route(&webhook_path, post(handle_signoz_webhook))
+        .route("/webhooks/{integration}", post(handle_generic_webhook))
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(TraceLayer::new_for_http())
         .with_state(state))
@@ -241,18 +244,20 @@ async fn handle_signoz_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(&state, &headers)?;
+    authorize(state.config.server.auth.as_ref(), &headers)?;
 
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
     if state.config.debug.log_alerts {
         log_debug_json("incoming alert", &payload);
     }
 
-    let alerts = SigNozAlert::from_value_grouped_by_rule_id(payload)?;
+    let signoz = SigNozIntegration::new("signoz");
+    let alerts = signoz.parse_alerts(payload)?;
     let mut delivered_receivers = Vec::new();
 
     for alert in &alerts {
-        let plan = state.router.plan(alert);
+        let event = alert.to_alert_event("signoz");
+        let plan = state.router.plan(&event);
 
         for delivery in &plan.deliveries {
             let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
@@ -290,8 +295,69 @@ async fn handle_signoz_webhook(
     ))
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), WebhookError> {
-    let Some(auth) = &state.config.server.auth else {
+async fn handle_generic_webhook(
+    State(state): State<AppState>,
+    Path(integration): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, WebhookError> {
+    let (name, config) =
+        integration::configured_integration(&state.config.integrations, &integration)?;
+    authorize(
+        config.auth.as_ref().or(state.config.server.auth.as_ref()),
+        &headers,
+    )?;
+
+    let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
+    if state.config.debug.log_alerts {
+        log_debug_json("incoming generic alert", &payload);
+    }
+
+    let integration = GenericJsonIntegration::new(name, config);
+    let events = integration.normalize(payload)?;
+    let mut delivered_receivers = Vec::new();
+
+    for event in &events {
+        let plan = state.router.plan(event);
+
+        for delivery in &plan.deliveries {
+            let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
+                error!(receiver = %delivery.receiver, "route selected missing receiver");
+                continue;
+            };
+
+            match receiver {
+                config::ReceiverConfig::GoogleChat(receiver) => {
+                    let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
+                        route_name: delivery.route_name.as_str(),
+                        receiver_name: delivery.receiver.as_str(),
+                    });
+                    state
+                        .aggregator
+                        .google_chat
+                        .send_event(receiver, event, delivery, debug)
+                        .await?;
+                    delivered_receivers.push(delivery.receiver.clone());
+                }
+            }
+        }
+    }
+
+    if delivered_receivers.is_empty() {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "delivered": 0 })),
+        ));
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(delivery_summary(&delivered_receivers)),
+    ))
+}
+
+fn authorize(auth: Option<&config::AuthConfig>, headers: &HeaderMap) -> Result<(), WebhookError> {
+    let Some(auth) = auth else {
         return Ok(());
     };
 
@@ -348,6 +414,8 @@ enum WebhookError {
     Unauthorized,
     #[error("invalid SigNoz payload: {0}")]
     InvalidPayload(#[from] signoz::AlertParseError),
+    #[error("invalid integration payload: {0}")]
+    Integration(#[from] integration::IntegrationError),
     #[error("delivery failed: {0}")]
     Delivery(#[from] google_chat::GoogleChatError),
 }
@@ -358,6 +426,10 @@ impl IntoResponse for WebhookError {
         let status = match self {
             WebhookError::Unauthorized => StatusCode::UNAUTHORIZED,
             WebhookError::InvalidPayload(_) => StatusCode::BAD_REQUEST,
+            WebhookError::Integration(integration::IntegrationError::Unknown(_)) => {
+                StatusCode::NOT_FOUND
+            }
+            WebhookError::Integration(_) => StatusCode::BAD_REQUEST,
             WebhookError::Delivery(_) => StatusCode::BAD_GATEWAY,
         };
         (
@@ -372,8 +444,8 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, AuthConfig, DebugConfig, GoogleChatReceiverConfig, ReceiverConfig,
-        RoutingConfig, ServerConfig,
+        AlertGroupingConfig, AuthConfig, DebugConfig, GenericJsonIntegrationConfig,
+        GoogleChatReceiverConfig, IntegrationConfig, ReceiverConfig, RoutingConfig, ServerConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -415,6 +487,10 @@ mod tests {
         assert_eq!(config.server.max_body_bytes, 1024 * 1024);
         assert!(config.server.auth.is_some());
         assert!(config.alert_grouping.enabled);
+        assert!(matches!(
+            config.integrations.get("openvas-example"),
+            Some(IntegrationConfig::GenericJson(_))
+        ));
         assert_eq!(
             config.routing.default_receiver.as_deref(),
             Some("default-chat")
@@ -444,6 +520,86 @@ mod tests {
             received[0]["cardsV2"][0]["card"]["header"]["title"].as_str(),
             Some("[firing] HighErrorRate via critical-production")
         );
+    }
+
+    #[tokio::test]
+    async fn generic_webhook_path_normalizes_and_delivers_event() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.routing.routes[0].matchers = vec![config::MatcherConfig {
+            field: "label.severity".to_string(),
+            equals: Some("high".to_string()),
+            regex: None,
+            contains: None,
+        }];
+        config.integrations = BTreeMap::from([(
+            "openvas".to_string(),
+            IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                path: "/webhooks/openvas".to_string(),
+                auth: None,
+                source: "openvas".to_string(),
+                status: "state".to_string(),
+                severity: Some("risk.level".to_string()),
+                title: "finding.title".to_string(),
+                body: Some("finding.description".to_string()),
+                fingerprint: "finding.id".to_string(),
+                starts_at: Some("observed_at".to_string()),
+                ends_at: None,
+                labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
+                annotations: BTreeMap::from([("asset".to_string(), "asset.host".to_string())]),
+                links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/openvas")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(include_str!(
+                        "../examples/generic-json-webhook.json"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        let received = received.lock().unwrap();
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] TLS certificate expired via critical-production")
+        );
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["subtitle"].as_str(),
+            Some("openvas | firing | high")
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_webhook_path_rejects_unknown_integration() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/unknown")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -892,6 +1048,7 @@ mod tests {
                 }),
                 tls: None,
             },
+            integrations: BTreeMap::new(),
             alert_grouping: AlertGroupingConfig {
                 enabled: true,
                 debounce_millis: 10,
