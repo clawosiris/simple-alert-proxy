@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use crate::alert::{AlertEvent, AlertLink};
+
 #[derive(Debug, Clone)]
 pub struct SigNozAlert {
     pub status: Option<String>,
@@ -89,6 +91,88 @@ impl SigNozAlert {
 
         let raw = serde_json::to_value(&payload)?;
         Ok(payload.into_alert(raw))
+    }
+
+    pub fn to_alert_event(&self, integration: impl Into<String>) -> AlertEvent {
+        let integration = integration.into();
+        let fingerprint = self.canonical_fingerprint();
+        let mut event = AlertEvent::new(
+            integration,
+            "signoz",
+            self.enrichment.overall_status.clone(),
+            self.canonical_severity(),
+            self.alert_name(),
+            fingerprint,
+            self.raw.clone(),
+        );
+
+        event.body = self
+            .enrichment
+            .summary
+            .clone()
+            .or_else(|| self.enrichment.description.clone());
+        event.labels = self.canonical_labels();
+        event.annotations = self.canonical_annotations();
+        event.starts_at = self
+            .alerts
+            .iter()
+            .filter_map(|alert| alert.starts_at.clone())
+            .min();
+        event.ends_at = self
+            .alerts
+            .iter()
+            .filter_map(|alert| alert.ends_at.clone())
+            .max();
+
+        if let Some(source_url) = &self.enrichment.source_url {
+            event.links.push(AlertLink {
+                label: "source".to_string(),
+                url: source_url.clone(),
+            });
+        }
+
+        event
+    }
+
+    fn canonical_labels(&self) -> BTreeMap<String, String> {
+        let mut labels = self.group_labels.clone();
+        labels.extend(self.common_labels.clone());
+        labels
+    }
+
+    fn canonical_annotations(&self) -> BTreeMap<String, String> {
+        let mut annotations = self
+            .alerts
+            .first()
+            .map(|alert| alert.annotations.clone())
+            .unwrap_or_default();
+        annotations.extend(self.common_annotations.clone());
+        annotations
+    }
+
+    fn canonical_fingerprint(&self) -> String {
+        self.rule_id()
+            .or_else(|| {
+                self.alerts
+                    .iter()
+                    .find_map(|alert| alert.fingerprint.clone())
+            })
+            .or_else(|| self.group_key.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "signoz:{}:{}",
+                    self.enrichment.alert_name, self.enrichment.overall_status
+                )
+            })
+    }
+
+    fn canonical_severity(&self) -> String {
+        ["critical", "error", "warning", "warn", "info", "unknown"]
+            .into_iter()
+            .find(|severity| self.enrichment.severity_counts.contains_key(*severity))
+            .map(ToOwned::to_owned)
+            .or_else(|| self.enrichment.severity_counts.keys().next().cloned())
+            .unwrap_or_else(|| "unknown".to_string())
     }
 }
 
@@ -494,6 +578,55 @@ mod tests {
         );
         assert_eq!(alert.enrichment.instances[0].resource, "/");
         assert_eq!(alert.enrichment.instances[1].resource, "/var/cache/fscache");
+    }
+
+    #[test]
+    fn converts_issue_fixture_to_canonical_alert_event() {
+        let alert = SigNozAlert::from_value(
+            serde_json::from_str(include_str!("../examples/signoz-webhook-disk-space.json"))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let event = alert.to_alert_event("signoz-prod");
+
+        assert_eq!(event.integration, "signoz-prod");
+        assert_eq!(event.source, "signoz");
+        assert_eq!(event.status, "firing");
+        assert_eq!(event.severity, "warning");
+        assert_eq!(event.title, "Disk Space Low");
+        assert_eq!(
+            event.body.as_deref(),
+            Some(
+                "This alert is fired when the defined metric (current value: 0.8831764314370117) crosses the threshold (0.8)"
+            )
+        );
+        assert_eq!(event.fingerprint, "019ef5e1-2027-7be3-a458-88b6a8707d8f");
+        assert_eq!(
+            event.event_id,
+            "signoz-prod:019ef5e1-2027-7be3-a458-88b6a8707d8f"
+        );
+        assert_eq!(
+            event.labels.get("alertname").map(String::as_str),
+            Some("Disk Space Low")
+        );
+        assert_eq!(
+            event.annotations.get("summary").map(String::as_str),
+            Some(
+                "This alert is fired when the defined metric (current value: 0.8831764314370117) crosses the threshold (0.8)"
+            )
+        );
+        assert_eq!(event.links.len(), 1);
+        assert_eq!(event.links[0].label, "source");
+        assert_eq!(
+            event.links[0].url,
+            "https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f"
+        );
+        assert_eq!(
+            event.starts_at.as_deref(),
+            Some("2026-06-23T19:09:27.583939484Z")
+        );
+        assert!(event.raw_payload.is_object());
     }
 
     #[test]

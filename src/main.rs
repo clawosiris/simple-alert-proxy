@@ -15,6 +15,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
+mod alert;
 mod config;
 mod google_chat;
 mod routing;
