@@ -34,6 +34,10 @@ notify Slack but not Google Chat, some can create tickets but not send rich chat
 cards, and many lack robust queueing, retries, deduplication, delivery history,
 and acknowledgement tracking.
 
+Adding every needed alerting target separately to every alert-producing tool is
+inefficient and makes each source carry integration complexity that belongs in a
+shared notification hub.
+
 The result is a fragmented alert flow:
 
 - each source needs separate notification configuration
@@ -111,8 +115,6 @@ The intended niche:
   to manage outgoing alert delivery.
 - Small infrastructure or security teams that want self-hosted alert routing
   without adopting a large AIOps suite.
-- Developers of OpenVAS SCAN or similar systems that need a generic webhook
-  notification hub instead of implementing every backend directly.
 
 ## Core Concepts
 
