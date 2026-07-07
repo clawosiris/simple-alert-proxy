@@ -78,6 +78,22 @@ impl AppConfig {
                     bail!("receiver {name} timeout_secs must be greater than zero")
                 }
                 ReceiverConfig::GoogleChat(_) => {}
+                ReceiverConfig::GenericWebhook(receiver) if receiver.timeout_secs == 0 => {
+                    bail!("receiver {name} timeout_secs must be greater than zero")
+                }
+                ReceiverConfig::GenericWebhook(_) => {}
+                ReceiverConfig::Slack(receiver) if receiver.timeout_secs == 0 => {
+                    bail!("receiver {name} timeout_secs must be greater than zero")
+                }
+                ReceiverConfig::Slack(_) => {}
+                ReceiverConfig::Mattermost(receiver) if receiver.timeout_secs == 0 => {
+                    bail!("receiver {name} timeout_secs must be greater than zero")
+                }
+                ReceiverConfig::Mattermost(_) => {}
+                ReceiverConfig::Discord(receiver) if receiver.timeout_secs == 0 => {
+                    bail!("receiver {name} timeout_secs must be greater than zero")
+                }
+                ReceiverConfig::Discord(_) => {}
             }
         }
 
@@ -189,6 +205,7 @@ pub enum IntegrationConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenericJsonIntegrationConfig {
+    pub preset: Option<String>,
     pub path: String,
     pub auth: Option<AuthConfig>,
     pub source: String,
@@ -211,6 +228,10 @@ impl GenericJsonIntegrationConfig {
     fn validate(&self, name: &str) -> anyhow::Result<()> {
         if self.path.is_empty() {
             bail!("integration {name} path must not be empty");
+        }
+
+        if let Some(preset) = &self.preset {
+            validate_source_preset(name, preset)?;
         }
 
         if !self.path.starts_with("/webhooks/") {
@@ -378,10 +399,30 @@ pub struct MatcherConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReceiverConfig {
     GoogleChat(GoogleChatReceiverConfig),
+    GenericWebhook(GenericWebhookReceiverConfig),
+    Slack(ChatWebhookReceiverConfig),
+    Mattermost(ChatWebhookReceiverConfig),
+    Discord(ChatWebhookReceiverConfig),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleChatReceiverConfig {
+    pub webhook_url: String,
+    #[serde(default = "default_title_template")]
+    pub title_template: String,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenericWebhookReceiverConfig {
+    pub webhook_url: String,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatWebhookReceiverConfig {
     pub webhook_url: String,
     #[serde(default = "default_title_template")]
     pub title_template: String,
@@ -452,6 +493,13 @@ fn validate_integration_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_source_preset(integration_name: &str, preset: &str) -> anyhow::Result<()> {
+    match preset {
+        "alertmanager" | "grafana" | "openobserve" | "openvas_scan" => Ok(()),
+        _ => bail!("integration {integration_name} preset {preset} is not supported"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,6 +566,7 @@ mod tests {
             integrations: BTreeMap::from([(
                 "openvas".to_string(),
                 IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                    preset: None,
                     path: "/webhooks/openvas".to_string(),
                     auth: None,
                     source: "openvas".to_string(),

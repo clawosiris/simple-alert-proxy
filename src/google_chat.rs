@@ -1,5 +1,11 @@
 use crate::{
-    alert::AlertEvent, config::GoogleChatReceiverConfig, routing::Delivery, signoz::SigNozAlert,
+    alert::AlertEvent,
+    config::{
+        ChatWebhookReceiverConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
+        ReceiverConfig,
+    },
+    routing::Delivery,
+    signoz::SigNozAlert,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -73,6 +79,134 @@ impl GoogleChatClient {
             Err(GoogleChatError::Rejected(response.status()))
         }
     }
+
+    pub async fn send_receiver_event(
+        &self,
+        receiver: &ReceiverConfig,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        match receiver {
+            ReceiverConfig::GoogleChat(receiver) => {
+                self.send_event(receiver, event, delivery, debug).await
+            }
+            ReceiverConfig::GenericWebhook(receiver) => {
+                self.send_generic_webhook(receiver, event, delivery, debug)
+                    .await
+            }
+            ReceiverConfig::Slack(receiver) => {
+                self.send_chat_webhook(receiver, event, delivery, debug, ChatTarget::Slack)
+                    .await
+            }
+            ReceiverConfig::Mattermost(receiver) => {
+                self.send_chat_webhook(receiver, event, delivery, debug, ChatTarget::Mattermost)
+                    .await
+            }
+            ReceiverConfig::Discord(receiver) => {
+                self.send_chat_webhook(receiver, event, delivery, debug, ChatTarget::Discord)
+                    .await
+            }
+        }
+    }
+
+    async fn send_generic_webhook(
+        &self,
+        receiver: &GenericWebhookReceiverConfig,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let message = json!({
+            "event": event,
+            "delivery": {
+                "route": delivery.route_name,
+                "receiver": delivery.receiver,
+            }
+        });
+        self.post_json(
+            &receiver.webhook_url,
+            receiver.timeout_secs,
+            &message,
+            debug,
+        )
+        .await
+    }
+
+    async fn send_chat_webhook(
+        &self,
+        receiver: &ChatWebhookReceiverConfig,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        debug: Option<DebugDeliveryLog<'_>>,
+        target: ChatTarget,
+    ) -> Result<(), GoogleChatError> {
+        let title = receiver
+            .title_template
+            .replace("{{status}}", &event.status)
+            .replace("{{alertname}}", &event.title)
+            .replace("{{title}}", &event.title)
+            .replace("{{severity}}", &event.severity);
+        let text = format!(
+            "{title} via {} | {} | {}",
+            delivery.route_name, event.source, event.fingerprint
+        );
+        let message = match target {
+            ChatTarget::Slack | ChatTarget::Mattermost => json!({ "text": text }),
+            ChatTarget::Discord => json!({
+                "content": text,
+                "embeds": [{
+                    "title": event.title,
+                    "description": event.body,
+                    "fields": [
+                        { "name": "Status", "value": event.status, "inline": true },
+                        { "name": "Severity", "value": event.severity, "inline": true },
+                        { "name": "Source", "value": event.source, "inline": true }
+                    ]
+                }]
+            }),
+        };
+        self.post_json(
+            &receiver.webhook_url,
+            receiver.timeout_secs,
+            &message,
+            debug,
+        )
+        .await
+    }
+
+    async fn post_json(
+        &self,
+        webhook_url: &str,
+        timeout_secs: u64,
+        message: &serde_json::Value,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        if let Some(debug) = debug {
+            log_outgoing_alert(message, debug);
+        }
+
+        let response = self
+            .http
+            .post(webhook_url)
+            .timeout(Duration::from_secs(timeout_secs))
+            .json(message)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(GoogleChatError::Rejected(response.status()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChatTarget {
+    Slack,
+    Mattermost,
+    Discord,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -11,3 +11,5 @@
 - Started Phase 3: alert group records keyed by fingerprint, lifecycle/audit state, read APIs, action APIs, and tests.
 - Completed Phase 3 locally, committed `0375174`, pushed, and checked Phase 3 boxes in issue #10.
 - Started Phase 4: static operator UI at `/` and `/ui`, API-backed group table/detail panel, lifecycle/replay controls, route smoke test.
+- Completed Phase 4 locally, committed `bef78fd`, pushed, and checked Phase 4 boxes in issue #10.
+- Started Phase 5: generic webhook, Slack, Mattermost, and Discord receiver configs/adapters plus source preset validation.

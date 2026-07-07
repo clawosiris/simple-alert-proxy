@@ -287,7 +287,8 @@ routing:
 
 ## Receivers
 
-Initial receiver support is Google Chat incoming webhooks.
+Receiver support includes Google Chat incoming webhooks, generic outbound
+webhooks, Slack, Mattermost, and Discord.
 
 ```yaml
 receivers:
@@ -296,9 +297,38 @@ receivers:
     webhook_url: "https://chat.googleapis.com/v1/spaces/..."
     title_template: "[{{status}}] {{alertname}}"
     timeout_secs: 10
+
+  generic-webhook:
+    type: generic_webhook
+    webhook_url: "https://alerts.example.test/webhook"
+    timeout_secs: 10
+
+  slack-alerts:
+    type: slack
+    webhook_url: "https://hooks.slack.com/services/..."
+    title_template: "[{{status}}] {{title}}"
+    timeout_secs: 10
+
+  mattermost-alerts:
+    type: mattermost
+    webhook_url: "https://mattermost.example.test/hooks/..."
+    title_template: "[{{severity}}] {{title}}"
+    timeout_secs: 10
+
+  discord-alerts:
+    type: discord
+    webhook_url: "https://discord.com/api/webhooks/..."
+    title_template: "[{{status}}] {{title}}"
+    timeout_secs: 10
 ```
 
-The current implementation sends a compact Google Chat card payload with status, per-severity counts, grouped host/resource rows, and a labeled source link when present.
+The current Google Chat adapter keeps the SigNoz grouped card behavior. Generic
+and chat-style targets receive canonical alert-event payloads through the same
+durable delivery queue, retry, redaction, and replay behavior.
+
+Generic JSON integrations can name a source preset for operator clarity and
+validation. Supported presets are `alertmanager`, `grafana`, `openobserve`, and
+`openvas_scan`.
 
 ## Security
 

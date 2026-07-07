@@ -27,7 +27,7 @@ mod ui;
 
 use crate::{
     alert::AlertEvent,
-    config::{AppConfig, GoogleChatReceiverConfig},
+    config::{AppConfig, GoogleChatReceiverConfig, ReceiverConfig},
     google_chat::{DebugDeliveryLog, GoogleChatClient},
     integration::{GenericJsonIntegration, Integration, SigNozIntegration},
     routing::{Delivery, RouteEngine},
@@ -398,6 +398,10 @@ async fn handle_signoz_webhook(
                     )?;
                     delivered_receivers.push(delivery.receiver.clone());
                 }
+                receiver => {
+                    queue_target_event_delivery(&state, &event, receiver, delivery.clone())?;
+                    delivered_receivers.push(delivery.receiver.clone());
+                }
             }
         }
     }
@@ -447,8 +451,8 @@ async fn handle_generic_webhook(
             };
 
             match receiver {
-                config::ReceiverConfig::GoogleChat(receiver) => {
-                    queue_generic_google_chat_delivery(&state, event, receiver, delivery.clone())?;
+                receiver => {
+                    queue_target_event_delivery(&state, event, receiver, delivery.clone())?;
                     delivered_receivers.push(delivery.receiver.clone());
                 }
             }
@@ -505,10 +509,10 @@ fn queue_signoz_google_chat_delivery(
     Ok(())
 }
 
-fn queue_generic_google_chat_delivery(
+fn queue_target_event_delivery(
     state: &AppState,
     event: &AlertEvent,
-    receiver: &GoogleChatReceiverConfig,
+    receiver: &ReceiverConfig,
     delivery: Delivery,
 ) -> Result<(), WebhookError> {
     let alert_event_id = state.storage.store_event(event)?;
@@ -518,14 +522,14 @@ fn queue_generic_google_chat_delivery(
         state.config.delivery.clone(),
         state.config.debug.log_alerts,
     );
-    let google_chat = state.aggregator.google_chat.clone();
+    let target_client = state.aggregator.google_chat.clone();
     let receiver = receiver.clone();
     let event = event.clone();
 
     tokio::spawn(async move {
         worker
             .run(delivery_id, move |debug_enabled| {
-                let google_chat = google_chat.clone();
+                let target_client = target_client.clone();
                 let receiver = receiver.clone();
                 let event = event.clone();
                 let delivery = delivery.clone();
@@ -534,8 +538,8 @@ fn queue_generic_google_chat_delivery(
                         route_name: delivery.route_name.as_str(),
                         receiver_name: delivery.receiver.as_str(),
                     });
-                    google_chat
-                        .send_event(&receiver, &event, &delivery, debug)
+                    target_client
+                        .send_receiver_event(&receiver, &event, &delivery, debug)
                         .await
                         .map_err(redacted_delivery_error)
                 }
@@ -708,8 +712,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, GenericJsonIntegrationConfig,
-        GoogleChatReceiverConfig, IntegrationConfig, ReceiverConfig, RoutingConfig, ServerConfig,
-        StorageConfig,
+        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig, ReceiverConfig,
+        RoutingConfig, ServerConfig, StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -824,6 +828,7 @@ mod tests {
         config.integrations = BTreeMap::from([(
             "openvas".to_string(),
             IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                preset: None,
                 path: "/webhooks/openvas".to_string(),
                 auth: None,
                 source: "openvas".to_string(),
@@ -1062,6 +1067,45 @@ mod tests {
             let value: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(value.as_array().is_some_and(|items| !items.is_empty()));
         }
+    }
+
+    #[tokio::test]
+    async fn generic_webhook_receiver_gets_canonical_event_payload() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.routing.default_receiver = Some("generic-target".to_string());
+        config.routing.routes.clear();
+        config.integrations = generic_test_integrations();
+        config.receivers.insert(
+            "generic-target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                timeout_secs: 10,
+            }),
+        );
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "risk": { "level": "high" },
+                "finding": {
+                    "id": "target-1",
+                    "title": "Webhook target alert",
+                    "description": "target",
+                    "plugin": "test"
+                }
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        let received = received.lock().unwrap();
+        assert_eq!(received[0]["event"]["fingerprint"], "target-1");
+        assert_eq!(received[0]["delivery"]["receiver"], "generic-target");
     }
 
     #[tokio::test]
@@ -1552,6 +1596,7 @@ mod tests {
         BTreeMap::from([(
             "openvas".to_string(),
             IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                preset: None,
                 path: "/webhooks/openvas".to_string(),
                 auth: None,
                 source: "openvas".to_string(),

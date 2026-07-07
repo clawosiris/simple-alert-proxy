@@ -172,6 +172,7 @@ mod tests {
     #[test]
     fn normalizes_generic_json_payload_from_config() {
         let config = GenericJsonIntegrationConfig {
+            preset: None,
             path: "/webhooks/openvas".to_string(),
             auth: None,
             source: "openvas".to_string(),
@@ -222,6 +223,7 @@ mod tests {
     #[test]
     fn rejects_generic_json_payload_missing_required_field() {
         let config = GenericJsonIntegrationConfig {
+            preset: None,
             path: "/webhooks/openvas".to_string(),
             auth: None,
             source: "openvas".to_string(),

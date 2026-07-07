@@ -259,6 +259,15 @@ Expand useful integrations after lifecycle correctness is in place.
 - Source mapping presets and examples.
 - Contract tests for target request construction.
 
+### Implementation Notes
+
+- Receiver config supports `generic_webhook`, `slack`, `mattermost`, and
+  `discord` in addition to `google_chat`.
+- Non-Google-Chat targets receive canonical alert-event payloads through the
+  same durable delivery queue and retry/dead-letter path.
+- Generic JSON integrations validate optional preset names for
+  `alertmanager`, `grafana`, `openobserve`, and `openvas_scan`.
+
 ### Acceptance
 
 - Adding a new chat target does not bypass the delivery queue.
