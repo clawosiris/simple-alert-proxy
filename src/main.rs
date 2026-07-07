@@ -406,6 +406,46 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
+    #[test]
+    fn example_config_loads_without_migration() {
+        let config = AppConfig::load("examples/config.yaml").unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.server.webhook_path, "/webhooks/signoz");
+        assert_eq!(config.server.max_body_bytes, 1024 * 1024);
+        assert!(config.server.auth.is_some());
+        assert!(config.alert_grouping.enabled);
+        assert_eq!(
+            config.routing.default_receiver.as_deref(),
+            Some("default-chat")
+        );
+        assert!(matches!(
+            config.receivers.get("critical-chat"),
+            Some(ReceiverConfig::GoogleChat(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_signoz_webhook_path_accepts_existing_payload() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let config = test_config(&chat_url);
+        let app = build_app(Arc::new(config.clone()), config.server.webhook_path).unwrap();
+
+        let response = app
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        let received = received.lock().unwrap();
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] HighErrorRate via critical-production")
+        );
+    }
+
     #[tokio::test]
     async fn accepts_webhook_without_auth_when_auth_disabled() {
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -770,6 +810,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn rejects_request_bodies_over_configured_limit() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.max_body_bytes = 16;
+        config.server.auth = None;
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/signoz")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(include_str!("../examples/signoz-webhook.json")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     async fn spawn_mock_google_chat(received: Arc<Mutex<Vec<Value>>>) -> String {
         let app =
             Router::new()
@@ -813,6 +875,10 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearer test-token")
             .body(Body::from(payload.to_string()))
             .unwrap()
+    }
+
+    fn fixture_payload() -> Value {
+        serde_json::from_str(include_str!("../examples/signoz-webhook.json")).unwrap()
     }
 
     fn test_config(webhook_url: &str) -> AppConfig {

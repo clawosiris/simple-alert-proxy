@@ -43,9 +43,9 @@ work.
 ### Deliverables
 
 - Compatibility test matrix for current webhook, routing, grouping, and Google
-  Chat behavior.
+  Chat behavior in `docs/COMPATIBILITY.md`.
 - Baseline docs that name the current SigNoz path as a compatibility
-  integration.
+  integration in `docs/SPEC.md` and `docs/COMPATIBILITY.md`.
 
 ### Acceptance
 

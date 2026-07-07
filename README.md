@@ -86,6 +86,8 @@ See [examples/config.yaml](examples/config.yaml) for a working example and [docs
 
 For the proposed evolution into a source-agnostic alert webhook gateway, see
 [docs/ALERT_WEBHOOK_GATEWAY_PRD.md](docs/ALERT_WEBHOOK_GATEWAY_PRD.md).
+The baseline behavior that gateway work must preserve is tracked in
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
 To log incoming webhook payloads and outgoing receiver payloads to stderr:
 

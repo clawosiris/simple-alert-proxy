@@ -30,6 +30,10 @@ Returns `204 No Content` when the process is alive.
 
 ### `POST /webhooks/signoz`
 
+This is the current SigNoz compatibility integration path. Gateway v2 work must
+keep accepting this path by default unless the operator explicitly changes
+`server.webhook_path`.
+
 Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 
 - `status`
