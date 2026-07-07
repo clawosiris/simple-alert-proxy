@@ -481,6 +481,7 @@ fn queue_signoz_google_chat_delivery(
 ) -> Result<(), WebhookError> {
     let alert_event_id = state.storage.store_event(event)?;
     let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
+    queue_escalation_if_configured(state, alert_event_id, &delivery)?;
     let worker = DeliveryWorker::new(
         state.storage.clone(),
         state.config.delivery.clone(),
@@ -517,6 +518,7 @@ fn queue_target_event_delivery(
 ) -> Result<(), WebhookError> {
     let alert_event_id = state.storage.store_event(event)?;
     let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
+    queue_escalation_if_configured(state, alert_event_id, &delivery)?;
     let worker = DeliveryWorker::new(
         state.storage.clone(),
         state.config.delivery.clone(),
@@ -547,6 +549,27 @@ fn queue_target_event_delivery(
             .await;
     });
 
+    Ok(())
+}
+
+fn queue_escalation_if_configured(
+    state: &AppState,
+    alert_event_id: i64,
+    delivery: &Delivery,
+) -> Result<(), WebhookError> {
+    let Some(policy_name) = &delivery.escalation_policy else {
+        return Ok(());
+    };
+    let Some(policy) = state.config.escalation.policies.get(policy_name) else {
+        return Ok(());
+    };
+    let Some(first_step) = policy.steps.first() else {
+        return Ok(());
+    };
+    let _stop_conditions = (first_step.stop_on_ack, first_step.stop_on_resolve);
+    state
+        .storage
+        .queue_escalation(alert_event_id, policy_name, first_step.delay_millis)?;
     Ok(())
 }
 
@@ -711,7 +734,8 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, GenericJsonIntegrationConfig,
+        AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, EscalationConfig,
+        EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
         GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig, ReceiverConfig,
         RoutingConfig, ServerConfig, StorageConfig,
     };
@@ -908,6 +932,7 @@ mod tests {
         let delivery = Delivery {
             route_name: "default".to_string(),
             receiver: "dead-target".to_string(),
+            escalation_policy: None,
         };
         let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
         let worker = DeliveryWorker::new(
@@ -1000,9 +1025,14 @@ mod tests {
         let delivery = Delivery {
             route_name: "default".to_string(),
             receiver: "target".to_string(),
+            escalation_policy: None,
         };
         let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
+        storage
+            .queue_escalation(event_id, "primary", 1_000)
+            .unwrap();
         let group_id = storage.list_alert_groups().unwrap()[0].id;
+        assert_eq!(storage.escalation_statuses().unwrap(), vec!["scheduled"]);
 
         storage.acknowledge_group(group_id).unwrap();
         storage.silence_group(group_id).unwrap();
@@ -1013,10 +1043,69 @@ mod tests {
         assert_eq!(group.status, "resolved");
         assert!(group.acknowledged_at.is_some());
         assert!(group.silenced_until.is_some());
+        assert_eq!(storage.escalation_statuses().unwrap(), vec!["canceled"]);
         assert_eq!(
             storage.audit_actions().unwrap(),
             vec!["acknowledge", "silence", "resolve", "replay"]
         );
+    }
+
+    #[tokio::test]
+    async fn route_escalation_policy_schedules_and_ack_cancels_task() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.escalation = EscalationConfig {
+            policies: BTreeMap::from([(
+                "primary".to_string(),
+                EscalationPolicyConfig {
+                    steps: vec![EscalationStepConfig {
+                        receiver: "critical-chat".to_string(),
+                        delay_millis: 1_000,
+                        stop_on_ack: true,
+                        stop_on_resolve: true,
+                    }],
+                },
+            )]),
+        };
+        config.routing.routes[0].escalation_policy = Some("primary".to_string());
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let groups = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/alert-groups")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(groups.into_body(), usize::MAX).await.unwrap();
+        let groups: Value = serde_json::from_slice(&bytes).unwrap();
+        let group_id = groups[0]["id"].as_i64().unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/alert-groups/{group_id}/ack"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -1639,6 +1728,7 @@ mod tests {
                 initial_backoff_millis: 1,
                 max_backoff_millis: 1,
             },
+            escalation: EscalationConfig::default(),
             alert_grouping: AlertGroupingConfig {
                 enabled: true,
                 debounce_millis: 10,
@@ -1649,6 +1739,7 @@ mod tests {
                 routes: vec![config::RouteConfig {
                     name: "critical-production".to_string(),
                     receiver: "critical-chat".to_string(),
+                    escalation_policy: None,
                     continue_matching: false,
                     matchers: vec![config::MatcherConfig {
                         field: "label.severity".to_string(),

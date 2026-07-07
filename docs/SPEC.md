@@ -225,6 +225,33 @@ Alert groups are keyed by normalized event fingerprint. Repeated active events
 increment `event_count` and update `last_event_at`; resolved events mark the
 group `resolved`.
 
+## Escalation
+
+Escalation policies are config-defined ordered steps. Routes can select a policy
+with `escalation_policy`; the first step is persisted as a scheduled escalation
+task when an active alert is accepted. Acknowledging or resolving the alert group
+cancels scheduled escalation tasks.
+
+```yaml
+escalation:
+  policies:
+    primary-on-duty:
+      steps:
+        - receiver: "critical-chat"
+          delay_millis: 300000
+          stop_on_ack: true
+          stop_on_resolve: true
+
+routing:
+  routes:
+    - name: "critical-prod"
+      receiver: "critical-chat"
+      escalation_policy: "primary-on-duty"
+```
+
+External schedule sources such as iCalendar, Google Calendar, CalDAV, GoAlert,
+or static YAML can be represented by generated config or later scheduler inputs.
+
 Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery. Grouped alerts are enqueued before the webhook response returns, then flushed in the background after the debounce window.
 
 ```yaml

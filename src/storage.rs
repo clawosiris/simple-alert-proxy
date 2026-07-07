@@ -92,6 +92,18 @@ impl Storage {
                 FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id),
                 FOREIGN KEY(delivery_record_id) REFERENCES delivery_records(id)
             );
+
+            CREATE TABLE IF NOT EXISTS escalation_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_group_id INTEGER NOT NULL,
+                policy TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                due_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
+            );
             "#,
         )?;
         add_column_if_missing(&conn, "alert_events", "alert_group_id INTEGER")?;
@@ -146,6 +158,42 @@ impl Storage {
             params![alert_event_id, delivery.receiver, now, request_summary],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn queue_escalation(
+        &self,
+        alert_event_id: i64,
+        policy: &str,
+        delay_millis: u64,
+    ) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let due_at = now + delay_millis as i64;
+        let conn = self.conn.lock().unwrap();
+        let (alert_group_id, group_status): (i64, String) = conn.query_row(
+            r#"
+            SELECT alert_group_id, alert_groups.status
+            FROM alert_events
+            JOIN alert_groups ON alert_groups.id = alert_events.alert_group_id
+            WHERE alert_events.id = ?1
+            "#,
+            params![alert_event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        if group_status == "resolved" {
+            return Ok(());
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO escalation_tasks (
+                alert_group_id, policy, step_index, status, due_at, created_at, updated_at
+            )
+            VALUES (?1, ?2, 0, 'scheduled', ?3, ?4, ?4)
+            "#,
+            params![alert_group_id, policy, due_at, now],
+        )?;
+        Ok(())
     }
 
     pub fn mark_attempt(&self, delivery_id: i64, attempt: u32) -> anyhow::Result<()> {
@@ -281,6 +329,7 @@ impl Storage {
             "UPDATE alert_groups SET acknowledged_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![alert_group_id, now],
         )?;
+        cancel_escalations(&conn, alert_group_id, now)?;
         insert_audit(&conn, Some(alert_group_id), None, "acknowledge", None, now)?;
         Ok(())
     }
@@ -293,6 +342,7 @@ impl Storage {
             "UPDATE alert_groups SET status = 'resolved', updated_at = ?2 WHERE id = ?1",
             params![alert_group_id, now],
         )?;
+        cancel_escalations(&conn, alert_group_id, now)?;
         insert_audit(&conn, Some(alert_group_id), None, "resolve", None, now)?;
         Ok(())
     }
@@ -344,6 +394,16 @@ impl Storage {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(actions)
+    }
+
+    #[cfg(test)]
+    pub fn escalation_statuses(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT status FROM escalation_tasks ORDER BY id")?;
+        let statuses = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(statuses)
     }
 
     #[cfg(test)]
@@ -593,6 +653,20 @@ fn insert_audit(
         VALUES (?1, ?2, ?3, ?4, ?5)
         "#,
         params![alert_group_id, delivery_record_id, action, detail, now],
+    )?;
+    Ok(())
+}
+
+fn cancel_escalations(conn: &Connection, alert_group_id: i64, now: i64) -> anyhow::Result<()> {
+    conn.execute(
+        r#"
+        UPDATE escalation_tasks
+        SET status = 'canceled',
+            updated_at = ?2
+        WHERE alert_group_id = ?1
+          AND status = 'scheduled'
+        "#,
+        params![alert_group_id, now],
     )?;
     Ok(())
 }

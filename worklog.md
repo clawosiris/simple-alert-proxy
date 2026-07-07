@@ -13,3 +13,5 @@
 - Started Phase 4: static operator UI at `/` and `/ui`, API-backed group table/detail panel, lifecycle/replay controls, route smoke test.
 - Completed Phase 4 locally, committed `bef78fd`, pushed, and checked Phase 4 boxes in issue #10.
 - Started Phase 5: generic webhook, Slack, Mattermost, and Discord receiver configs/adapters plus source preset validation.
+- Completed Phase 5 locally, committed `e5769ed`, pushed, and checked Phase 5 boxes in issue #10.
+- Started Phase 6: escalation policy config, route policy selection, persisted escalation tasks, and cancellation on ack/resolve.

@@ -500,6 +500,7 @@ mod tests {
         let delivery = Delivery {
             route_name: "ops".to_string(),
             receiver: "ops-chat".to_string(),
+            escalation_policy: None,
         };
 
         let payload = build_message(&receiver, &alert, &delivery);
@@ -563,6 +564,7 @@ mod tests {
         let delivery = Delivery {
             route_name: "ops".to_string(),
             receiver: "ops-chat".to_string(),
+            escalation_policy: None,
         };
 
         let payload = build_message(&receiver, &alert, &delivery);
@@ -604,6 +606,7 @@ mod tests {
         let delivery = Delivery {
             route_name: "ops".to_string(),
             receiver: "ops-chat".to_string(),
+            escalation_policy: None,
         };
 
         let payload = build_event_message(&receiver, &event, &delivery);

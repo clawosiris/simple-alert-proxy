@@ -12,6 +12,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub delivery: DeliveryConfig,
     #[serde(default)]
+    pub escalation: EscalationConfig,
+    #[serde(default)]
     pub alert_grouping: AlertGroupingConfig,
     #[serde(default)]
     pub debug: DebugConfig,
@@ -40,6 +42,7 @@ impl AppConfig {
 
         self.storage.validate()?;
         self.delivery.validate()?;
+        self.escalation.validate()?;
 
         if let Some(auth) = &self.server.auth
             && auth.bearer_token.is_empty()
@@ -70,6 +73,9 @@ impl AppConfig {
 
         for route in &self.routing.routes {
             self.require_receiver(&route.receiver)?;
+            if let Some(policy) = &route.escalation_policy {
+                self.require_escalation_policy(policy)?;
+            }
         }
 
         for (name, receiver) in &self.receivers {
@@ -105,6 +111,14 @@ impl AppConfig {
             Ok(())
         } else {
             bail!("route references unknown receiver {name}")
+        }
+    }
+
+    fn require_escalation_policy(&self, name: &str) -> anyhow::Result<()> {
+        if self.escalation.policies.contains_key(name) {
+            Ok(())
+        } else {
+            bail!("route references unknown escalation policy {name}")
         }
     }
 }
@@ -165,6 +179,57 @@ pub struct DeliveryConfig {
     pub initial_backoff_millis: u64,
     #[serde(default = "default_max_backoff_millis")]
     pub max_backoff_millis: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EscalationConfig {
+    #[serde(default)]
+    pub policies: BTreeMap<String, EscalationPolicyConfig>,
+}
+
+impl EscalationConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        for (name, policy) in &self.policies {
+            policy.validate(name)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EscalationPolicyConfig {
+    pub steps: Vec<EscalationStepConfig>,
+}
+
+impl EscalationPolicyConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        if self.steps.is_empty() {
+            bail!("escalation policy {name} must have at least one step");
+        }
+
+        for (index, step) in self.steps.iter().enumerate() {
+            if step.delay_millis == 0 {
+                bail!(
+                    "escalation policy {name} step {index} delay_millis must be greater than zero"
+                );
+            }
+            if step.receiver.is_empty() {
+                bail!("escalation policy {name} step {index} receiver must not be empty");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EscalationStepConfig {
+    pub receiver: String,
+    pub delay_millis: u64,
+    #[serde(default = "default_stop_on_ack")]
+    pub stop_on_ack: bool,
+    #[serde(default = "default_stop_on_resolve")]
+    pub stop_on_resolve: bool,
 }
 
 impl Default for DeliveryConfig {
@@ -381,6 +446,7 @@ pub struct RoutingConfig {
 pub struct RouteConfig {
     pub name: String,
     pub receiver: String,
+    pub escalation_policy: Option<String>,
     #[serde(default)]
     pub continue_matching: bool,
     #[serde(default)]
@@ -460,6 +526,14 @@ fn default_initial_backoff_millis() -> u64 {
 
 fn default_max_backoff_millis() -> u64 {
     30_000
+}
+
+fn default_stop_on_ack() -> bool {
+    true
+}
+
+fn default_stop_on_resolve() -> bool {
+    true
 }
 
 fn default_alert_grouping_enabled() -> bool {
@@ -587,6 +661,7 @@ mod tests {
                 path: ":memory:".to_string(),
             },
             delivery: DeliveryConfig::default(),
+            escalation: EscalationConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig::default(),
             routing: RoutingConfig::default(),

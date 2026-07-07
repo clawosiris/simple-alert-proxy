@@ -297,6 +297,16 @@ Add delayed routing behavior that reacts to alert lifecycle state.
 - External schedule interface.
 - Tests for delayed steps and stop conditions.
 
+### Implementation Notes
+
+- Config supports named escalation policies with ordered delayed steps and
+  stop-on-ack/stop-on-resolve flags.
+- Routes can select an `escalation_policy`; accepted active alerts persist a
+  scheduled escalation task for the first step.
+- Acknowledge and resolve actions cancel scheduled escalation tasks.
+- Static YAML is the initial schedule source, with external schedule systems
+  intended to feed the same config shape.
+
 ### Acceptance
 
 - An unacknowledged alert can escalate after a configured delay.

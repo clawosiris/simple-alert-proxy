@@ -41,6 +41,15 @@ delivery:
   initial_backoff_millis: 250
   max_backoff_millis: 30000
 
+escalation:
+  policies:
+    primary-on-duty:
+      steps:
+        - receiver: "critical-chat"
+          delay_millis: 300000
+          stop_on_ack: true
+          stop_on_resolve: true
+
 alert_grouping:
   enabled: true
   debounce_millis: 1000
@@ -50,6 +59,7 @@ routing:
   routes:
     - name: "critical-production"
       receiver: "critical-chat"
+      escalation_policy: "primary-on-duty"
       matchers:
         - field: "label.severity"
           equals: "critical"

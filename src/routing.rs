@@ -13,6 +13,7 @@ pub struct DeliveryPlan {
 pub struct Delivery {
     pub route_name: String,
     pub receiver: String,
+    pub escalation_policy: Option<String>,
 }
 
 #[derive(Debug)]
@@ -42,6 +43,7 @@ impl RouteEngine {
                 deliveries.push(Delivery {
                     route_name: route.name.clone(),
                     receiver: route.receiver.clone(),
+                    escalation_policy: route.escalation_policy.clone(),
                 });
 
                 if !route.continue_matching {
@@ -56,6 +58,7 @@ impl RouteEngine {
             deliveries.push(Delivery {
                 route_name: "default".to_string(),
                 receiver: receiver.clone(),
+                escalation_policy: None,
             });
         }
 
@@ -67,6 +70,7 @@ impl RouteEngine {
 struct CompiledRoute {
     name: String,
     receiver: String,
+    escalation_policy: Option<String>,
     continue_matching: bool,
     matchers: Vec<CompiledMatcher>,
 }
@@ -81,6 +85,7 @@ impl CompiledRoute {
         Ok(Self {
             name: route.name,
             receiver: route.receiver,
+            escalation_policy: route.escalation_policy,
             continue_matching: route.continue_matching,
             matchers,
         })
@@ -196,6 +201,7 @@ mod tests {
                 path: ":memory:".to_string(),
             },
             delivery: DeliveryConfig::default(),
+            escalation: crate::config::EscalationConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig { log_alerts: false },
             routing: RoutingConfig {
@@ -203,6 +209,7 @@ mod tests {
                 routes: vec![RouteConfig {
                     name: "prod-critical".to_string(),
                     receiver: "prod".to_string(),
+                    escalation_policy: None,
                     continue_matching: false,
                     matchers: vec![MatcherConfig {
                         field: "label.severity".to_string(),
