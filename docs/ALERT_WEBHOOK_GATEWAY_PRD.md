@@ -17,6 +17,9 @@ The closest product shape is the original self-hosted Grafana OnCall OSS plus
 its mapping support, but smaller, source-agnostic, config-first, and easier to
 operate. It should avoid becoming a broad AIOps workbench like Keep.
 
+For a phased implementation plan, see
+[ALERT_WEBHOOK_GATEWAY_OPENSPEC.md](ALERT_WEBHOOK_GATEWAY_OPENSPEC.md).
+
 ## Problem
 
 Teams use multiple systems that can generate alerts through webhooks, for
