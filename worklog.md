@@ -9,3 +9,5 @@
 - Started Phase 2: SQLite event/delivery records, background retry worker, redacted delivery errors, persistence-before-delivery tests, retry/dead-letter tests.
 - Completed Phase 2 locally, committed `1b82cc1`, pushed, and checked Phase 2 boxes in issue #10.
 - Started Phase 3: alert group records keyed by fingerprint, lifecycle/audit state, read APIs, action APIs, and tests.
+- Completed Phase 3 locally, committed `0375174`, pushed, and checked Phase 3 boxes in issue #10.
+- Started Phase 4: static operator UI at `/` and `/ui`, API-backed group table/detail panel, lifecycle/replay controls, route smoke test.

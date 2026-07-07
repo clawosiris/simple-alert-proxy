@@ -53,6 +53,14 @@ Alert groups and delivery records support explicit operator actions:
 Lifecycle actions update persisted state and write audit entries. Silence uses
 a one-hour default window until configurable policies are added.
 
+### Operator UI
+
+The service serves a compact operator UI at `/` and `/ui`. The UI uses the JSON
+read/action APIs to show alert groups, normalized event detail, raw payloads,
+route information, delivery attempts/errors, and ack/resolve/silence/replay
+controls. It is intentionally static and served by the Rust binary so the
+single-container deployment path stays simple.
+
 ### `POST /webhooks/signoz`
 
 This is the current SigNoz compatibility integration path. Gateway v2 work must

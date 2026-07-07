@@ -244,7 +244,7 @@ impl Storage {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, alert_group_id, event_id, integration, source, status,
-                   severity, title, fingerprint, created_at
+                   severity, title, fingerprint, raw_payload, created_at
             FROM alert_events
             ORDER BY created_at DESC, id DESC
             LIMIT 500
@@ -411,6 +411,7 @@ pub struct AlertEventRecord {
     pub severity: String,
     pub title: String,
     pub fingerprint: String,
+    pub raw_payload: serde_json::Value,
     pub created_at: i64,
 }
 
@@ -512,7 +513,9 @@ fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventR
         severity: row.get(6)?,
         title: row.get(7)?,
         fingerprint: row.get(8)?,
-        created_at: row.get(9)?,
+        raw_payload: serde_json::from_str(&row.get::<_, String>(9)?)
+            .unwrap_or(serde_json::Value::Null),
+        created_at: row.get(10)?,
     })
 }
 

@@ -221,6 +221,15 @@ Provide a compact UI for normal alert inspection and intervention.
 - API client layer.
 - UI tests or screenshot checks for primary views.
 
+### Implementation Notes
+
+- `src/ui.rs` serves a static operator console at `/` and `/ui`.
+- The UI reads alert groups, events, deliveries, integrations, and routes from
+  the Phase 3 APIs.
+- The detail panel includes lifecycle controls for ack, resolve, silence, and
+  delivery replay, plus normalized event JSON and raw payload JSON.
+- Route smoke coverage verifies the UI is served by the Rust binary.
+
 ### Acceptance
 
 - An operator can inspect and act on an alert without reading logs.

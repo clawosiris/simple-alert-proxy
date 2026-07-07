@@ -4,7 +4,7 @@ use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::{get, post},
 };
 use clap::Parser;
@@ -23,6 +23,7 @@ mod routing;
 mod signoz;
 mod storage;
 mod tls;
+mod ui;
 
 use crate::{
     alert::AlertEvent,
@@ -234,6 +235,8 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
 
     Ok(Router::new()
         .route("/healthz", post(healthz).get(healthz))
+        .route("/", get(operator_ui))
+        .route("/ui", get(operator_ui))
         .route(&webhook_path, post(handle_signoz_webhook))
         .route("/webhooks/{integration}", post(handle_generic_webhook))
         .route("/api/alert-groups", get(list_alert_groups))
@@ -252,6 +255,10 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
 
 async fn healthz() -> impl IntoResponse {
     StatusCode::NO_CONTENT
+}
+
+async fn operator_ui() -> Html<&'static str> {
+    Html(ui::OPERATOR_UI)
 }
 
 async fn list_alert_groups(
@@ -733,6 +740,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn ui_route_serves_operator_console() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("Simple Alert Proxy"));
+        assert!(body.contains("/api/alert-groups"));
     }
 
     #[test]
