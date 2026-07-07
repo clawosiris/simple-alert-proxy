@@ -19,3 +19,4 @@
 - Started Phase 7: optional intelligence config disabled by default, advisory enrichment records/API, and UI advisory section.
 - Started E2E core alert proxy test work on `alert-proxy_v2`: synthetic webhook generator, mock receivers, severity routing, canonical output checks, and alert-group dedupe assertions.
 - Completed E2E test locally; `cargo fmt --check`, `cargo test`, and `git diff --check` pass with 44 tests.
+- Fixed PR #12 Rust CI Clippy failures on `alert-proxy_v2`: removed a single-binding match in the generic webhook handler and cloned mock receiver payloads before later awaits in the E2E test. Verified `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, and `cargo test` locally.

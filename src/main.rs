@@ -459,12 +459,8 @@ async fn handle_generic_webhook(
                 continue;
             };
 
-            match receiver {
-                receiver => {
-                    queue_target_event_delivery(&state, event, receiver, delivery.clone())?;
-                    delivered_receivers.push(delivery.receiver.clone());
-                }
-            }
+            queue_target_event_delivery(&state, event, receiver, delivery.clone())?;
+            delivered_receivers.push(delivery.receiver.clone());
         }
     }
 
@@ -1341,7 +1337,7 @@ mod tests {
         wait_for_received_count(&default_received, 1).await;
         wait_for_succeeded_deliveries(app.clone(), 5).await;
 
-        let critical = critical_received.lock().unwrap();
+        let critical = critical_received.lock().unwrap().clone();
         assert_eq!(critical.len(), 3);
         assert!(critical.iter().all(|payload| {
             payload["event"]["fingerprint"] == "svc-cpu"
@@ -1356,21 +1352,18 @@ mod tests {
                 .iter()
                 .any(|payload| payload["event"]["status"] == "resolved")
         );
-        drop(critical);
 
-        let warning = warning_received.lock().unwrap();
+        let warning = warning_received.lock().unwrap().clone();
         assert_eq!(warning[0]["event"]["fingerprint"], "svc-disk");
         assert_eq!(warning[0]["event"]["severity"], "warning");
         assert_eq!(warning[0]["delivery"]["route"], "warning-synthetic");
         assert_eq!(warning[0]["delivery"]["receiver"], "warning-target");
-        drop(warning);
 
-        let default = default_received.lock().unwrap();
+        let default = default_received.lock().unwrap().clone();
         assert_eq!(default[0]["event"]["fingerprint"], "svc-latency");
         assert_eq!(default[0]["event"]["severity"], "info");
         assert_eq!(default[0]["delivery"]["route"], "default");
         assert_eq!(default[0]["delivery"]["receiver"], "default-target");
-        drop(default);
 
         let groups = get_api_json(app.clone(), "/api/alert-groups").await;
         let critical_group = find_record(&groups, "fingerprint", "svc-cpu");
