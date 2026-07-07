@@ -181,6 +181,16 @@ Promote deduplicated alert groups to the primary operator-facing object.
 - Audit/history storage.
 - Tests for ack, resolve, silence, and replay state transitions.
 
+### Implementation Notes
+
+- SQLite storage maintains `alert_groups` keyed by fingerprint and links stored
+  alert events to their group.
+- Repeated events increment group counts and update timestamps; resolved events
+  mark the group resolved.
+- Read APIs expose groups, events, deliveries, integrations, and routes.
+- Lifecycle APIs support acknowledge, resolve, silence, and replay state
+  changes with persisted audit entries.
+
 ### Acceptance
 
 - Operators can inspect one canonical alert group for repeated events.

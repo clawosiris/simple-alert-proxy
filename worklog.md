@@ -7,3 +7,5 @@
 - Added `src/integration.rs`, generic integration config, canonical-event routing, generic webhook handler, example fixture/config, docs, and tests.
 - Completed Phase 1 locally, committed `46dc513`, pushed, and checked Phase 1 boxes in issue #10.
 - Started Phase 2: SQLite event/delivery records, background retry worker, redacted delivery errors, persistence-before-delivery tests, retry/dead-letter tests.
+- Completed Phase 2 locally, committed `1b82cc1`, pushed, and checked Phase 2 boxes in issue #10.
+- Started Phase 3: alert group records keyed by fingerprint, lifecycle/audit state, read APIs, action APIs, and tests.

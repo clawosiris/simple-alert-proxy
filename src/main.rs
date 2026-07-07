@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
 };
 use clap::Parser;
 use serde_json::Value;
@@ -236,6 +236,15 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         .route("/healthz", post(healthz).get(healthz))
         .route(&webhook_path, post(handle_signoz_webhook))
         .route("/webhooks/{integration}", post(handle_generic_webhook))
+        .route("/api/alert-groups", get(list_alert_groups))
+        .route("/api/alert-events", get(list_alert_events))
+        .route("/api/deliveries", get(list_deliveries))
+        .route("/api/integrations", get(list_integrations))
+        .route("/api/routes", get(list_routes))
+        .route("/api/alert-groups/{id}/ack", post(acknowledge_group))
+        .route("/api/alert-groups/{id}/resolve", post(resolve_group))
+        .route("/api/alert-groups/{id}/silence", post(silence_group))
+        .route("/api/deliveries/{id}/replay", post(replay_delivery))
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(TraceLayer::new_for_http())
         .with_state(state))
@@ -243,6 +252,106 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
 
 async fn healthz() -> impl IntoResponse {
     StatusCode::NO_CONTENT
+}
+
+async fn list_alert_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    Ok(Json(state.storage.list_alert_groups()?))
+}
+
+async fn list_alert_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    Ok(Json(state.storage.list_alert_events()?))
+}
+
+async fn list_deliveries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    Ok(Json(state.storage.list_deliveries()?))
+}
+
+async fn list_integrations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    let integrations = state
+        .config
+        .integrations
+        .keys()
+        .map(|name| serde_json::json!({ "name": name }))
+        .collect::<Vec<_>>();
+    Ok(Json(integrations))
+}
+
+async fn list_routes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    let routes = state
+        .config
+        .routing
+        .routes
+        .iter()
+        .map(|route| {
+            serde_json::json!({
+                "name": route.name,
+                "receiver": route.receiver,
+                "continue_matching": route.continue_matching,
+                "matcher_count": route.matchers.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(routes))
+}
+
+async fn acknowledge_group(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    state.storage.acknowledge_group(id)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn resolve_group(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    state.storage.resolve_group(id)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn silence_group(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    state.storage.silence_group(id)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn replay_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize(state.config.server.auth.as_ref(), &headers)?;
+    state.storage.replay_delivery(id)?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn handle_signoz_webhook(
@@ -788,6 +897,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alert_group_api_tracks_repeated_and_resolved_events() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.routing.routes[0].matchers = vec![config::MatcherConfig {
+            field: "fingerprint".to_string(),
+            equals: Some("group-1".to_string()),
+            regex: None,
+            contains: None,
+        }];
+        config.integrations = generic_test_integrations();
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        for state in ["firing", "firing", "resolved"] {
+            let response = app
+                .clone()
+                .oneshot(generic_request(serde_json::json!({
+                    "state": state,
+                    "risk": { "level": "critical" },
+                    "finding": {
+                        "id": "group-1",
+                        "title": "Grouped alert",
+                        "description": "repeat",
+                        "plugin": "test"
+                    }
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/alert-groups")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let groups: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(groups[0]["fingerprint"], "group-1");
+        assert_eq!(groups[0]["event_count"], 3);
+        assert_eq!(groups[0]["status"], "resolved");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_actions_update_group_and_audit_records() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = AlertEvent::new(
+            "test",
+            "test",
+            "firing",
+            "critical",
+            "Lifecycle Test",
+            "lifecycle-test",
+            serde_json::json!({}),
+        );
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "default".to_string(),
+            receiver: "target".to_string(),
+        };
+        let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
+        let group_id = storage.list_alert_groups().unwrap()[0].id;
+
+        storage.acknowledge_group(group_id).unwrap();
+        storage.silence_group(group_id).unwrap();
+        storage.resolve_group(group_id).unwrap();
+        storage.replay_delivery(delivery_id).unwrap();
+
+        let group = &storage.list_alert_groups().unwrap()[0];
+        assert_eq!(group.status, "resolved");
+        assert!(group.acknowledged_at.is_some());
+        assert!(group.silenced_until.is_some());
+        assert_eq!(
+            storage.audit_actions().unwrap(),
+            vec!["acknowledge", "silence", "resolve", "replay"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_apis_expose_events_deliveries_integrations_and_routes() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.integrations = generic_test_integrations();
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "risk": { "level": "high" },
+                "finding": {
+                    "id": "api-1",
+                    "title": "API alert",
+                    "description": "api",
+                    "plugin": "test"
+                }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        for uri in [
+            "/api/alert-events",
+            "/api/deliveries",
+            "/api/integrations",
+            "/api/routes",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(value.as_array().is_some_and(|items| !items.is_empty()));
+        }
+    }
+
+    #[tokio::test]
     async fn generic_webhook_path_rejects_unknown_integration() {
         let config = test_config("http://127.0.0.1:1");
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -1260,6 +1507,36 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearer test-token")
             .body(Body::from(payload.to_string()))
             .unwrap()
+    }
+
+    fn generic_request(payload: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/webhooks/openvas")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
+    fn generic_test_integrations() -> BTreeMap<String, IntegrationConfig> {
+        BTreeMap::from([(
+            "openvas".to_string(),
+            IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                path: "/webhooks/openvas".to_string(),
+                auth: None,
+                source: "openvas".to_string(),
+                status: "state".to_string(),
+                severity: Some("risk.level".to_string()),
+                title: "finding.title".to_string(),
+                body: Some("finding.description".to_string()),
+                fingerprint: "finding.id".to_string(),
+                starts_at: None,
+                ends_at: None,
+                labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
+                annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
+                links: BTreeMap::new(),
+            }),
+        )])
     }
 
     fn fixture_payload() -> Value {

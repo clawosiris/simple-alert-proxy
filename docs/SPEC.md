@@ -28,6 +28,31 @@ The service is a single Rust binary.
 
 Returns `204 No Content` when the process is alive.
 
+### Read APIs
+
+The gateway exposes compact JSON read APIs for operator and later UI use:
+
+- `GET /api/alert-groups`
+- `GET /api/alert-events`
+- `GET /api/deliveries`
+- `GET /api/integrations`
+- `GET /api/routes`
+
+If server bearer authentication is configured, these endpoints require the same
+`Authorization: Bearer ...` header as inbound webhooks.
+
+### Lifecycle APIs
+
+Alert groups and delivery records support explicit operator actions:
+
+- `POST /api/alert-groups/{id}/ack`
+- `POST /api/alert-groups/{id}/resolve`
+- `POST /api/alert-groups/{id}/silence`
+- `POST /api/deliveries/{id}/replay`
+
+Lifecycle actions update persisted state and write audit entries. Silence uses
+a one-hour default window until configurable policies are added.
+
 ### `POST /webhooks/signoz`
 
 This is the current SigNoz compatibility integration path. Gateway v2 work must
@@ -187,6 +212,10 @@ last redacted error, request summary, and response summary. Delivery failures
 retry with bounded exponential backoff and move to `dead_letter` after retry
 exhaustion. Request summaries store route and receiver names, not receiver
 webhook URLs.
+
+Alert groups are keyed by normalized event fingerprint. Repeated active events
+increment `event_count` and update `last_event_at`; resolved events mark the
+group `resolved`.
 
 Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery. Grouped alerts are enqueued before the webhook response returns, then flushed in the background after the debounce window.
 
