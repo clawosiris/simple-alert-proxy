@@ -167,6 +167,27 @@ receivers:
     timeout_secs: 10
 ```
 
+Accepted alert events and delivery records are persisted in SQLite before
+outbound delivery is attempted. The default database path is
+`simple-alert-proxy.db`.
+
+```yaml
+storage:
+  type: sqlite
+  path: "simple-alert-proxy.db"
+
+delivery:
+  max_attempts: 3
+  initial_backoff_millis: 250
+  max_backoff_millis: 30000
+```
+
+Delivery records store target name, status, attempt count, next retry time,
+last redacted error, request summary, and response summary. Delivery failures
+retry with bounded exponential backoff and move to `dead_letter` after retry
+exhaustion. Request summaries store route and receiver names, not receiver
+webhook URLs.
+
 Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery. Grouped alerts are enqueued before the webhook response returns, then flushed in the background after the debounce window.
 
 ```yaml

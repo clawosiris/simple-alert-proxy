@@ -134,6 +134,17 @@ Decouple webhook acceptance from outbound target availability.
 - Retry policy config.
 - Tests for persistence-before-delivery and retry/dead-letter behavior.
 
+### Implementation Notes
+
+- `src/storage.rs` creates the SQLite schema at startup and persists
+  `alert_events` plus `delivery_records`.
+- Webhook handlers store events and queue delivery records before returning
+  `202 Accepted`.
+- Delivery workers update attempt counts, retry with bounded backoff, and mark
+  exhausted records as `dead_letter`.
+- Stored request summaries use route and receiver names, and stored target
+  errors are redacted instead of recording full webhook URLs.
+
 ### Acceptance
 
 - A failing target does not cause an accepted webhook event to be lost.

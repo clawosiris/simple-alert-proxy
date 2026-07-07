@@ -21,14 +21,17 @@ mod google_chat;
 mod integration;
 mod routing;
 mod signoz;
+mod storage;
 mod tls;
 
 use crate::{
+    alert::AlertEvent,
     config::{AppConfig, GoogleChatReceiverConfig},
     google_chat::{DebugDeliveryLog, GoogleChatClient},
     integration::{GenericJsonIntegration, Integration, SigNozIntegration},
     routing::{Delivery, RouteEngine},
     signoz::SigNozAlert,
+    storage::Storage,
 };
 
 #[derive(Debug, Parser)]
@@ -48,6 +51,7 @@ struct AppState {
     config: Arc<AppConfig>,
     router: Arc<RouteEngine>,
     aggregator: AlertAggregator,
+    storage: Storage,
 }
 
 #[derive(Clone)]
@@ -220,9 +224,11 @@ async fn main() -> anyhow::Result<()> {
 fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Router> {
     let max_body_bytes = config.server.max_body_bytes;
     let google_chat = GoogleChatClient::new();
+    let storage = Storage::open(&config.storage.path)?;
     let state = AppState {
         router: Arc::new(RouteEngine::new(config.as_ref().clone())?),
         aggregator: AlertAggregator::new(&config, google_chat),
+        storage,
         config: Arc::clone(&config),
     };
 
@@ -267,15 +273,13 @@ async fn handle_signoz_webhook(
 
             match receiver {
                 config::ReceiverConfig::GoogleChat(receiver) => {
-                    state
-                        .aggregator
-                        .enqueue_google_chat(
-                            receiver,
-                            alert.clone(),
-                            delivery.clone(),
-                            state.config.debug.log_alerts,
-                        )
-                        .await?;
+                    queue_signoz_google_chat_delivery(
+                        &state,
+                        &event,
+                        receiver,
+                        alert.clone(),
+                        delivery.clone(),
+                    )?;
                     delivered_receivers.push(delivery.receiver.clone());
                 }
             }
@@ -328,15 +332,7 @@ async fn handle_generic_webhook(
 
             match receiver {
                 config::ReceiverConfig::GoogleChat(receiver) => {
-                    let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
-                        route_name: delivery.route_name.as_str(),
-                        receiver_name: delivery.receiver.as_str(),
-                    });
-                    state
-                        .aggregator
-                        .google_chat
-                        .send_event(receiver, event, delivery, debug)
-                        .await?;
+                    queue_generic_google_chat_delivery(&state, event, receiver, delivery.clone())?;
                     delivered_receivers.push(delivery.receiver.clone());
                 }
             }
@@ -354,6 +350,154 @@ async fn handle_generic_webhook(
         StatusCode::ACCEPTED,
         Json(delivery_summary(&delivered_receivers)),
     ))
+}
+
+fn queue_signoz_google_chat_delivery(
+    state: &AppState,
+    event: &AlertEvent,
+    receiver: &GoogleChatReceiverConfig,
+    alert: SigNozAlert,
+    delivery: Delivery,
+) -> Result<(), WebhookError> {
+    let alert_event_id = state.storage.store_event(event)?;
+    let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
+    let worker = DeliveryWorker::new(
+        state.storage.clone(),
+        state.config.delivery.clone(),
+        state.config.debug.log_alerts,
+    );
+    let aggregator = state.aggregator.clone();
+    let receiver = receiver.clone();
+
+    tokio::spawn(async move {
+        worker
+            .run(delivery_id, move |debug_enabled| {
+                let aggregator = aggregator.clone();
+                let receiver = receiver.clone();
+                let alert = alert.clone();
+                let delivery = delivery.clone();
+                async move {
+                    aggregator
+                        .enqueue_google_chat(&receiver, alert, delivery, debug_enabled)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            })
+            .await;
+    });
+
+    Ok(())
+}
+
+fn queue_generic_google_chat_delivery(
+    state: &AppState,
+    event: &AlertEvent,
+    receiver: &GoogleChatReceiverConfig,
+    delivery: Delivery,
+) -> Result<(), WebhookError> {
+    let alert_event_id = state.storage.store_event(event)?;
+    let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
+    let worker = DeliveryWorker::new(
+        state.storage.clone(),
+        state.config.delivery.clone(),
+        state.config.debug.log_alerts,
+    );
+    let google_chat = state.aggregator.google_chat.clone();
+    let receiver = receiver.clone();
+    let event = event.clone();
+
+    tokio::spawn(async move {
+        worker
+            .run(delivery_id, move |debug_enabled| {
+                let google_chat = google_chat.clone();
+                let receiver = receiver.clone();
+                let event = event.clone();
+                let delivery = delivery.clone();
+                async move {
+                    let debug = debug_enabled.then_some(DebugDeliveryLog {
+                        route_name: delivery.route_name.as_str(),
+                        receiver_name: delivery.receiver.as_str(),
+                    });
+                    google_chat
+                        .send_event(&receiver, &event, &delivery, debug)
+                        .await
+                        .map_err(redacted_delivery_error)
+                }
+            })
+            .await;
+    });
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct DeliveryWorker {
+    storage: Storage,
+    config: config::DeliveryConfig,
+    debug_enabled: bool,
+}
+
+impl DeliveryWorker {
+    fn new(storage: Storage, config: config::DeliveryConfig, debug_enabled: bool) -> Self {
+        Self {
+            storage,
+            config,
+            debug_enabled,
+        }
+    }
+
+    async fn run<F, Fut>(&self, delivery_id: i64, mut send: F)
+    where
+        F: FnMut(bool) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        let mut backoff = Duration::from_millis(self.config.initial_backoff_millis);
+
+        for attempt in 1..=self.config.max_attempts {
+            if let Err(error) = self.storage.mark_attempt(delivery_id, attempt) {
+                error!(%error, delivery_id, "failed to mark delivery attempt");
+            }
+
+            match send(self.debug_enabled).await {
+                Ok(()) => {
+                    if let Err(error) = self.storage.mark_succeeded(delivery_id, "delivered") {
+                        error!(%error, delivery_id, "failed to mark delivery success");
+                    }
+                    return;
+                }
+                Err(error) if attempt >= self.config.max_attempts => {
+                    if let Err(store_error) = self.storage.mark_dead_letter(delivery_id, &error) {
+                        error!(%store_error, delivery_id, "failed to mark delivery dead-letter");
+                    }
+                    error!(delivery_id, %error, "delivery exhausted retries");
+                    return;
+                }
+                Err(error) => {
+                    let next_retry_at = storage::now_epoch_millis() + backoff.as_millis() as i64;
+                    if let Err(store_error) =
+                        self.storage
+                            .mark_retrying(delivery_id, next_retry_at, &error)
+                    {
+                        error!(%store_error, delivery_id, "failed to mark delivery retry");
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(
+                        backoff.saturating_mul(2),
+                        Duration::from_millis(self.config.max_backoff_millis),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn redacted_delivery_error(error: google_chat::GoogleChatError) -> String {
+    match error {
+        google_chat::GoogleChatError::Rejected(status) => {
+            format!("target rejected delivery with status {status}")
+        }
+        google_chat::GoogleChatError::Http(_) => "target delivery failed".to_string(),
+    }
 }
 
 fn authorize(auth: Option<&config::AuthConfig>, headers: &HeaderMap) -> Result<(), WebhookError> {
@@ -416,6 +560,8 @@ enum WebhookError {
     InvalidPayload(#[from] signoz::AlertParseError),
     #[error("invalid integration payload: {0}")]
     Integration(#[from] integration::IntegrationError),
+    #[error("storage failed: {0}")]
+    Storage(#[from] anyhow::Error),
     #[error("delivery failed: {0}")]
     Delivery(#[from] google_chat::GoogleChatError),
 }
@@ -430,6 +576,7 @@ impl IntoResponse for WebhookError {
                 StatusCode::NOT_FOUND
             }
             WebhookError::Integration(_) => StatusCode::BAD_REQUEST,
+            WebhookError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebhookError::Delivery(_) => StatusCode::BAD_GATEWAY,
         };
         (
@@ -444,8 +591,9 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, AuthConfig, DebugConfig, GenericJsonIntegrationConfig,
+        AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, GenericJsonIntegrationConfig,
         GoogleChatReceiverConfig, IntegrationConfig, ReceiverConfig, RoutingConfig, ServerConfig,
+        StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -579,6 +727,64 @@ mod tests {
             received[0]["cardsV2"][0]["card"]["header"]["subtitle"].as_str(),
             Some("openvas | firing | high")
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_accepts_after_persisting_before_delivery_finishes() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_slow_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(received.lock().unwrap().len(), 0);
+        wait_for_received_count(&received, 1).await;
+    }
+
+    #[tokio::test]
+    async fn delivery_worker_dead_letters_after_retry_exhaustion() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = AlertEvent::new(
+            "test",
+            "test",
+            "firing",
+            "critical",
+            "Retry Test",
+            "retry-test",
+            serde_json::json!({}),
+        );
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "default".to_string(),
+            receiver: "dead-target".to_string(),
+        };
+        let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
+        let worker = DeliveryWorker::new(
+            storage.clone(),
+            DeliveryConfig {
+                max_attempts: 2,
+                initial_backoff_millis: 1,
+                max_backoff_millis: 1,
+            },
+            false,
+        );
+
+        worker
+            .run(delivery_id, |_| async {
+                Err::<(), String>("target delivery failed".to_string())
+            })
+            .await;
+
+        assert_eq!(storage.event_count().unwrap(), 1);
+        assert_eq!(storage.delivery_statuses().unwrap(), vec!["dead_letter"]);
+        assert_eq!(storage.delivery_attempts().unwrap(), vec![2]);
     }
 
     #[tokio::test]
@@ -1010,6 +1216,29 @@ mod tests {
         format!("http://{addr}/chat")
     }
 
+    async fn spawn_slow_mock_google_chat(received: Arc<Mutex<Vec<Value>>>) -> String {
+        let app =
+            Router::new()
+                .route(
+                    "/chat",
+                    post(
+                        |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                         Json(payload): Json<Value>| async move {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            received.lock().unwrap().push(payload);
+                            StatusCode::OK
+                        },
+                    ),
+                )
+                .with_state(received);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/chat")
+    }
+
     async fn wait_for_received_count(received: &Arc<Mutex<Vec<Value>>>, expected: usize) {
         for _ in 0..100 {
             if received.lock().unwrap().len() >= expected {
@@ -1049,6 +1278,15 @@ mod tests {
                 tls: None,
             },
             integrations: BTreeMap::new(),
+            storage: StorageConfig {
+                r#type: "sqlite".to_string(),
+                path: ":memory:".to_string(),
+            },
+            delivery: DeliveryConfig {
+                max_attempts: 3,
+                initial_backoff_millis: 1,
+                max_backoff_millis: 1,
+            },
             alert_grouping: AlertGroupingConfig {
                 enabled: true,
                 debounce_millis: 10,

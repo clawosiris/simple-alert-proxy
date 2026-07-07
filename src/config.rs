@@ -8,6 +8,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub integrations: BTreeMap<String, IntegrationConfig>,
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub delivery: DeliveryConfig,
+    #[serde(default)]
     pub alert_grouping: AlertGroupingConfig,
     #[serde(default)]
     pub debug: DebugConfig,
@@ -33,6 +37,9 @@ impl AppConfig {
         if self.server.max_body_bytes == 0 {
             bail!("server.max_body_bytes must be greater than zero");
         }
+
+        self.storage.validate()?;
+        self.delivery.validate()?;
 
         if let Some(auth) = &self.server.auth
             && auth.bearer_token.is_empty()
@@ -101,6 +108,77 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     pub bearer_token: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_storage_type")]
+    pub r#type: String,
+    #[serde(default = "default_storage_path")]
+    pub path: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            r#type: default_storage_type(),
+            path: default_storage_path(),
+        }
+    }
+}
+
+impl StorageConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.r#type != "sqlite" {
+            bail!("storage.type must be sqlite");
+        }
+
+        if self.path.is_empty() {
+            bail!("storage.path must not be empty");
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryConfig {
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_initial_backoff_millis")]
+    pub initial_backoff_millis: u64,
+    #[serde(default = "default_max_backoff_millis")]
+    pub max_backoff_millis: u64,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            initial_backoff_millis: default_initial_backoff_millis(),
+            max_backoff_millis: default_max_backoff_millis(),
+        }
+    }
+}
+
+impl DeliveryConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.max_attempts == 0 {
+            bail!("delivery.max_attempts must be greater than zero");
+        }
+
+        if self.initial_backoff_millis == 0 {
+            bail!("delivery.initial_backoff_millis must be greater than zero");
+        }
+
+        if self.max_backoff_millis < self.initial_backoff_millis {
+            bail!(
+                "delivery.max_backoff_millis must be greater than or equal to delivery.initial_backoff_millis"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -323,6 +401,26 @@ fn default_max_body_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_storage_type() -> String {
+    "sqlite".to_string()
+}
+
+fn default_storage_path() -> String {
+    "simple-alert-proxy.db".to_string()
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+fn default_initial_backoff_millis() -> u64 {
+    250
+}
+
+fn default_max_backoff_millis() -> u64 {
+    30_000
+}
+
 fn default_alert_grouping_enabled() -> bool {
     true
 }
@@ -435,6 +533,11 @@ mod tests {
                     links: BTreeMap::new(),
                 }),
             )]),
+            storage: StorageConfig {
+                r#type: "sqlite".to_string(),
+                path: ":memory:".to_string(),
+            },
+            delivery: DeliveryConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig::default(),
             routing: RoutingConfig::default(),
