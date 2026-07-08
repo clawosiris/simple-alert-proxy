@@ -1,0 +1,65 @@
+{
+  "alerts": [
+    {
+      "annotations": {
+        "description": "This alert is fired when the defined metric (current value: 0.8831764314370117) crosses the threshold (0.8)",
+        "summary": "This alert is fired when the defined metric (current value: 0.8831764314370117) crosses the threshold (0.8)"
+      },
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "5c141589ae6fd554",
+      "generatorURL": "https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f",
+      "labels": {
+        "Category": "Ops",
+        "alertname": "Disk Space Low",
+        "host.name": "host000.het.example.com",
+        "mountpoint": "/",
+        "ruleId": "019ef5e1-2027-7be3-a458-88b6a8707d8f",
+        "ruleSource": "https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f",
+        "severity": "warning",
+        "threshold.name": "warning"
+      },
+      "startsAt": "2026-06-23T19:09:27.583939484Z",
+      "status": "firing"
+    },
+    {
+      "annotations": {
+        "description": "This alert is fired when the defined metric (current value: 0.8066590624516485) crosses the threshold (0.8)",
+        "summary": "This alert is fired when the defined metric (current value: 0.8066590624516485) crosses the threshold (0.8)"
+      },
+      "endsAt": "0001-01-01T00:00:00Z",
+      "fingerprint": "830dcc0075881150",
+      "generatorURL": "https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f",
+      "labels": {
+        "Category": "Ops",
+        "alertname": "Disk Space Low",
+        "host.name": "host000.het.example.com",
+        "mountpoint": "/var/cache/fscache",
+        "ruleId": "019ef5e1-2027-7be3-a458-88b6a8707d8f",
+        "ruleSource": "https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f",
+        "severity": "warning",
+        "threshold.name": "warning"
+      },
+      "startsAt": "2026-06-23T19:09:27.583939484Z",
+      "status": "firing"
+    }
+  ],
+  "commonAnnotations": {},
+  "commonLabels": {
+    "Category": "Ops",
+    "alertname": "Disk Space Low",
+    "host.name": "host000.het.example.com",
+    "ruleId": "019ef5e1-2027-7be3-a458-88b6a8707d8f",
+    "ruleSource": "https://signoz00.het.example.com/alerts/edit?ruleId=019ef5e1-2027-7be3-a458-88b6a8707d8f",
+    "severity": "warning",
+    "threshold.name": "warning"
+  },
+  "externalURL": "http://localhost:8080",
+  "groupKey": "{__receiver__=\"GC - Ops Alerts\"}:{ruleId=\"019ef5e1-2027-7be3-a458-88b6a8707d8f\"}",
+  "groupLabels": {
+    "ruleId": "019ef5e1-2027-7be3-a458-88b6a8707d8f"
+  },
+  "receiver": "GC - Ops Alerts",
+  "status": "firing",
+  "truncatedAlerts": 0,
+  "version": "4"
+}

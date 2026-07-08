@@ -11,11 +11,60 @@ server:
 debug:
   log_alerts: false
 
+integrations:
+  openvas-example:
+    type: "generic_json"
+    preset: "openvas_scan"
+    path: "/webhooks/openvas-example"
+    auth:
+      bearer_token: "replace-me"
+    source: "openvas"
+    status: "state"
+    severity: "risk.level"
+    title: "finding.title"
+    body: "finding.description"
+    fingerprint: "finding.id"
+    starts_at: "observed_at"
+    labels:
+      asset: "asset.host"
+    annotations:
+      plugin: "finding.plugin"
+    links:
+      source: "finding.url"
+
+storage:
+  type: "sqlite"
+  path: "simple-alert-proxy.db"
+
+delivery:
+  max_attempts: 3
+  initial_backoff_millis: 250
+  max_backoff_millis: 30000
+
+escalation:
+  policies:
+    primary-on-duty:
+      steps:
+        - receiver: "critical-chat"
+          delay_millis: 300000
+          stop_on_ack: true
+          stop_on_resolve: true
+
+intelligence:
+  enabled: false
+  # provider: "openai"
+  allow_lifecycle_mutation: false
+
+alert_grouping:
+  enabled: true
+  debounce_millis: 1000
+
 routing:
   default_receiver: "default-chat"
   routes:
     - name: "critical-production"
       receiver: "critical-chat"
+      escalation_policy: "primary-on-duty"
       matchers:
         - field: "label.severity"
           equals: "critical"
@@ -46,4 +95,27 @@ receivers:
     type: "google_chat"
     webhook_url: "https://chat.googleapis.com/v1/spaces/database/messages?key=example&token=example"
     title_template: "DB {{alertname}}"
+    timeout_secs: 10
+
+  generic-webhook:
+    type: "generic_webhook"
+    webhook_url: "https://alerts.example.test/webhook"
+    timeout_secs: 10
+
+  slack-alerts:
+    type: "slack"
+    webhook_url: "https://hooks.slack.com/services/example"
+    title_template: "[{{status}}] {{title}}"
+    timeout_secs: 10
+
+  mattermost-alerts:
+    type: "mattermost"
+    webhook_url: "https://mattermost.example.test/hooks/example"
+    title_template: "[{{severity}}] {{title}}"
+    timeout_secs: 10
+
+  discord-alerts:
+    type: "discord"
+    webhook_url: "https://discord.com/api/webhooks/example"
+    title_template: "[{{status}}] {{title}}"
     timeout_secs: 10

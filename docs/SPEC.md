@@ -28,7 +28,44 @@ The service is a single Rust binary.
 
 Returns `204 No Content` when the process is alive.
 
+### Read APIs
+
+The gateway exposes compact JSON read APIs for operator and later UI use:
+
+- `GET /api/alert-groups`
+- `GET /api/alert-events`
+- `GET /api/deliveries`
+- `GET /api/integrations`
+- `GET /api/routes`
+
+If server bearer authentication is configured, these endpoints require the same
+`Authorization: Bearer ...` header as inbound webhooks.
+
+### Lifecycle APIs
+
+Alert groups and delivery records support explicit operator actions:
+
+- `POST /api/alert-groups/{id}/ack`
+- `POST /api/alert-groups/{id}/resolve`
+- `POST /api/alert-groups/{id}/silence`
+- `POST /api/deliveries/{id}/replay`
+
+Lifecycle actions update persisted state and write audit entries. Silence uses
+a one-hour default window until configurable policies are added.
+
+### Operator UI
+
+The service serves a compact operator UI at `/` and `/ui`. The UI uses the JSON
+read/action APIs to show alert groups, normalized event detail, raw payloads,
+route information, delivery attempts/errors, and ack/resolve/silence/replay
+controls. It is intentionally static and served by the Rust binary so the
+single-container deployment path stays simple.
+
 ### `POST /webhooks/signoz`
+
+This is the current SigNoz compatibility integration path. Gateway v2 work must
+keep accepting this path by default unless the operator explicitly changes
+`server.webhook_path`.
 
 Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 
@@ -39,7 +76,9 @@ Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 
 The raw payload is retained for routing rules that need JSON pointer access.
 
-Success returns `202 Accepted` with a delivery summary:
+The proxy groups alerts by `ruleId` before delivery. When one webhook payload contains alerts for multiple `ruleId` values, the proxy splits the payload by `ruleId`. When SigNoz emits separate webhook requests for instances of the same rule, the proxy accepts each request, holds grouped alerts for the configured debounce window, and then sends one outgoing notification with the instances combined.
+
+Success returns `202 Accepted` with an accepted delivery summary:
 
 ```json
 {
@@ -48,9 +87,47 @@ Success returns `202 Accepted` with a delivery summary:
 }
 ```
 
-Invalid payloads return `400`. Receiver failures return `502`.
+Invalid payloads return `400`. Ungrouped receiver failures return `502`. Grouped delivery failures happen after the webhook response and are logged.
 
 If bearer authentication is enabled, missing or invalid credentials return `401`.
+
+### `POST /webhooks/{integration}`
+
+Generic JSON integrations can be configured under `integrations`. Each
+integration maps fields from an arbitrary JSON payload into the canonical alert
+event model with config only.
+
+```yaml
+integrations:
+  openvas-example:
+    type: generic_json
+    path: "/webhooks/openvas-example"
+    auth:
+      bearer_token: "replace-me"
+    source: "openvas"
+    status: "state"
+    severity: "risk.level"
+    title: "finding.title"
+    body: "finding.description"
+    fingerprint: "finding.id"
+    starts_at: "observed_at"
+    labels:
+      asset: "asset.host"
+    annotations:
+      plugin: "finding.plugin"
+    links:
+      source: "finding.url"
+```
+
+Field mappings accept either dotted paths such as `finding.title` or JSON
+pointers such as `/finding/title`. Required mappings are `source`, `status`,
+`title`, and `fingerprint`; invalid integration config fails at startup with a
+clear validation error. A missing configured integration returns `404`, while a
+payload missing a required mapped field returns `400`.
+
+Integration-specific bearer auth overrides the server-level bearer token for
+that integration. If no integration auth is configured, the server auth setting
+applies.
 
 ## SigNoz Integration
 
@@ -123,6 +200,86 @@ receivers:
     timeout_secs: 10
 ```
 
+Accepted alert events and delivery records are persisted in SQLite before
+outbound delivery is attempted. The default database path is
+`simple-alert-proxy.db`.
+
+```yaml
+storage:
+  type: sqlite
+  path: "simple-alert-proxy.db"
+
+delivery:
+  max_attempts: 3
+  initial_backoff_millis: 250
+  max_backoff_millis: 30000
+```
+
+Delivery records store target name, status, attempt count, next retry time,
+last redacted error, request summary, and response summary. Delivery failures
+retry with bounded exponential backoff and move to `dead_letter` after retry
+exhaustion. Request summaries store route and receiver names, not receiver
+webhook URLs.
+
+Alert groups are keyed by normalized event fingerprint. Repeated active events
+increment `event_count` and update `last_event_at`; resolved events mark the
+group `resolved`.
+
+## Escalation
+
+Escalation policies are config-defined ordered steps. Routes can select a policy
+with `escalation_policy`; the first step is persisted as a scheduled escalation
+task when an active alert is accepted. Acknowledging or resolving the alert group
+cancels scheduled escalation tasks.
+
+```yaml
+escalation:
+  policies:
+    primary-on-duty:
+      steps:
+        - receiver: "critical-chat"
+          delay_millis: 300000
+          stop_on_ack: true
+          stop_on_resolve: true
+
+routing:
+  routes:
+    - name: "critical-prod"
+      receiver: "critical-chat"
+      escalation_policy: "primary-on-duty"
+```
+
+External schedule sources such as iCalendar, Google Calendar, CalDAV, GoAlert,
+or static YAML can be represented by generated config or later scheduler inputs.
+
+## Optional Intelligence
+
+Intelligence support is optional and disabled by default. Advisory enrichment is
+stored separately from canonical alert group state, delivery state, and lifecycle
+state.
+
+```yaml
+intelligence:
+  enabled: false
+  provider: "openai"
+  allow_lifecycle_mutation: false
+```
+
+The advisory storage model supports suggested summaries, labels, fingerprints,
+and correlations without changing alert lifecycle state. Lifecycle mutation is
+rejected unless intelligence is enabled and the operator explicitly configures
+`allow_lifecycle_mutation`.
+
+Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery. Grouped alerts are enqueued before the webhook response returns, then flushed in the background after the debounce window.
+
+```yaml
+alert_grouping:
+  enabled: true
+  debounce_millis: 1000
+```
+
+The grouping key includes receiver, route, status, and `ruleId`, so unrelated routes and firing/resolved transitions are not merged into the same outgoing notification.
+
 ## Debug Logging
 
 Debug alert logging is disabled by default.
@@ -148,7 +305,12 @@ Supported matcher operators:
 
 Supported matcher fields:
 
+- `integration`
+- `source`
 - `status`
+- `severity`
+- `title`
+- `fingerprint`
 - `label.<name>`
 - `annotation.<name>`
 - `payload.<json-pointer-or-path>`
@@ -170,7 +332,8 @@ routing:
 
 ## Receivers
 
-Initial receiver support is Google Chat incoming webhooks.
+Receiver support includes Google Chat incoming webhooks, generic outbound
+webhooks, Slack, Mattermost, and Discord.
 
 ```yaml
 receivers:
@@ -179,9 +342,38 @@ receivers:
     webhook_url: "https://chat.googleapis.com/v1/spaces/..."
     title_template: "[{{status}}] {{alertname}}"
     timeout_secs: 10
+
+  generic-webhook:
+    type: generic_webhook
+    webhook_url: "https://alerts.example.test/webhook"
+    timeout_secs: 10
+
+  slack-alerts:
+    type: slack
+    webhook_url: "https://hooks.slack.com/services/..."
+    title_template: "[{{status}}] {{title}}"
+    timeout_secs: 10
+
+  mattermost-alerts:
+    type: mattermost
+    webhook_url: "https://mattermost.example.test/hooks/..."
+    title_template: "[{{severity}}] {{title}}"
+    timeout_secs: 10
+
+  discord-alerts:
+    type: discord
+    webhook_url: "https://discord.com/api/webhooks/..."
+    title_template: "[{{status}}] {{title}}"
+    timeout_secs: 10
 ```
 
-The first implementation sends plain text messages. A later iteration should support Google Chat cards with sections for labels, annotations, and instance links.
+The current Google Chat adapter keeps the SigNoz grouped card behavior. Generic
+and chat-style targets receive canonical alert-event payloads through the same
+durable delivery queue, retry, redaction, and replay behavior.
+
+Generic JSON integrations can name a source preset for operator clarity and
+validation. Supported presets are `alertmanager`, `grafana`, `openobserve`, and
+`openvas_scan`.
 
 ## Security
 
@@ -214,7 +406,7 @@ Future metrics:
 
 1. Compile and run with YAML config
 2. Accept real SigNoz webhook payloads
-3. Deliver plain text Google Chat messages
+3. Deliver compact Google Chat card messages
 4. Add route tests and config validation tests
 5. Add inbound auth and request limits
 6. Package as a container image
