@@ -10,6 +10,12 @@ PublishPort=8443:8443
 Volume=/etc/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z
 Volume=/etc/simple-alert-proxy/tls.crt:/run/simple-alert-proxy/tls/tls.crt:ro,Z
 Volume=/etc/simple-alert-proxy/tls.key:/run/simple-alert-proxy/tls/tls.key:ro,Z
+HealthCmd=/usr/bin/curl -kfsS https://127.0.0.1:8443/healthz || exit 1
+HealthInterval=30s
+HealthTimeout=3s
+HealthRetries=3
+HealthStartPeriod=30s
+HealthOnFailure=kill
 
 [Service]
 EnvironmentFile=/etc/default/simple-alert-proxy

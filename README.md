@@ -70,6 +70,7 @@ http://127.0.0.1:8080/ui
 
 - `POST /webhooks/signoz`
 - `POST /webhooks/{integration}`
+- `POST /debug/webhook`
 
 `/webhooks/signoz` is the compatibility integration for existing SigNoz
 deployments. Generic integrations are configured under `integrations` and can
@@ -77,6 +78,12 @@ map arbitrary JSON payloads into canonical alert events without Rust changes.
 
 Accepted webhooks are persisted and queued before the service returns
 `202 Accepted`; outbound target delivery happens through the delivery worker.
+
+`/debug/webhook` is an authenticated diagnostic intake that pretty-prints the
+incoming JSON payload to stderr and returns `202 Accepted` without persisting,
+routing, or delivering it. This endpoint always requires
+`server.auth.bearer_token`; it returns `401 Unauthorized` if auth is missing
+from the request or not configured on the server.
 
 ### Read APIs
 
@@ -284,6 +291,10 @@ debug:
 Only enable this while debugging. Alert payloads can contain sensitive labels,
 annotations, and incident context.
 
+For source-side webhook troubleshooting without routing an alert, send JSON to
+`POST /debug/webhook` with `Authorization: Bearer ...`. The endpoint logs the
+payload and returns `{"logged":true}`.
+
 ## TLS
 
 TLS is optional.
@@ -359,6 +370,13 @@ Build or pull the `localhost/simple-alert-proxy:latest` image, then run:
 sudo systemctl daemon-reload
 sudo systemctl enable --now simple-alert-proxy.service
 ```
+
+The image includes a default HTTP health check for `GET /healthz` on
+`127.0.0.1:8080`. The bundled Quadlet unit overrides it for the native TLS
+deployment path and checks `https://127.0.0.1:8443/healthz` every 30 seconds
+with a 3-second timeout, 3 retries, and a 30-second startup grace period. If the
+health check fails repeatedly, Podman kills the container and systemd restarts
+it through the unit's `Restart=on-failure` policy.
 
 ## Development
 

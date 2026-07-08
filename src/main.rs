@@ -237,6 +237,7 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         .route("/healthz", post(healthz).get(healthz))
         .route("/", get(operator_ui))
         .route("/ui", get(operator_ui))
+        .route("/debug/webhook", post(handle_debug_webhook))
         .route(&webhook_path, post(handle_signoz_webhook))
         .route("/webhooks/{integration}", post(handle_generic_webhook))
         .route("/api/alert-groups", get(list_alert_groups))
@@ -368,6 +369,22 @@ async fn replay_delivery(
     authorize(state.config.server.auth.as_ref(), &headers)?;
     state.storage.replay_delivery(id)?;
     Ok(StatusCode::ACCEPTED)
+}
+
+async fn handle_debug_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, WebhookError> {
+    authorize_required(state.config.server.auth.as_ref(), &headers)?;
+
+    let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
+    log_debug_json("authenticated debug webhook", &payload);
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "logged": true })),
+    ))
 }
 
 async fn handle_signoz_webhook(
@@ -651,6 +668,17 @@ fn redacted_delivery_error(error: google_chat::GoogleChatError) -> String {
 fn authorize(auth: Option<&config::AuthConfig>, headers: &HeaderMap) -> Result<(), WebhookError> {
     let Some(auth) = auth else {
         return Ok(());
+    };
+
+    authorize_required(Some(auth), headers)
+}
+
+fn authorize_required(
+    auth: Option<&config::AuthConfig>,
+    headers: &HeaderMap,
+) -> Result<(), WebhookError> {
+    let Some(auth) = auth else {
+        return Err(WebhookError::Unauthorized);
     };
 
     let Some(value) = headers.get(header::AUTHORIZATION) else {
@@ -1465,6 +1493,78 @@ mod tests {
         wait_for_received_count(&received, 1).await;
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn debug_webhook_logs_payload_with_bearer_token() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/webhook")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source": "manual-debug",
+                            "message": "debug payload"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["logged"], true);
+    }
+
+    #[tokio::test]
+    async fn debug_webhook_requires_bearer_token() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/webhook")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn debug_webhook_rejects_when_auth_is_not_configured() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/webhook")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

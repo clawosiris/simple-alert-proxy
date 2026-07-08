@@ -28,6 +28,13 @@ The service is a single Rust binary.
 
 Returns `204 No Content` when the process is alive.
 
+Container images include a default health check that calls
+`http://127.0.0.1:8080/healthz` with a short timeout. The bundled Quadlet
+deployment overrides this for the TLS profile and checks
+`https://127.0.0.1:8443/healthz` with certificate verification disabled for the
+in-container loopback request. The Quadlet health policy kills the container
+after repeated failures so systemd can restart it with `Restart=on-failure`.
+
 ### Read APIs
 
 The gateway exposes compact JSON read APIs for operator and later UI use:
@@ -40,6 +47,17 @@ The gateway exposes compact JSON read APIs for operator and later UI use:
 
 If server bearer authentication is configured, these endpoints require the same
 `Authorization: Bearer ...` header as inbound webhooks.
+
+### Debug Webhook
+
+`POST /debug/webhook` accepts arbitrary JSON for source-side troubleshooting,
+pretty-prints the payload to stderr, and returns `202 Accepted` with
+`{"logged":true}`. It does not normalize, persist, route, queue, or deliver the
+payload.
+
+This endpoint is always authenticated. It requires `server.auth.bearer_token`
+to be configured and requires the matching `Authorization: Bearer ...` header on
+the request; otherwise it returns `401 Unauthorized`.
 
 ### Lifecycle APIs
 
@@ -292,6 +310,9 @@ debug:
 When enabled, the service writes the raw incoming webhook payload and each outgoing receiver payload to stderr as pretty-printed JSON. Outgoing logs include the route and receiver names but do not include receiver webhook URLs.
 
 Only enable this for debugging. Alert payloads can contain sensitive labels, annotations, and incident context.
+
+For one-off payload inspection, `POST /debug/webhook` logs a JSON request body
+without storing or delivering it. It still requires bearer authentication.
 
 ## Routing
 
