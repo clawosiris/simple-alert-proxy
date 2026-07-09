@@ -356,6 +356,15 @@ For source-side webhook troubleshooting without routing an alert, send JSON to
 `POST /debug/webhook` with `Authorization: Bearer ...`. The endpoint logs the
 payload and returns `{"logged":true}`.
 
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/debug/webhook \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer replace-me' \
+  --data @examples/generic-json-webhook.json
+```
+
 ## TLS
 
 TLS is optional.
