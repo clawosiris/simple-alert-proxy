@@ -40,6 +40,7 @@ To run the published container image, copy the example config first and adjust
 it for container networking and persistent storage:
 
 ```bash
+image=ghcr.io/clawosiris/simple-alert-proxy:latest
 mkdir -p .local/simple-alert-proxy/data
 cp examples/config.yaml .local/simple-alert-proxy/config.yaml
 ```
@@ -53,27 +54,41 @@ storage:
   path: "/var/lib/simple-alert-proxy/simple-alert-proxy.db"
 ```
 
+The image runs as the non-root `simple-alert-proxy` user. Make the mounted data
+directory writable by that in-container user before starting the service.
+
 Run with Podman:
 
 ```bash
+uid="$(podman run --rm --entrypoint /usr/bin/id "$image" -u simple-alert-proxy)"
+gid="$(podman run --rm --entrypoint /usr/bin/id "$image" -g simple-alert-proxy)"
+podman unshare chown -R "$uid:$gid" .local/simple-alert-proxy/data
+
 podman run --rm --name simple-alert-proxy \
   --pull=always \
   -p 127.0.0.1:8080:8080 \
   -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z" \
   -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy:Z" \
-  ghcr.io/clawosiris/simple-alert-proxy:latest
+  "$image"
 ```
 
 Run with Docker:
 
 ```bash
+uid="$(docker run --rm --entrypoint /usr/bin/id "$image" -u simple-alert-proxy)"
+gid="$(docker run --rm --entrypoint /usr/bin/id "$image" -g simple-alert-proxy)"
+sudo chown -R "$uid:$gid" .local/simple-alert-proxy/data
+
 docker run --rm --name simple-alert-proxy \
   --pull=always \
   -p 127.0.0.1:8080:8080 \
   -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro" \
   -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy" \
-  ghcr.io/clawosiris/simple-alert-proxy:latest
+  "$image"
 ```
+
+For a disposable local test, you can skip the data volume and ownership commands;
+SQLite will write inside the temporary container filesystem.
 
 Send the bundled SigNoz-compatible fixture:
 
