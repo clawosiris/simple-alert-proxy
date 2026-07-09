@@ -36,6 +36,45 @@ advisory intelligence scaffolding.
 cargo run -- --config examples/config.yaml
 ```
 
+To run the published container image, copy the example config first and adjust
+it for container networking and persistent storage:
+
+```bash
+mkdir -p .local/simple-alert-proxy/data
+cp examples/config.yaml .local/simple-alert-proxy/config.yaml
+```
+
+In `.local/simple-alert-proxy/config.yaml`, set:
+
+```yaml
+server:
+  bind: "0.0.0.0:8080"
+storage:
+  path: "/var/lib/simple-alert-proxy/simple-alert-proxy.db"
+```
+
+Run with Podman:
+
+```bash
+podman run --rm --name simple-alert-proxy \
+  --pull=always \
+  -p 127.0.0.1:8080:8080 \
+  -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z" \
+  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy:Z" \
+  ghcr.io/clawosiris/simple-alert-proxy:latest
+```
+
+Run with Docker:
+
+```bash
+docker run --rm --name simple-alert-proxy \
+  --pull=always \
+  -p 127.0.0.1:8080:8080 \
+  -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro" \
+  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy" \
+  ghcr.io/clawosiris/simple-alert-proxy:latest
+```
+
 Send the bundled SigNoz-compatible fixture:
 
 ```bash
@@ -315,18 +354,21 @@ TLS supports PEM files on disk, whole-value environment references in `$VAR` or
 
 ## Container Build
 
+After creating the container-ready `.local/simple-alert-proxy/config.yaml` from
+the Quick Start, build and run a local image:
+
 ```bash
 podman build -t simple-alert-proxy:local .
 podman run --rm -p 8080:8080 \
-  -v ./examples/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z \
+  -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z" \
+  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy:Z" \
   simple-alert-proxy:local
 ```
 
-Release images are published to GitHub Container Registry. Published tags may
-lag the current `alert-proxy_v2` branch:
+Release images are published to GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/clawosiris/simple-alert-proxy:0.0.4
+podman pull ghcr.io/clawosiris/simple-alert-proxy:0.0.5
 podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
 ```
 
