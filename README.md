@@ -51,11 +51,14 @@ In `.local/simple-alert-proxy/config.yaml`, set:
 server:
   bind: "0.0.0.0:8080"
 storage:
-  path: "/var/lib/simple-alert-proxy/simple-alert-proxy.db"
+  path: "/var/lib/simple-alert-proxy/data/simple-alert-proxy.db"
 ```
 
 The image runs as the non-root `simple-alert-proxy` user. Make the mounted data
-directory writable by that in-container user before starting the service.
+directory writable by that in-container user before starting the service. The
+host data directory and the in-container storage path must line up: the examples
+below mount `.local/simple-alert-proxy/data` at
+`/var/lib/simple-alert-proxy/data`, so the SQLite path also uses that directory.
 
 Run with Podman:
 
@@ -68,7 +71,7 @@ podman run --rm --name simple-alert-proxy \
   --pull=always \
   -p 127.0.0.1:8080:8080 \
   -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z" \
-  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy:Z" \
+  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy/data:Z" \
   "$image"
 ```
 
@@ -83,12 +86,16 @@ docker run --rm --name simple-alert-proxy \
   --pull=always \
   -p 127.0.0.1:8080:8080 \
   -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro" \
-  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy" \
+  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy/data" \
   "$image"
 ```
 
 For a disposable local test, you can skip the data volume and ownership commands;
 SQLite will write inside the temporary container filesystem.
+
+If SQLite reports `Unable to open the database file`, confirm that the configured
+`storage.path` is inside the mounted container directory and that the mounted
+host directory is writable by the image's `simple-alert-proxy` UID/GID.
 
 Send the bundled SigNoz-compatible fixture:
 
@@ -376,7 +383,7 @@ the Quick Start, build and run a local image:
 podman build -t simple-alert-proxy:local .
 podman run --rm -p 8080:8080 \
   -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z" \
-  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy:Z" \
+  -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy/data:Z" \
   simple-alert-proxy:local
 ```
 
