@@ -25,7 +25,7 @@ pub async fn serve_tls(
     };
 
     axum_server::bind_rustls(bind_addr, rustls_config)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("TLS server failed")
 }

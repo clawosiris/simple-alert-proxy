@@ -2,9 +2,10 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, StatusCode, header},
-    response::{Html, IntoResponse},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use clap::Parser;
@@ -214,9 +215,12 @@ async fn main() -> anyhow::Result<()> {
         tls::serve_tls(bind_addr, app, tls_config).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     }
 
     Ok(())
@@ -252,7 +256,92 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         .route("/api/deliveries/{id}/replay", post(replay_delivery))
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(log_webhook_failures))
         .with_state(state))
+}
+
+async fn log_webhook_failures(request: Request, next: Next) -> Response {
+    let caller = CallerDetails::from_request(&request);
+    let response = next.run(request).await;
+
+    if let Some(log) = response.extensions().get::<WebhookErrorLog>() {
+        error!(
+            error = %log.error,
+            status = %response.status(),
+            method = %caller.method,
+            path = %caller.path,
+            source_ip = caller.source_ip.as_deref().unwrap_or("unknown"),
+            peer_addr = caller.peer_addr.as_deref().unwrap_or("unknown"),
+            x_forwarded_for = caller.x_forwarded_for.as_deref().unwrap_or(""),
+            x_real_ip = caller.x_real_ip.as_deref().unwrap_or(""),
+            user_agent = caller.user_agent.as_deref().unwrap_or(""),
+            "webhook failed"
+        );
+    }
+
+    response
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallerDetails {
+    method: String,
+    path: String,
+    source_ip: Option<String>,
+    peer_addr: Option<String>,
+    x_forwarded_for: Option<String>,
+    x_real_ip: Option<String>,
+    user_agent: Option<String>,
+}
+
+impl CallerDetails {
+    fn from_request(request: &Request) -> Self {
+        let headers = request.headers();
+        let peer_addr = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.to_string());
+        let x_forwarded_for = header_string(headers, "x-forwarded-for");
+        let x_real_ip = header_string(headers, "x-real-ip");
+        let user_agent = header_string(headers, "user-agent");
+        let source_ip = first_forwarded_ip(x_forwarded_for.as_deref())
+            .or_else(|| x_real_ip.clone())
+            .or_else(|| peer_addr.as_deref().and_then(peer_ip));
+
+        Self {
+            method: request.method().to_string(),
+            path: request.uri().path().to_string(),
+            source_ip,
+            peer_addr,
+            x_forwarded_for,
+            x_real_ip,
+            user_agent,
+        }
+    }
+}
+
+fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn first_forwarded_ip(value: Option<&str>) -> Option<String> {
+    value?
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn peer_ip(value: &str) -> Option<String> {
+    value
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|addr| addr.ip().to_string())
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -742,10 +831,15 @@ enum WebhookError {
     Delivery(#[from] google_chat::GoogleChatError),
 }
 
+#[derive(Debug, Clone)]
+struct WebhookErrorLog {
+    error: String,
+}
+
 impl IntoResponse for WebhookError {
     fn into_response(self) -> axum::response::Response {
-        error!(error = %self, "webhook failed");
-        let status = match self {
+        let error = self.to_string();
+        let status = match &self {
             WebhookError::Unauthorized => StatusCode::UNAUTHORIZED,
             WebhookError::InvalidPayload(_) => StatusCode::BAD_REQUEST,
             WebhookError::Integration(integration::IntegrationError::Unknown(_)) => {
@@ -755,11 +849,10 @@ impl IntoResponse for WebhookError {
             WebhookError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebhookError::Delivery(_) => StatusCode::BAD_GATEWAY,
         };
-        (
-            status,
-            Json(serde_json::json!({ "error": self.to_string() })),
-        )
-            .into_response()
+        let mut response =
+            (status, Json(serde_json::json!({ "error": error.clone() }))).into_response();
+        response.extensions_mut().insert(WebhookErrorLog { error });
+        response
     }
 }
 
@@ -801,6 +894,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn caller_details_prefers_forwarded_ip_over_peer_addr() {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/debug/webhook")
+            .header("x-forwarded-for", "203.0.113.10, 10.0.0.2")
+            .header("x-real-ip", "198.51.100.5")
+            .header(header::USER_AGENT, "curl/8.0")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:55220".parse::<SocketAddr>().unwrap(),
+        ));
+
+        let caller = CallerDetails::from_request(&request);
+
+        assert_eq!(caller.method, "POST");
+        assert_eq!(caller.path, "/debug/webhook");
+        assert_eq!(caller.source_ip.as_deref(), Some("203.0.113.10"));
+        assert_eq!(caller.peer_addr.as_deref(), Some("127.0.0.1:55220"));
+        assert_eq!(
+            caller.x_forwarded_for.as_deref(),
+            Some("203.0.113.10, 10.0.0.2")
+        );
+        assert_eq!(caller.x_real_ip.as_deref(), Some("198.51.100.5"));
+        assert_eq!(caller.user_agent.as_deref(), Some("curl/8.0"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_carries_error_log_extension() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/webhook")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-forwarded-for", "203.0.113.10")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let log = response.extensions().get::<WebhookErrorLog>().unwrap();
+        assert_eq!(log.error, "missing or invalid authorization");
     }
 
     #[tokio::test]
