@@ -180,8 +180,8 @@ fn field_value(event: &AlertEvent, field: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, DebugConfig, DeliveryConfig, GoogleChatReceiverConfig, ReceiverConfig,
-        RoutingConfig, ServerLimitsConfig, StorageConfig,
+        AlertGroupingConfig, DebugConfig, DeliveryConfig, GoogleChatReceiverConfig,
+        ManagementConfig, ReceiverConfig, RoutingConfig, ServerLimitsConfig, StorageConfig,
     };
     use std::collections::BTreeMap;
 
@@ -196,6 +196,7 @@ mod tests {
                 auth: None,
                 tls: None,
             },
+            management: ManagementConfig::default(),
             integrations: BTreeMap::new(),
             storage: StorageConfig {
                 r#type: "sqlite".to_string(),
