@@ -96,6 +96,9 @@ SQLite will write inside the temporary container filesystem.
 If SQLite reports `Unable to open the database file`, confirm that the configured
 `storage.path` is inside the mounted container directory and that the mounted
 host directory is writable by the image's `simple-alert-proxy` UID/GID.
+For older configs that still use the relative example path
+`simple-alert-proxy.db`, the published image uses `/var/lib/simple-alert-proxy/data`
+as its working directory so the database lands in the mounted data directory.
 
 Send the bundled SigNoz-compatible fixture:
 
