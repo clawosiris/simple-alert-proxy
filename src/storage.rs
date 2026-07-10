@@ -488,9 +488,9 @@ impl Storage {
     pub fn event_count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap();
         let count = conn.query_row("SELECT COUNT(*) FROM alert_events", [], |row| {
-            row.get::<_, usize>(0)
+            row.get::<_, i64>(0)
         })?;
-        Ok(count)
+        usize::try_from(count).context("alert event count overflowed usize")
     }
 }
 
