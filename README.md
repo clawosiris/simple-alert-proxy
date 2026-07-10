@@ -165,8 +165,10 @@ from the request or not configured on the server.
 Lifecycle actions update persistent state and write audit entries. Acknowledge
 and resolve actions also cancel scheduled escalation tasks for the alert group.
 
-If `server.auth.bearer_token` is configured, these APIs require the same
-`Authorization: Bearer ...` header as inbound webhooks.
+Management APIs use `management.auth.bearer_token` when configured. If that is
+not set, they fall back to `server.auth.bearer_token` for compatibility. Exposed
+non-loopback binds require effective management auth unless
+`management.allow_unauthenticated: true` is set deliberately.
 
 ## Configuration
 
@@ -182,9 +184,27 @@ server:
   bind: "127.0.0.1:8080"
   webhook_path: "/webhooks/signoz"
   max_body_bytes: 1048576
+  limits:
+    webhook_concurrency: 64
+    management_concurrency: 16
   auth:
     bearer_token: "replace-me"
+
+management:
+  auth:
+    bearer_token: "replace-me"
+  allow_unauthenticated: false
 ```
+
+The built-in operator UI stores the management bearer token in browser
+`sessionStorage` and sends it as `Authorization: Bearer ...` for every
+management API request. `/healthz` remains public.
+
+`server.limits.webhook_concurrency` bounds concurrent webhook intake requests.
+`server.limits.management_concurrency` bounds concurrent API, UI, and debug
+requests. Saturated route classes return `503 Service Unavailable` with a small
+JSON error body; `/healthz` is not behind those route-class limits. Use a
+trusted reverse proxy or ingress for per-client/IP rate limiting.
 
 Generic JSON integrations use dotted paths or JSON pointers to map payload
 fields:
@@ -320,8 +340,9 @@ Auth note:
 - This proxy's built-in auth expects `Authorization: Bearer ...` when
   `server.auth.bearer_token` is set.
 - The simplest setup is to leave `server.auth` unset for the SigNoz-facing
-  endpoint, or put a reverse proxy in front that adds the bearer header before
-  forwarding to `simple-alert-proxy`.
+  endpoint, configure `management.auth.bearer_token` for the API/UI, or put a
+  reverse proxy in front that adds the inbound bearer header before forwarding
+  to `simple-alert-proxy`.
 
 ## Alert Grouping
 

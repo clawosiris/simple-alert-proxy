@@ -1,10 +1,12 @@
 use anyhow::{Context, bail};
 use serde::Deserialize;
-use std::{collections::BTreeMap, env, fs, path::Path};
+use std::{collections::BTreeMap, env, fs, net::SocketAddr, path::Path};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
+    #[serde(default)]
+    pub management: ManagementConfig,
     #[serde(default)]
     pub integrations: BTreeMap<String, IntegrationConfig>,
     #[serde(default)]
@@ -41,6 +43,7 @@ impl AppConfig {
         if self.server.max_body_bytes == 0 {
             bail!("server.max_body_bytes must be greater than zero");
         }
+        self.server.limits.validate()?;
 
         self.storage.validate()?;
         self.delivery.validate()?;
@@ -52,6 +55,9 @@ impl AppConfig {
         {
             bail!("server.auth.bearer_token must not be empty");
         }
+
+        self.management.validate()?;
+        self.validate_management_exposure()?;
 
         if let Some(tls) = &self.server.tls {
             tls.validate()?;
@@ -109,6 +115,33 @@ impl AppConfig {
         Ok(())
     }
 
+    pub fn management_auth(&self) -> Option<&AuthConfig> {
+        self.management.auth.as_ref().or(self.server.auth.as_ref())
+    }
+
+    pub fn management_allows_unauthenticated(&self) -> bool {
+        self.management_auth().is_none() && self.management.allow_unauthenticated
+    }
+
+    fn validate_management_exposure(&self) -> anyhow::Result<()> {
+        if self.management_auth().is_some() || self.management.allow_unauthenticated {
+            return Ok(());
+        }
+
+        let bind = self
+            .server
+            .bind
+            .parse::<SocketAddr>()
+            .with_context(|| format!("invalid bind address {}", self.server.bind))?;
+        if bind.ip().is_loopback() {
+            return Ok(());
+        }
+
+        bail!(
+            "management auth is required when server.bind is not loopback; set management.auth.bearer_token or management.allow_unauthenticated: true"
+        )
+    }
+
     fn require_receiver(&self, name: &str) -> anyhow::Result<()> {
         if self.receivers.contains_key(name) {
             Ok(())
@@ -134,13 +167,65 @@ pub struct ServerConfig {
     pub webhook_path: String,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    #[serde(default)]
+    pub limits: ServerLimitsConfig,
     pub auth: Option<AuthConfig>,
     pub tls: Option<TlsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ServerLimitsConfig {
+    #[serde(default = "default_webhook_concurrency")]
+    pub webhook_concurrency: usize,
+    #[serde(default = "default_management_concurrency")]
+    pub management_concurrency: usize,
+}
+
+impl Default for ServerLimitsConfig {
+    fn default() -> Self {
+        Self {
+            webhook_concurrency: default_webhook_concurrency(),
+            management_concurrency: default_management_concurrency(),
+        }
+    }
+}
+
+impl ServerLimitsConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.webhook_concurrency == 0 {
+            bail!("server.limits.webhook_concurrency must be greater than zero");
+        }
+
+        if self.management_concurrency == 0 {
+            bail!("server.limits.management_concurrency must be greater than zero");
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     pub bearer_token: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ManagementConfig {
+    pub auth: Option<AuthConfig>,
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
+}
+
+impl ManagementConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if let Some(auth) = &self.auth
+            && auth.bearer_token.is_empty()
+        {
+            bail!("management.auth.bearer_token must not be empty");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -541,6 +626,14 @@ fn default_max_body_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_webhook_concurrency() -> usize {
+    64
+}
+
+fn default_management_concurrency() -> usize {
+    16
+}
+
 fn default_storage_type() -> String {
     "sqlite".to_string()
 }
@@ -667,9 +760,11 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 webhook_path: "/webhooks/signoz".to_string(),
                 max_body_bytes: 1024 * 1024,
+                limits: ServerLimitsConfig::default(),
                 auth: None,
                 tls: None,
             },
+            management: ManagementConfig::default(),
             integrations: BTreeMap::from([(
                 "openvas".to_string(),
                 IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
@@ -716,5 +811,105 @@ mod tests {
                 .to_string()
                 .contains("integration openvas title field must not be empty")
         );
+    }
+
+    #[test]
+    fn rejects_zero_webhook_concurrency_limit() {
+        let limits = ServerLimitsConfig {
+            webhook_concurrency: 0,
+            ..Default::default()
+        };
+
+        let error = limits.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("server.limits.webhook_concurrency must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_management_concurrency_limit() {
+        let limits = ServerLimitsConfig {
+            management_concurrency: 0,
+            ..Default::default()
+        };
+
+        let error = limits.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("server.limits.management_concurrency must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn exposed_bind_requires_management_auth() {
+        let mut config = minimal_valid_config();
+        config.server.bind = "0.0.0.0:8080".to_string();
+        config.server.auth = None;
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("management auth is required when server.bind is not loopback")
+        );
+    }
+
+    #[test]
+    fn exposed_bind_allows_explicit_unauthenticated_management_escape_hatch() {
+        let mut config = minimal_valid_config();
+        config.server.bind = "0.0.0.0:8080".to_string();
+        config.server.auth = None;
+        config.management.allow_unauthenticated = true;
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn loopback_bind_allows_local_management_without_auth() {
+        let mut config = minimal_valid_config();
+        config.server.auth = None;
+
+        config.validate().unwrap();
+    }
+
+    fn minimal_valid_config() -> AppConfig {
+        AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:8080".to_string(),
+                webhook_path: "/webhooks/signoz".to_string(),
+                max_body_bytes: 1024 * 1024,
+                auth: Some(AuthConfig {
+                    bearer_token: "inbound-token".to_string(),
+                }),
+                limits: ServerLimitsConfig::default(),
+                tls: None,
+            },
+            management: ManagementConfig::default(),
+            integrations: BTreeMap::new(),
+            storage: StorageConfig::default(),
+            delivery: DeliveryConfig::default(),
+            escalation: EscalationConfig::default(),
+            intelligence: IntelligenceConfig::default(),
+            alert_grouping: AlertGroupingConfig::default(),
+            debug: DebugConfig::default(),
+            routing: RoutingConfig {
+                default_receiver: Some("default".to_string()),
+                routes: Vec::new(),
+            },
+            receivers: BTreeMap::from([(
+                "default".to_string(),
+                ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
+                    webhook_url: "https://chat.example.test/hook".to_string(),
+                    title_template: default_title_template(),
+                    timeout_secs: default_timeout_secs(),
+                }),
+            )]),
+        }
     }
 }

@@ -201,6 +201,28 @@ Authorization: Bearer replace-me
 
 The current implementation uses a shared secret. If SigNoz can emit signed webhooks in the target deployment, HMAC verification should replace or complement this.
 
+## Management Authentication
+
+Management APIs, lifecycle mutation endpoints, `/debug/webhook`, and the
+operator UI data path use `management.auth.bearer_token` when configured. If no
+management token is configured, the service falls back to `server.auth` for
+compatibility with older configs.
+
+```yaml
+management:
+  auth:
+    bearer_token: "replace-me"
+  allow_unauthenticated: false
+```
+
+When `server.bind` is not loopback, startup validation requires effective
+management auth unless `management.allow_unauthenticated: true` is configured
+explicitly. Loopback-only development can run without management auth. `/healthz`
+stays public.
+
+The built-in operator UI stores the management token in browser `sessionStorage`
+and attaches it as `Authorization: Bearer ...` to every `/api/*` request.
+
 ## Limits And Timeouts
 
 The service rejects request bodies larger than `server.max_body_bytes`.
@@ -208,7 +230,19 @@ The service rejects request bodies larger than `server.max_body_bytes`.
 ```yaml
 server:
   max_body_bytes: 1048576
+  limits:
+    webhook_concurrency: 64
+    management_concurrency: 16
 ```
+
+Webhook intake routes and management/debug/UI routes have separate concurrency
+limits. When a route class is saturated, the service sheds excess requests with
+`503 Service Unavailable` and `{"error":"request concurrency limit exceeded"}`.
+`/healthz` is intentionally outside these route-class limits so health probes
+remain cheap during webhook pressure.
+
+Per-client/IP rate limiting is best enforced at a trusted reverse proxy or
+ingress until this service has explicit proxy-header trust rules.
 
 Google Chat receivers use `timeout_secs` to bound outbound delivery time.
 

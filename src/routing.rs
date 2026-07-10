@@ -180,8 +180,8 @@ fn field_value(event: &AlertEvent, field: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, DebugConfig, DeliveryConfig, GoogleChatReceiverConfig, ReceiverConfig,
-        RoutingConfig, StorageConfig,
+        AlertGroupingConfig, DebugConfig, DeliveryConfig, GoogleChatReceiverConfig,
+        ManagementConfig, ReceiverConfig, RoutingConfig, ServerLimitsConfig, StorageConfig,
     };
     use std::collections::BTreeMap;
 
@@ -192,9 +192,11 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 webhook_path: "/webhooks/signoz".to_string(),
                 max_body_bytes: 1024 * 1024,
+                limits: ServerLimitsConfig::default(),
                 auth: None,
                 tls: None,
             },
+            management: ManagementConfig::default(),
             integrations: BTreeMap::new(),
             storage: StorageConfig {
                 r#type: "sqlite".to_string(),
