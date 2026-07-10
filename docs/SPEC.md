@@ -51,9 +51,10 @@ If server bearer authentication is configured, these endpoints require the same
 ### Debug Webhook
 
 `POST /debug/webhook` accepts arbitrary JSON for source-side troubleshooting,
-pretty-prints the payload to stderr, and returns `202 Accepted` with
+logs the payload to stderr, and returns `202 Accepted` with
 `{"logged":true}`. It does not normalize, persist, route, queue, or deliver the
-payload.
+payload. Payload fields are redacted by default unless
+`debug.log_full_payloads` is explicitly enabled.
 
 This endpoint is always authenticated. It requires `server.auth.bearer_token`
 to be configured and requires the matching `Authorization: Bearer ...` header on
@@ -305,11 +306,12 @@ Debug alert logging is disabled by default.
 ```yaml
 debug:
   log_alerts: true
+  log_full_payloads: false
 ```
 
-When enabled, the service writes the raw incoming webhook payload and each outgoing receiver payload to stderr as pretty-printed JSON. Outgoing logs include the route and receiver names but do not include receiver webhook URLs.
+When enabled, the service writes incoming webhook payloads and outgoing receiver payloads to stderr as pretty-printed JSON. With the default `log_full_payloads: false`, obvious sensitive keys are recursively redacted, including tokens, passwords, secrets, authorization material, API keys, credentials, and webhook URLs. Outgoing logs include the route and receiver names but do not include receiver webhook URLs.
 
-Only enable this for debugging. Alert payloads can contain sensitive labels, annotations, and incident context.
+Only enable `log_full_payloads: true` for trusted local diagnostics. Raw alert payloads can contain sensitive labels, annotations, hostnames, URLs, and incident context.
 
 For one-off payload inspection, `POST /debug/webhook` logs a JSON request body
 without storing or delivering it. It still requires bearer authentication.

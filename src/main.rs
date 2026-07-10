@@ -20,6 +20,7 @@ mod alert;
 mod config;
 mod google_chat;
 mod integration;
+mod redaction;
 mod routing;
 mod signoz;
 mod storage;
@@ -468,7 +469,11 @@ async fn handle_debug_webhook(
     authorize_required(state.config.server.auth.as_ref(), &headers)?;
 
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
-    log_debug_json("authenticated debug webhook", &payload);
+    log_debug_json(
+        "authenticated debug webhook",
+        &payload,
+        state.config.debug.log_full_payloads,
+    );
 
     Ok((
         StatusCode::ACCEPTED,
@@ -485,7 +490,11 @@ async fn handle_signoz_webhook(
 
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
     if state.config.debug.log_alerts {
-        log_debug_json("incoming alert", &payload);
+        log_debug_json(
+            "incoming alert",
+            &payload,
+            state.config.debug.log_full_payloads,
+        );
     }
 
     let signoz = SigNozIntegration::new("signoz");
@@ -549,7 +558,11 @@ async fn handle_generic_webhook(
 
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
     if state.config.debug.log_alerts {
-        log_debug_json("incoming generic alert", &payload);
+        log_debug_json(
+            "incoming generic alert",
+            &payload,
+            state.config.debug.log_full_payloads,
+        );
     }
 
     let integration = GenericJsonIntegration::new(name, config);
@@ -799,8 +812,9 @@ fn parse_bearer_token(value: &header::HeaderValue) -> Option<&[u8]> {
     Some(&value[prefix.len()..])
 }
 
-fn log_debug_json(label: &str, value: &Value) {
-    match serde_json::to_string_pretty(value) {
+fn log_debug_json(label: &str, value: &Value, log_full_payloads: bool) {
+    let log_value = redaction::debug_payload_for_logging(value, log_full_payloads);
+    match serde_json::to_string_pretty(&log_value) {
         Ok(json) => eprintln!("simple-alert-proxy debug {label}:\n{json}"),
         Err(error) => eprintln!("simple-alert-proxy debug {label}: failed to render JSON: {error}"),
     }
@@ -2312,7 +2326,10 @@ mod tests {
                 enabled: true,
                 debounce_millis: 10,
             },
-            debug: DebugConfig { log_alerts: false },
+            debug: DebugConfig {
+                log_alerts: false,
+                log_full_payloads: false,
+            },
             routing: RoutingConfig {
                 default_receiver: Some("default-chat".to_string()),
                 routes: vec![config::RouteConfig {

@@ -381,6 +381,8 @@ impl Default for AlertGroupingConfig {
 pub struct DebugConfig {
     #[serde(default)]
     pub log_alerts: bool,
+    #[serde(default)]
+    pub log_full_payloads: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -4,6 +4,7 @@ use crate::{
         ChatWebhookReceiverConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
         ReceiverConfig,
     },
+    redaction,
     routing::Delivery,
     signoz::SigNozAlert,
 };
@@ -219,7 +220,7 @@ fn log_outgoing_alert(message: &serde_json::Value, debug: DebugDeliveryLog<'_>) 
     let log = json!({
         "route": debug.route_name,
         "receiver": debug.receiver_name,
-        "payload": message,
+        "payload": redaction::redact_json_value(message),
     });
 
     match serde_json::to_string_pretty(&log) {
@@ -620,5 +621,25 @@ mod tests {
                 .as_str(),
             Some("edge-1")
         );
+    }
+
+    #[test]
+    fn outgoing_debug_payload_redacts_sensitive_fields() {
+        let message = serde_json::json!({
+            "event": {
+                "title": "Alert",
+                "authorization": "Bearer secret"
+            },
+            "delivery": {
+                "receiver": "target",
+                "webhook_url": "https://hooks.example.test/token"
+            }
+        });
+
+        let redacted = redaction::redact_json_value(&message);
+
+        assert_eq!(redacted["event"]["authorization"], "[redacted]");
+        assert_eq!(redacted["delivery"]["webhook_url"], "[redacted]");
+        assert_eq!(redacted["event"]["title"], "Alert");
     }
 }

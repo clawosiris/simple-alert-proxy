@@ -140,9 +140,9 @@ map arbitrary JSON payloads into canonical alert events without Rust changes.
 Accepted webhooks are persisted and queued before the service returns
 `202 Accepted`; outbound target delivery happens through the delivery worker.
 
-`/debug/webhook` is an authenticated diagnostic intake that pretty-prints the
-incoming JSON payload to stderr and returns `202 Accepted` without persisting,
-routing, or delivering it. This endpoint always requires
+`/debug/webhook` is an authenticated diagnostic intake that logs the incoming
+JSON payload to stderr and returns `202 Accepted` without persisting, routing,
+or delivering it. Debug payload logging is redacted by default. This endpoint always requires
 `server.auth.bearer_token`; it returns `401 Unauthorized` if auth is missing
 from the request or not configured on the server.
 
@@ -347,14 +347,18 @@ To log incoming webhook payloads and outgoing receiver payloads to stderr:
 ```yaml
 debug:
   log_alerts: true
+  log_full_payloads: false
 ```
 
-Only enable this while debugging. Alert payloads can contain sensitive labels,
-annotations, and incident context.
+With `log_full_payloads: false`, debug output recursively redacts obvious
+sensitive keys such as tokens, passwords, secrets, authorization material,
+API keys, credentials, and webhook URLs. Only enable `log_full_payloads: true`
+for trusted local diagnostics; raw alert payloads can contain sensitive labels,
+annotations, hostnames, URLs, and incident context.
 
 For source-side webhook troubleshooting without routing an alert, send JSON to
 `POST /debug/webhook` with `Authorization: Bearer ...`. The endpoint logs the
-payload and returns `{"logged":true}`.
+redacted payload by default and returns `{"logged":true}`.
 
 Example:
 
