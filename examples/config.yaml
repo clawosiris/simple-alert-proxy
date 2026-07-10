@@ -43,7 +43,7 @@ integrations:
 
 storage:
   type: "sqlite"
-  path: "simple-alert-proxy.db"
+  path: "/var/lib/simple-alert-proxy/data/simple-alert-proxy.db"
 
 delivery:
   max_attempts: 3

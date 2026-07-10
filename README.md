@@ -36,8 +36,8 @@ advisory intelligence scaffolding.
 cargo run -- --config examples/config.yaml
 ```
 
-To run the published container image, copy the example config first and adjust
-it for container networking and persistent storage:
+To run the published container image, copy the example config first. It already
+uses the container data path for SQLite storage:
 
 ```bash
 image=ghcr.io/clawosiris/simple-alert-proxy:latest
@@ -45,7 +45,7 @@ mkdir -p .local/simple-alert-proxy/data
 cp examples/config.yaml .local/simple-alert-proxy/config.yaml
 ```
 
-In `.local/simple-alert-proxy/config.yaml`, set:
+In `.local/simple-alert-proxy/config.yaml`, keep:
 
 ```yaml
 server:
