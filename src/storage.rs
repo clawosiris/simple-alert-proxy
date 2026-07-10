@@ -5,6 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
@@ -21,10 +22,19 @@ impl Storage {
             && let Some(parent) = Path::new(path).parent()
             && !parent.as_os_str().is_empty()
         {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create sqlite database directory {}",
+                    parent.display()
+                )
+            })?;
         }
 
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path).with_context(|| {
+            format!(
+                "failed to open sqlite database at {path}; for containers, set storage.path under the mounted data directory such as /var/lib/simple-alert-proxy/data/simple-alert-proxy.db"
+            )
+        })?;
         let storage = Self {
             conn: Arc::new(Mutex::new(conn)),
         };

@@ -10,11 +10,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --create-home --home-dir /var/lib/simple-alert-proxy simple-alert-proxy
+RUN useradd --system --create-home --home-dir /var/lib/simple-alert-proxy simple-alert-proxy \
+    && mkdir -p /var/lib/simple-alert-proxy/data \
+    && chown simple-alert-proxy:simple-alert-proxy /var/lib/simple-alert-proxy/data
 
 COPY --from=build /app/target/release/simple-alert-proxy /usr/local/bin/simple-alert-proxy
 
 USER simple-alert-proxy
+WORKDIR /var/lib/simple-alert-proxy/data
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
