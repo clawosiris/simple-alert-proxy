@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex as AsyncMutex;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod alert;
 mod config;
@@ -209,6 +209,12 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_app(Arc::clone(&config), webhook_path.clone())?;
 
+    if config.management_allows_unauthenticated() {
+        warn!(
+            "management API/UI authentication explicitly disabled by management.allow_unauthenticated"
+        );
+    }
+
     info!(%bind_addr, %webhook_path, tls = config.server.tls.is_some(), "starting simple-alert-proxy");
 
     if let Some(tls_config) = &config.server.tls {
@@ -356,7 +362,7 @@ async fn list_alert_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     Ok(Json(state.storage.list_alert_groups()?))
 }
 
@@ -364,7 +370,7 @@ async fn list_alert_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     Ok(Json(state.storage.list_alert_events()?))
 }
 
@@ -372,7 +378,7 @@ async fn list_deliveries(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     Ok(Json(state.storage.list_deliveries()?))
 }
 
@@ -380,7 +386,7 @@ async fn list_advisories(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     Ok(Json(state.storage.list_advisories()?))
 }
 
@@ -388,7 +394,7 @@ async fn list_integrations(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     let integrations = state
         .config
         .integrations
@@ -402,7 +408,7 @@ async fn list_routes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     let routes = state
         .config
         .routing
@@ -425,7 +431,7 @@ async fn acknowledge_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     state.storage.acknowledge_group(id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -435,7 +441,7 @@ async fn resolve_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     state.storage.resolve_group(id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -445,7 +451,7 @@ async fn silence_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     state.storage.silence_group(id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -455,7 +461,7 @@ async fn replay_delivery(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
     state.storage.replay_delivery(id)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -465,7 +471,7 @@ async fn handle_debug_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_required(state.config.server.auth.as_ref(), &headers)?;
+    authorize_management(&state.config, &headers)?;
 
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
     log_debug_json("authenticated debug webhook", &payload);
@@ -762,6 +768,14 @@ fn authorize(auth: Option<&config::AuthConfig>, headers: &HeaderMap) -> Result<(
     authorize_required(Some(auth), headers)
 }
 
+fn authorize_management(config: &AppConfig, headers: &HeaderMap) -> Result<(), WebhookError> {
+    if let Some(auth) = config.management_auth() {
+        authorize_required(Some(auth), headers)
+    } else {
+        Ok(())
+    }
+}
+
 fn authorize_required(
     auth: Option<&config::AuthConfig>,
     headers: &HeaderMap,
@@ -863,7 +877,8 @@ mod tests {
         AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, EscalationConfig,
         EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
         GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
-        IntelligenceConfig, ReceiverConfig, RoutingConfig, ServerConfig, StorageConfig,
+        IntelligenceConfig, ManagementConfig, ReceiverConfig, RoutingConfig, ServerConfig,
+        StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -968,6 +983,81 @@ mod tests {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("Simple Alert Proxy"));
         assert!(body.contains("/api/alert-groups"));
+        assert!(body.contains("simple-alert-proxy.managementToken"));
+        assert!(body.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn management_api_uses_management_auth_when_configured() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.management.auth = Some(AuthConfig {
+            bearer_token: "management-token".to_string(),
+        });
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/alert-groups")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let inbound_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/alert-groups")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbound_token.status(), StatusCode::UNAUTHORIZED);
+
+        let management_token = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/alert-groups")
+                    .header(header::AUTHORIZATION, "Bearer management-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(management_token.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn debug_webhook_uses_management_auth() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.management.auth = Some(AuthConfig {
+            bearer_token: "management-token".to_string(),
+        });
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/webhook")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer management-token")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[test]
@@ -1690,7 +1780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn debug_webhook_rejects_when_auth_is_not_configured() {
+    async fn debug_webhook_accepts_loopback_local_mode_without_management_auth() {
         let mut config = test_config("http://127.0.0.1:1");
         config.server.auth = None;
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -1708,7 +1798,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
@@ -2296,6 +2386,7 @@ mod tests {
                 }),
                 tls: None,
             },
+            management: ManagementConfig::default(),
             integrations: BTreeMap::new(),
             storage: StorageConfig {
                 r#type: "sqlite".to_string(),

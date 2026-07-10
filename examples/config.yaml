@@ -8,6 +8,11 @@ server:
   #   cert_path: "/run/simple-alert-proxy/tls/tls.crt"
   #   key_path: "/run/simple-alert-proxy/tls/tls.key"
 
+management:
+  auth:
+    bearer_token: "replace-me"
+  allow_unauthenticated: false
+
 debug:
   log_alerts: false
 

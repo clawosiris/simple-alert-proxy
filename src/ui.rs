@@ -52,6 +52,14 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
       font-weight: 600;
     }
     button.primary { background: var(--accent); color: white; border-color: var(--accent); }
+    input {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 10px;
+      min-height: 34px;
+      min-width: 220px;
+    }
+    .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     main {
       display: grid;
       grid-template-columns: minmax(320px, 1.1fr) minmax(360px, .9fr);
@@ -143,7 +151,12 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
 <body>
   <header>
     <h1>Simple Alert Proxy</h1>
-    <button id="refresh" class="primary">Refresh</button>
+    <div class="toolbar">
+      <input id="token" type="password" autocomplete="off" placeholder="Management token">
+      <button id="save-token">Save</button>
+      <button id="forget-token">Forget</button>
+      <button id="refresh" class="primary">Refresh</button>
+    </div>
   </header>
   <main>
     <section>
@@ -176,9 +189,17 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     </section>
   </main>
   <script>
+    const TOKEN_KEY = "simple-alert-proxy.managementToken";
     const state = { groups: [], events: [], deliveries: [], advisories: [], routes: [], integrations: [], selected: null };
     const $ = (id) => document.getElementById(id);
-    const api = (url, options = {}) => fetch(url, options).then((r) => {
+    const authHeaders = () => {
+      const token = sessionStorage.getItem(TOKEN_KEY);
+      return token ? { "Authorization": `Bearer ${token}` } : {};
+    };
+    const api = (url, options = {}) => fetch(url, {
+      ...options,
+      headers: { ...authHeaders(), ...(options.headers || {}) },
+    }).then((r) => {
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
       return r.status === 204 ? null : r.json().catch(() => null);
     });
@@ -188,6 +209,8 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     })[ch]);
 
     async function load() {
+      const token = sessionStorage.getItem(TOKEN_KEY) || "";
+      if ($("token").value !== token) $("token").value = token;
       [state.groups, state.events, state.deliveries, state.advisories, state.integrations, state.routes] = await Promise.all([
         api("/api/alert-groups"),
         api("/api/alert-events"),
@@ -299,6 +322,18 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     }
 
     $("refresh").addEventListener("click", load);
+    $("save-token").addEventListener("click", async () => {
+      const token = $("token").value.trim();
+      if (token) sessionStorage.setItem(TOKEN_KEY, token);
+      else sessionStorage.removeItem(TOKEN_KEY);
+      await load();
+    });
+    $("forget-token").addEventListener("click", async () => {
+      sessionStorage.removeItem(TOKEN_KEY);
+      $("token").value = "";
+      await load();
+    });
+    $("token").value = sessionStorage.getItem(TOKEN_KEY) || "";
     load().catch((error) => { $("detail").innerHTML = `<div class="item">${esc(error.message)}</div>`; });
   </script>
 </body>
