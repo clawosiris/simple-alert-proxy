@@ -31,3 +31,4 @@
 - Fixed repeated container SQLite startup failure for configs using relative `storage.path`: set the image working directory to `/var/lib/simple-alert-proxy/data`, pre-create it in the image, and add storage-open context for clearer container guidance.
 - Updated `examples/config.yaml` to use the container-safe SQLite path directly so copied configs no longer need a manual storage path edit.
 - Fixed `management.allow_unauthenticated: true` so it overrides the `server.auth` management fallback for `/debug/webhook` and other management endpoints.
+- Started issue #30 implementation on `feat/user-management-rbac`: local users with Argon2id password hashes, SQLite-backed sessions, CSRF-protected cookie auth, bootstrap admin from `SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD`, admin user/team APIs, basic global RBAC, actor-aware lifecycle audit, WebUI login/admin panels, and docs/Quadlet env updates.

@@ -199,12 +199,24 @@ server:
 management:
   auth:
     bearer_token: "replace-me"
+  local_users: true
+  bootstrap_admin_password_env: "SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD"
+  session_ttl_secs: 28800
   allow_unauthenticated: false
 ```
 
-The built-in operator UI stores the management bearer token in browser
-`sessionStorage` and sends it as `Authorization: Bearer ...` for every
-management API request. `/healthz` remains public.
+The built-in operator UI supports local user login backed by SQLite sessions.
+On first startup, if no users exist and `management.local_users: true`, the app
+creates an `admin` user from the password stored in the environment variable
+named by `management.bootstrap_admin_password_env`. The default variable name is
+`SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD`.
+
+The bootstrap password is only used to initialize the first admin user. Once a
+user password exists in the database, the database password hash takes
+precedence; changing the environment variable does not overwrite it. Admins can
+rotate user passwords in the WebUI. The legacy management bearer token remains
+supported as an admin-equivalent bootstrap/emergency path and is still accepted
+as `Authorization: Bearer ...`. `/healthz` remains public.
 
 `server.limits.webhook_concurrency` bounds concurrent webhook intake requests.
 `server.limits.management_concurrency` bounds concurrent API, UI, and debug
@@ -463,6 +475,12 @@ Set `SIMPLE_ALERT_PROXY_TLS_CERT_FILE` and
 real host-side source paths. On startup, the helper copies them into
 `/etc/simple-alert-proxy/tls.crt` and `/etc/simple-alert-proxy/tls.key` with
 ownership and permissions that allow the containerized service to read them.
+Set `SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD` there as well for first-run
+WebUI admin creation:
+
+```ini
+SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD=change-this-long-password
+```
 
 Then point the app config at the mounted in-container paths:
 

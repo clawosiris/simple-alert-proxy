@@ -123,8 +123,15 @@ impl AppConfig {
         self.management.allow_unauthenticated
     }
 
+    pub fn management_local_users_enabled(&self) -> bool {
+        self.management.local_users
+    }
+
     fn validate_management_exposure(&self) -> anyhow::Result<()> {
-        if self.management_auth().is_some() || self.management.allow_unauthenticated {
+        if self.management_auth().is_some()
+            || self.management.allow_unauthenticated
+            || self.management.local_users
+        {
             return Ok(());
         }
 
@@ -209,11 +216,29 @@ pub struct AuthConfig {
     pub bearer_token: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ManagementConfig {
     pub auth: Option<AuthConfig>,
     #[serde(default)]
     pub allow_unauthenticated: bool,
+    #[serde(default = "default_management_local_users")]
+    pub local_users: bool,
+    #[serde(default = "default_bootstrap_admin_password_env")]
+    pub bootstrap_admin_password_env: String,
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+impl Default for ManagementConfig {
+    fn default() -> Self {
+        Self {
+            auth: None,
+            allow_unauthenticated: false,
+            local_users: default_management_local_users(),
+            bootstrap_admin_password_env: default_bootstrap_admin_password_env(),
+            session_ttl_secs: default_session_ttl_secs(),
+        }
+    }
 }
 
 impl ManagementConfig {
@@ -222,6 +247,14 @@ impl ManagementConfig {
             && auth.bearer_token.is_empty()
         {
             bail!("management.auth.bearer_token must not be empty");
+        }
+
+        if self.local_users && self.bootstrap_admin_password_env.trim().is_empty() {
+            bail!("management.bootstrap_admin_password_env must not be empty");
+        }
+
+        if self.local_users && self.session_ttl_secs == 0 {
+            bail!("management.session_ttl_secs must be greater than zero");
         }
 
         Ok(())
@@ -634,6 +667,18 @@ fn default_management_concurrency() -> usize {
     16
 }
 
+fn default_management_local_users() -> bool {
+    true
+}
+
+fn default_bootstrap_admin_password_env() -> String {
+    "SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD".to_string()
+}
+
+fn default_session_ttl_secs() -> u64 {
+    8 * 60 * 60
+}
+
 fn default_storage_type() -> String {
     "sqlite".to_string()
 }
@@ -850,6 +895,7 @@ mod tests {
         let mut config = minimal_valid_config();
         config.server.bind = "0.0.0.0:8080".to_string();
         config.server.auth = None;
+        config.management.local_users = false;
 
         let error = config.validate().unwrap_err();
 
@@ -858,6 +904,15 @@ mod tests {
                 .to_string()
                 .contains("management auth is required when server.bind is not loopback")
         );
+    }
+
+    #[test]
+    fn exposed_bind_allows_local_user_management_auth() {
+        let mut config = minimal_valid_config();
+        config.server.bind = "0.0.0.0:8080".to_string();
+        config.server.auth = None;
+
+        config.validate().unwrap();
     }
 
     #[test]

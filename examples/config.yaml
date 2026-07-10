@@ -14,6 +14,9 @@ server:
 management:
   auth:
     bearer_token: "replace-me"
+  local_users: true
+  bootstrap_admin_password_env: "SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD"
+  session_ttl_secs: 28800
   allow_unauthenticated: false
 
 debug:
