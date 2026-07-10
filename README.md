@@ -146,9 +146,11 @@ Accepted webhooks are persisted and queued before the service returns
 `/debug/webhook` is an authenticated diagnostic intake that logs the incoming
 JSON payload to stderr and returns `202 Accepted` without persisting, routing,
 or delivering it. Debug payload logging is redacted by default. This endpoint
-uses `management.auth.bearer_token` when configured, and falls back to
-`server.auth.bearer_token` when management auth is not set. It returns
-`401 Unauthorized` if auth is required and missing from the request.
+uses `management.auth.bearer_token` when configured, falls back to
+`server.auth.bearer_token` when management auth is not set, and accepts
+unauthenticated requests only when `management.allow_unauthenticated: true` is
+set deliberately. It returns `401 Unauthorized` if auth is required and missing
+from the request.
 
 ### Read APIs
 

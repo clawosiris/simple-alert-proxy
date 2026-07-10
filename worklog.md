@@ -30,3 +30,4 @@
 - Started release `v0.0.7`: bumped Cargo/README version references so the next release includes the SBOM and OpenSSF Scorecard workflow work from PR #23.
 - Fixed repeated container SQLite startup failure for configs using relative `storage.path`: set the image working directory to `/var/lib/simple-alert-proxy/data`, pre-create it in the image, and add storage-open context for clearer container guidance.
 - Updated `examples/config.yaml` to use the container-safe SQLite path directly so copied configs no longer need a manual storage path edit.
+- Fixed `management.allow_unauthenticated: true` so it overrides the `server.auth` management fallback for `/debug/webhook` and other management endpoints.
