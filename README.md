@@ -36,8 +36,8 @@ advisory intelligence scaffolding.
 cargo run -- --config examples/config.yaml
 ```
 
-To run the published container image, copy the example config first and adjust
-it for container networking and persistent storage:
+To run the published container image, copy the example config first. It already
+uses the container data path for SQLite storage:
 
 ```bash
 image=ghcr.io/clawosiris/simple-alert-proxy:latest
@@ -45,7 +45,7 @@ mkdir -p .local/simple-alert-proxy/data
 cp examples/config.yaml .local/simple-alert-proxy/config.yaml
 ```
 
-In `.local/simple-alert-proxy/config.yaml`, set:
+In `.local/simple-alert-proxy/config.yaml`, keep:
 
 ```yaml
 server:
@@ -96,6 +96,9 @@ SQLite will write inside the temporary container filesystem.
 If SQLite reports `Unable to open the database file`, confirm that the configured
 `storage.path` is inside the mounted container directory and that the mounted
 host directory is writable by the image's `simple-alert-proxy` UID/GID.
+For older configs that still use the relative example path
+`simple-alert-proxy.db`, the published image uses `/var/lib/simple-alert-proxy/data`
+as its working directory so the database lands in the mounted data directory.
 
 Send the bundled SigNoz-compatible fixture:
 
@@ -142,9 +145,12 @@ Accepted webhooks are persisted and queued before the service returns
 
 `/debug/webhook` is an authenticated diagnostic intake that logs the incoming
 JSON payload to stderr and returns `202 Accepted` without persisting, routing,
-or delivering it. Debug payload logging is redacted by default. This endpoint always requires
-`server.auth.bearer_token`; it returns `401 Unauthorized` if auth is missing
-from the request or not configured on the server.
+or delivering it. Debug payload logging is redacted by default. This endpoint
+uses `management.auth.bearer_token` when configured, falls back to
+`server.auth.bearer_token` when management auth is not set, and accepts
+unauthenticated requests only when `management.allow_unauthenticated: true` is
+set deliberately. It returns `401 Unauthorized` if auth is required and missing
+from the request.
 
 ### Read APIs
 

@@ -120,7 +120,7 @@ impl AppConfig {
     }
 
     pub fn management_allows_unauthenticated(&self) -> bool {
-        self.management_auth().is_none() && self.management.allow_unauthenticated
+        self.management.allow_unauthenticated
     }
 
     fn validate_management_exposure(&self) -> anyhow::Result<()> {
@@ -868,6 +868,15 @@ mod tests {
         config.management.allow_unauthenticated = true;
 
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn management_escape_hatch_overrides_server_auth_fallback() {
+        let mut config = minimal_valid_config();
+        config.management.allow_unauthenticated = true;
+
+        assert!(config.server.auth.is_some());
+        assert!(config.management_allows_unauthenticated());
     }
 
     #[test]

@@ -811,6 +811,10 @@ fn authorize(auth: Option<&config::AuthConfig>, headers: &HeaderMap) -> Result<(
 }
 
 fn authorize_management(config: &AppConfig, headers: &HeaderMap) -> Result<(), WebhookError> {
+    if config.management_allows_unauthenticated() {
+        return Ok(());
+    }
+
     if let Some(auth) = config.management_auth() {
         authorize_required(Some(auth), headers)
     } else {
@@ -1090,6 +1094,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(management_token.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn management_allow_unauthenticated_overrides_server_auth_fallback() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.management.allow_unauthenticated = true;
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let api_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/alert-groups")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_response.status(), StatusCode::OK);
+
+        let debug_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/webhook")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(debug_response.status(), StatusCode::ACCEPTED);
+
+        let webhook_response = app
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+        assert_eq!(webhook_response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
