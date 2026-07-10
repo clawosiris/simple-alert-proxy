@@ -32,6 +32,23 @@ jobs:
           tar -C dist -czf "${asset}.tar.gz" "${asset}"
           sha256sum "${asset}.tar.gz" > "${asset}.tar.gz.sha256"
 
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0.24.0
+
+      - name: Generate source SBOMs
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="simple-alert-proxy-${version}"
+          "${{ steps.syft.outputs.cmd }}" dir:. \
+            --source-name simple-alert-proxy \
+            --source-version "${version}" \
+            -o spdx-json="${asset}.source.spdx.json" \
+            -o cyclonedx-json="${asset}.source.cyclonedx.json"
+          sha256sum "${asset}.source.spdx.json" > "${asset}.source.spdx.json.sha256"
+          sha256sum "${asset}.source.cyclonedx.json" > "${asset}.source.cyclonedx.json.sha256"
+
       - name: Install Podman
         run: |
           sudo apt-get update
@@ -55,6 +72,22 @@ jobs:
           sudo podman push "${image}:${version}"
           sudo podman push "${image}:latest"
 
+      - name: Generate container image SBOMs
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="simple-alert-proxy-${version}"
+          image="$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          sudo podman save "${image}:${version}" -o "${asset}.container.tar"
+          "${{ steps.syft.outputs.cmd }}" "docker-archive:${asset}.container.tar" \
+            --source-name "${image}" \
+            --source-version "${version}" \
+            -o spdx-json="${asset}.container.spdx.json" \
+            -o cyclonedx-json="${asset}.container.cyclonedx.json"
+          rm "${asset}.container.tar"
+          sha256sum "${asset}.container.spdx.json" > "${asset}.container.spdx.json.sha256"
+          sha256sum "${asset}.container.cyclonedx.json" > "${asset}.container.cyclonedx.json.sha256"
+
       - name: Create release notes
         run: |
           set -euo pipefail
@@ -71,6 +104,11 @@ jobs:
           ## Binary Asset
 
           This release includes a Linux x86_64 binary tarball and SHA-256 checksum.
+
+          ## SBOMs
+
+          This release includes SPDX JSON and CycloneDX JSON SBOMs for the source tree
+          and container image, plus SHA-256 checksums for each SBOM.
           EOF
 
       - name: Create GitHub release
@@ -80,6 +118,10 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             simple-alert-proxy-*.tar.gz \
             simple-alert-proxy-*.tar.gz.sha256 \
+            simple-alert-proxy-*.spdx.json \
+            simple-alert-proxy-*.spdx.json.sha256 \
+            simple-alert-proxy-*.cyclonedx.json \
+            simple-alert-proxy-*.cyclonedx.json.sha256 \
             --title "${GITHUB_REF_NAME}" \
             --notes-file release-notes.md \
             --verify-tag
