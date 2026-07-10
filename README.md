@@ -387,6 +387,11 @@ For source-side webhook troubleshooting without routing an alert, send JSON to
 `POST /debug/webhook` with `Authorization: Bearer ...`. The endpoint logs the
 redacted payload by default and returns `{"logged":true}`.
 
+Webhook failures, including authorization failures, also log request context such
+as method, path, source IP, forwarded IP headers, user agent, and a redacted
+header map. Header values that commonly carry credentials, cookies, tokens, API
+keys, or secrets are logged as `[redacted]`.
+
 Example:
 
 ```bash

@@ -4,7 +4,7 @@ use axum::{
     body::Bytes,
     error_handling::HandleErrorLayer,
     extract::{ConnectInfo, Path, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -311,6 +311,7 @@ async fn log_webhook_failures(request: Request, next: Next) -> Response {
             x_forwarded_for = caller.x_forwarded_for.as_deref().unwrap_or(""),
             x_real_ip = caller.x_real_ip.as_deref().unwrap_or(""),
             user_agent = caller.user_agent.as_deref().unwrap_or(""),
+            headers = ?caller.headers,
             "webhook failed"
         );
     }
@@ -327,6 +328,7 @@ struct CallerDetails {
     x_forwarded_for: Option<String>,
     x_real_ip: Option<String>,
     user_agent: Option<String>,
+    headers: BTreeMap<String, String>,
 }
 
 impl CallerDetails {
@@ -351,8 +353,62 @@ impl CallerDetails {
             x_forwarded_for,
             x_real_ip,
             user_agent,
+            headers: logged_headers(headers),
         }
     }
+}
+
+const MAX_LOGGED_HEADER_VALUE_LEN: usize = 256;
+const REDACTED_HEADER_VALUE: &str = "[redacted]";
+const NON_UTF8_HEADER_VALUE: &str = "[non-utf8]";
+
+fn logged_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                logged_header_value(name, value),
+            )
+        })
+        .collect()
+}
+
+fn logged_header_value(name: &HeaderName, value: &HeaderValue) -> String {
+    if is_sensitive_header(name.as_str()) {
+        return REDACTED_HEADER_VALUE.to_owned();
+    }
+
+    value.to_str().map_or_else(
+        |_| NON_UTF8_HEADER_VALUE.to_owned(),
+        |value| truncate_header_value(value.trim()),
+    )
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "key"
+    ) || name.contains("token")
+        || name.contains("secret")
+        || name.contains("password")
+        || name.contains("credential")
+        || name.contains("api-key")
+        || name.ends_with("-key")
+}
+
+fn truncate_header_value(value: &str) -> String {
+    if value.chars().count() <= MAX_LOGGED_HEADER_VALUE_LEN {
+        return value.to_owned();
+    }
+
+    let mut truncated = value
+        .chars()
+        .take(MAX_LOGGED_HEADER_VALUE_LEN)
+        .collect::<String>();
+    truncated.push_str("...[truncated]");
+    truncated
 }
 
 fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
@@ -979,6 +1035,9 @@ mod tests {
             .header("x-forwarded-for", "203.0.113.10, 10.0.0.2")
             .header("x-real-ip", "198.51.100.5")
             .header(header::USER_AGENT, "curl/8.0")
+            .header(header::AUTHORIZATION, "Bearer super-secret-token")
+            .header("x-api-key", "also-secret")
+            .header("x-request-id", "req-123")
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(
@@ -997,6 +1056,61 @@ mod tests {
         );
         assert_eq!(caller.x_real_ip.as_deref(), Some("198.51.100.5"));
         assert_eq!(caller.user_agent.as_deref(), Some("curl/8.0"));
+        assert_eq!(
+            caller.headers.get("authorization").map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        assert_eq!(
+            caller.headers.get("x-api-key").map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        assert_eq!(
+            caller.headers.get("x-request-id").map(String::as_str),
+            Some("req-123")
+        );
+    }
+
+    #[test]
+    fn logged_headers_redact_invalid_and_truncate_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer nope"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-custom-token"),
+            HeaderValue::from_static("secret"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-invalid"),
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        headers.insert(
+            HeaderName::from_static("x-long-header"),
+            HeaderValue::from_str(&"a".repeat(MAX_LOGGED_HEADER_VALUE_LEN + 1)).unwrap(),
+        );
+
+        let logged = logged_headers(&headers);
+
+        assert_eq!(
+            logged.get("authorization").map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        assert_eq!(
+            logged.get("x-custom-token").map(String::as_str),
+            Some(REDACTED_HEADER_VALUE)
+        );
+        assert_eq!(
+            logged.get("x-invalid").map(String::as_str),
+            Some(NON_UTF8_HEADER_VALUE)
+        );
+        assert_eq!(
+            logged
+                .get("x-long-header")
+                .expect("long header should be logged")
+                .len(),
+            MAX_LOGGED_HEADER_VALUE_LEN + "...[truncated]".len()
+        );
     }
 
     #[tokio::test]
