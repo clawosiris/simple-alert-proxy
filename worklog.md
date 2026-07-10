@@ -27,3 +27,4 @@
 - Added SBOM support with Syft: standalone source SBOM workflow and release-time source/container SPDX JSON + CycloneDX JSON assets with checksums.
 - Added OpenSSF Scorecard workflow with SARIF upload and public score publishing.
 - Verified workflow syntax with `actionlint`, checked whitespace with `git diff --check`, and smoke-tested Syft source SBOM generation locally.
+- Started release `v0.0.7`: bumped Cargo/README version references so the next release includes the SBOM and OpenSSF Scorecard workflow work from PR #23.

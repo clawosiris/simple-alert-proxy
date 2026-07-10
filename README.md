@@ -424,7 +424,7 @@ podman run --rm -p 8080:8080 \
 Release images are published to GitHub Container Registry:
 
 ```bash
-podman pull ghcr.io/clawosiris/simple-alert-proxy:0.0.6
+podman pull ghcr.io/clawosiris/simple-alert-proxy:0.0.7
 podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
 ```
 
