@@ -18,6 +18,7 @@ management:
 
 debug:
   log_alerts: false
+  log_full_payloads: false
 
 integrations:
   openvas-example:

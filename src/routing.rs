@@ -206,7 +206,10 @@ mod tests {
             escalation: crate::config::EscalationConfig::default(),
             intelligence: crate::config::IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
-            debug: DebugConfig { log_alerts: false },
+            debug: DebugConfig {
+                log_alerts: false,
+                log_full_payloads: false,
+            },
             routing: RoutingConfig {
                 default_receiver: Some("default".to_string()),
                 routes: vec![RouteConfig {
