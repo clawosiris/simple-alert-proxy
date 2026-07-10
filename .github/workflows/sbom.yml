@@ -1,0 +1,50 @@
+name: SBOM
+
+on:
+  push:
+    branches:
+      - main
+      - devel
+  pull_request:
+    branches:
+      - main
+      - devel
+  schedule:
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Generate source SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0.24.0
+
+      - name: Generate SBOMs
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          "${{ steps.syft.outputs.cmd }}" dir:. \
+            --source-name simple-alert-proxy \
+            --source-version "${GITHUB_SHA}" \
+            -o spdx-json=sbom/simple-alert-proxy.source.spdx.json \
+            -o cyclonedx-json=sbom/simple-alert-proxy.source.cyclonedx.json
+          test -s sbom/simple-alert-proxy.source.spdx.json
+          test -s sbom/simple-alert-proxy.source.cyclonedx.json
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: simple-alert-proxy-source-sbom
+          path: sbom/
+          if-no-files-found: error
