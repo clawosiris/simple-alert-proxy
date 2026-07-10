@@ -181,7 +181,7 @@ mod tests {
     use super::*;
     use crate::config::{
         AlertGroupingConfig, DebugConfig, DeliveryConfig, GoogleChatReceiverConfig, ReceiverConfig,
-        RoutingConfig, StorageConfig,
+        RoutingConfig, ServerLimitsConfig, StorageConfig,
     };
     use std::collections::BTreeMap;
 
@@ -192,6 +192,7 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 webhook_path: "/webhooks/signoz".to_string(),
                 max_body_bytes: 1024 * 1024,
+                limits: ServerLimitsConfig::default(),
                 auth: None,
                 tls: None,
             },

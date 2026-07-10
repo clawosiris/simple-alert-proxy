@@ -1,7 +1,8 @@
 use anyhow::Context;
 use axum::{
-    Json, Router,
+    BoxError, Json, Router,
     body::Bytes,
+    error_handling::HandleErrorLayer,
     extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
@@ -13,6 +14,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex as AsyncMutex;
+use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info};
 
@@ -228,6 +230,8 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Router> {
     let max_body_bytes = config.server.max_body_bytes;
+    let webhook_concurrency = config.server.limits.webhook_concurrency;
+    let management_concurrency = config.server.limits.management_concurrency;
     let google_chat = GoogleChatClient::new();
     let storage = Storage::open(&config.storage.path)?;
     let state = AppState {
@@ -237,13 +241,20 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         config: Arc::clone(&config),
     };
 
-    Ok(Router::new()
-        .route("/healthz", post(healthz).get(healthz))
+    let health = Router::new().route("/healthz", post(healthz).get(healthz));
+    let webhooks = Router::new()
+        .route(&webhook_path, post(handle_signoz_webhook))
+        .route("/webhooks/{integration}", post(handle_generic_webhook))
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_overload))
+                .layer(LoadShedLayer::new())
+                .layer(ConcurrencyLimitLayer::new(webhook_concurrency)),
+        );
+    let management = Router::new()
         .route("/", get(operator_ui))
         .route("/ui", get(operator_ui))
         .route("/debug/webhook", post(handle_debug_webhook))
-        .route(&webhook_path, post(handle_signoz_webhook))
-        .route("/webhooks/{integration}", post(handle_generic_webhook))
         .route("/api/alert-groups", get(list_alert_groups))
         .route("/api/alert-events", get(list_alert_events))
         .route("/api/deliveries", get(list_deliveries))
@@ -254,10 +265,28 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         .route("/api/alert-groups/{id}/resolve", post(resolve_group))
         .route("/api/alert-groups/{id}/silence", post(silence_group))
         .route("/api/deliveries/{id}/replay", post(replay_delivery))
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_overload))
+                .layer(LoadShedLayer::new())
+                .layer(ConcurrencyLimitLayer::new(management_concurrency)),
+        );
+
+    Ok(health
+        .merge(webhooks)
+        .merge(management)
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(log_webhook_failures))
         .with_state(state))
+}
+
+async fn handle_overload(_error: BoxError) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "request concurrency limit exceeded" })),
+    )
+        .into_response()
 }
 
 async fn log_webhook_failures(request: Request, next: Next) -> Response {
@@ -863,7 +892,8 @@ mod tests {
         AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, EscalationConfig,
         EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
         GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
-        IntelligenceConfig, ReceiverConfig, RoutingConfig, ServerConfig, StorageConfig,
+        IntelligenceConfig, ReceiverConfig, RoutingConfig, ServerConfig, ServerLimitsConfig,
+        StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -894,6 +924,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn overload_handler_returns_service_unavailable() {
+        let response = handle_overload(Box::<std::io::Error>::from(std::io::Error::other(
+            "overloaded",
+        )))
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "request concurrency limit exceeded");
     }
 
     #[test]
@@ -2291,6 +2334,7 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 webhook_path: "/webhooks/signoz".to_string(),
                 max_body_bytes: 1024 * 1024,
+                limits: ServerLimitsConfig::default(),
                 auth: Some(AuthConfig {
                     bearer_token: "test-token".to_string(),
                 }),

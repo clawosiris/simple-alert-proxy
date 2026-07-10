@@ -41,6 +41,7 @@ impl AppConfig {
         if self.server.max_body_bytes == 0 {
             bail!("server.max_body_bytes must be greater than zero");
         }
+        self.server.limits.validate()?;
 
         self.storage.validate()?;
         self.delivery.validate()?;
@@ -134,8 +135,41 @@ pub struct ServerConfig {
     pub webhook_path: String,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    #[serde(default)]
+    pub limits: ServerLimitsConfig,
     pub auth: Option<AuthConfig>,
     pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerLimitsConfig {
+    #[serde(default = "default_webhook_concurrency")]
+    pub webhook_concurrency: usize,
+    #[serde(default = "default_management_concurrency")]
+    pub management_concurrency: usize,
+}
+
+impl Default for ServerLimitsConfig {
+    fn default() -> Self {
+        Self {
+            webhook_concurrency: default_webhook_concurrency(),
+            management_concurrency: default_management_concurrency(),
+        }
+    }
+}
+
+impl ServerLimitsConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.webhook_concurrency == 0 {
+            bail!("server.limits.webhook_concurrency must be greater than zero");
+        }
+
+        if self.management_concurrency == 0 {
+            bail!("server.limits.management_concurrency must be greater than zero");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -539,6 +573,14 @@ fn default_max_body_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_webhook_concurrency() -> usize {
+    64
+}
+
+fn default_management_concurrency() -> usize {
+    16
+}
+
 fn default_storage_type() -> String {
     "sqlite".to_string()
 }
@@ -665,6 +707,7 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 webhook_path: "/webhooks/signoz".to_string(),
                 max_body_bytes: 1024 * 1024,
+                limits: ServerLimitsConfig::default(),
                 auth: None,
                 tls: None,
             },
@@ -713,6 +756,38 @@ mod tests {
             error
                 .to_string()
                 .contains("integration openvas title field must not be empty")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_webhook_concurrency_limit() {
+        let limits = ServerLimitsConfig {
+            webhook_concurrency: 0,
+            ..Default::default()
+        };
+
+        let error = limits.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("server.limits.webhook_concurrency must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_management_concurrency_limit() {
+        let limits = ServerLimitsConfig {
+            management_concurrency: 0,
+            ..Default::default()
+        };
+
+        let error = limits.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("server.limits.management_concurrency must be greater than zero")
         );
     }
 }

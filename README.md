@@ -182,9 +182,18 @@ server:
   bind: "127.0.0.1:8080"
   webhook_path: "/webhooks/signoz"
   max_body_bytes: 1048576
+  limits:
+    webhook_concurrency: 64
+    management_concurrency: 16
   auth:
     bearer_token: "replace-me"
 ```
+
+`server.limits.webhook_concurrency` bounds concurrent webhook intake requests.
+`server.limits.management_concurrency` bounds concurrent API, UI, and debug
+requests. Saturated route classes return `503 Service Unavailable` with a small
+JSON error body; `/healthz` is not behind those route-class limits. Use a
+trusted reverse proxy or ingress for per-client/IP rate limiting.
 
 Generic JSON integrations use dotted paths or JSON pointers to map payload
 fields:

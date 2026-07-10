@@ -207,7 +207,19 @@ The service rejects request bodies larger than `server.max_body_bytes`.
 ```yaml
 server:
   max_body_bytes: 1048576
+  limits:
+    webhook_concurrency: 64
+    management_concurrency: 16
 ```
+
+Webhook intake routes and management/debug/UI routes have separate concurrency
+limits. When a route class is saturated, the service sheds excess requests with
+`503 Service Unavailable` and `{"error":"request concurrency limit exceeded"}`.
+`/healthz` is intentionally outside these route-class limits so health probes
+remain cheap during webhook pressure.
+
+Per-client/IP rate limiting is best enforced at a trusted reverse proxy or
+ingress until this service has explicit proxy-header trust rules.
 
 Google Chat receivers use `timeout_secs` to bound outbound delivery time.
 

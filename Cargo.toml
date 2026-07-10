@@ -19,9 +19,7 @@ serde_yaml = "0.9"
 subtle = "2.6"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time"] }
+tower = { version = "0.5", features = ["limit", "load-shed", "util"] }
 tower-http = { version = "0.7", features = ["limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
