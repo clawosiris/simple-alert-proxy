@@ -202,6 +202,7 @@ management:
   local_users: true
   bootstrap_admin_password_env: "SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD"
   session_ttl_secs: 28800
+  secure_cookies: true
   allow_unauthenticated: false
 ```
 
@@ -217,6 +218,11 @@ precedence; changing the environment variable does not overwrite it. Admins can
 rotate user passwords in the WebUI. The legacy management bearer token remains
 supported as an admin-equivalent bootstrap/emergency path and is still accepted
 as `Authorization: Bearer ...`. `/healthz` remains public.
+
+Session cookies are `HttpOnly` and `SameSite=Lax`. They use the `Secure`
+attribute automatically when native `server.tls` is configured. Set
+`management.secure_cookies: true` when TLS terminates at a trusted reverse proxy
+or ingress in front of the app.
 
 `server.limits.webhook_concurrency` bounds concurrent webhook intake requests.
 `server.limits.management_concurrency` bounds concurrent API, UI, and debug

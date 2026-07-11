@@ -16,6 +16,12 @@ pub struct Storage {
     conn: Arc<Mutex<Connection>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisableUserOutcome {
+    Disabled,
+    LastActiveAdmin,
+}
+
 impl Storage {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         if path != ":memory:"
@@ -611,7 +617,12 @@ impl Storage {
         Ok(())
     }
 
-    pub fn update_user_password(&self, user_id: i64, password_hash: &str) -> anyhow::Result<()> {
+    pub fn update_user_password(
+        &self,
+        user_id: i64,
+        password_hash: &str,
+        actor: AuditActor,
+    ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
         update_user_exists(&conn, user_id)?;
@@ -623,21 +634,25 @@ impl Storage {
             &conn,
             None,
             None,
-            &AuditActor {
-                user_id: Some(user_id),
-                ..Default::default()
-            },
+            &actor,
             "change_password",
-            Some("user password changed"),
+            Some(&format!("changed_user_id={user_id}")),
             now,
         )?;
         Ok(())
     }
 
-    pub fn disable_user(&self, user_id: i64, actor: AuditActor) -> anyhow::Result<()> {
+    pub fn disable_user(
+        &self,
+        user_id: i64,
+        actor: AuditActor,
+    ) -> anyhow::Result<DisableUserOutcome> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
         update_user_exists(&conn, user_id)?;
+        if is_active_admin(&conn, user_id)? && active_admin_count(&conn)? <= 1 {
+            return Ok(DisableUserOutcome::LastActiveAdmin);
+        }
         conn.execute(
             "UPDATE users SET status = 'disabled', updated_at = ?2 WHERE id = ?1",
             params![user_id, now],
@@ -655,7 +670,7 @@ impl Storage {
             Some(&format!("disabled_user_id={user_id}")),
             now,
         )?;
-        Ok(())
+        Ok(DisableUserOutcome::Disabled)
     }
 
     pub fn create_session(
@@ -677,6 +692,15 @@ impl Storage {
             params![token_hash, user_id, csrf_token, expires_at, now],
         )?;
         Ok(())
+    }
+
+    pub fn delete_expired_sessions(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?1",
+            params![now_epoch_millis()],
+        )?;
+        Ok(deleted)
     }
 
     pub fn session_user(&self, token_hash: &str) -> anyhow::Result<Option<SessionUserRecord>> {
@@ -827,6 +851,25 @@ impl Storage {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(actions)
+    }
+
+    #[cfg(test)]
+    pub fn audit_actor_user_ids(&self) -> anyhow::Result<Vec<Option<i64>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT actor_user_id FROM audit_entries ORDER BY id")?;
+        let actors = stmt
+            .query_map([], |row| row.get::<_, Option<i64>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(actors)
+    }
+
+    #[cfg(test)]
+    pub fn session_count(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row("SELECT COUNT(*) FROM auth_sessions", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        usize::try_from(count).context("session count overflowed usize")
     }
 
     #[cfg(test)]
@@ -1281,6 +1324,24 @@ fn update_user_exists(conn: &Connection, user_id: i64) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("user {user_id} not found")
     }
+}
+
+fn is_active_admin(conn: &Connection, user_id: i64) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active' AND global_role = 'admin')",
+        params![user_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn active_admin_count(conn: &Connection) -> anyhow::Result<usize> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE status = 'active' AND global_role = 'admin'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    usize::try_from(count).context("active admin count overflowed usize")
 }
 
 fn update_team_exists(conn: &Connection, team_id: i64) -> anyhow::Result<()> {

@@ -127,6 +127,12 @@ impl AppConfig {
         self.management.local_users
     }
 
+    pub fn management_secure_cookies(&self) -> bool {
+        self.management
+            .secure_cookies
+            .unwrap_or(self.server.tls.is_some())
+    }
+
     fn validate_management_exposure(&self) -> anyhow::Result<()> {
         if self.management_auth().is_some()
             || self.management.allow_unauthenticated
@@ -227,6 +233,8 @@ pub struct ManagementConfig {
     pub bootstrap_admin_password_env: String,
     #[serde(default = "default_session_ttl_secs")]
     pub session_ttl_secs: u64,
+    #[serde(default)]
+    pub secure_cookies: Option<bool>,
 }
 
 impl Default for ManagementConfig {
@@ -237,6 +245,7 @@ impl Default for ManagementConfig {
             local_users: default_management_local_users(),
             bootstrap_admin_password_env: default_bootstrap_admin_password_env(),
             session_ttl_secs: default_session_ttl_secs(),
+            secure_cookies: None,
         }
     }
 }
