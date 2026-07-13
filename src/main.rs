@@ -2138,6 +2138,25 @@ mod tests {
     }
 
     #[test]
+    fn password_change_revokes_existing_sessions() {
+        let storage = Storage::open(":memory:").unwrap();
+        let user = storage
+            .create_user("target", "Target", "hash", "viewer")
+            .unwrap();
+        let now = storage::now_epoch_millis();
+        storage
+            .create_session("session-hash", user.id, "csrf-token", now + 60_000)
+            .unwrap();
+
+        storage
+            .update_user_password(user.id, "new-hash", AuditActor::default())
+            .unwrap();
+
+        assert!(storage.session_user("session-hash").unwrap().is_none());
+        assert_eq!(storage.session_count().unwrap(), 0);
+    }
+
+    #[test]
     fn cannot_disable_last_active_admin() {
         let storage = Storage::open(":memory:").unwrap();
         let first = storage

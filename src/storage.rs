@@ -630,6 +630,10 @@ impl Storage {
             "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
             params![user_id, password_hash, now],
         )?;
+        conn.execute(
+            "DELETE FROM auth_sessions WHERE user_id = ?1",
+            params![user_id],
+        )?;
         insert_audit(
             &conn,
             None,
