@@ -1,4 +1,8 @@
 use anyhow::Context;
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
 use axum::{
     BoxError, Json, Router,
     body::Bytes,
@@ -7,11 +11,21 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use clap::Parser;
+use rand_core::OsRng;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    env,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex as AsyncMutex;
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
@@ -36,8 +50,13 @@ use crate::{
     integration::{GenericJsonIntegration, Integration, SigNozIntegration},
     routing::{Delivery, RouteEngine},
     signoz::SigNozAlert,
-    storage::Storage,
+    storage::{AuditActor, DisableUserOutcome, SessionUserRecord, Storage, UserRecord},
 };
+
+const SESSION_COOKIE: &str = "sap_session";
+const CSRF_HEADER: &str = "x-csrf-token";
+const LOGIN_FAILURE_LIMIT: u32 = 5;
+const LOGIN_LOCKOUT_MILLIS: i64 = 15 * 60 * 1000;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -57,6 +76,67 @@ struct AppState {
     router: Arc<RouteEngine>,
     aggregator: AlertAggregator,
     storage: Storage,
+    login_attempts: LoginAttemptLimiter,
+}
+
+#[derive(Debug, Clone)]
+struct LoginAttemptLimiter {
+    attempts: Arc<Mutex<BTreeMap<String, LoginAttemptState>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoginAttemptState {
+    failures: u32,
+    locked_until: i64,
+}
+
+impl LoginAttemptLimiter {
+    fn new() -> Self {
+        Self {
+            attempts: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn check_allowed(&self, username: &str) -> bool {
+        let now = storage::now_epoch_millis();
+        let key = login_attempt_key(username);
+        let mut attempts = self.attempts.lock().unwrap();
+        let Some(state) = attempts.get(&key) else {
+            return true;
+        };
+
+        if state.locked_until > now {
+            return false;
+        }
+
+        if state.locked_until > 0 {
+            attempts.remove(&key);
+        }
+        true
+    }
+
+    fn record_failure(&self, username: &str) {
+        let now = storage::now_epoch_millis();
+        let key = login_attempt_key(username);
+        let mut attempts = self.attempts.lock().unwrap();
+        let state = attempts.entry(key).or_insert(LoginAttemptState {
+            failures: 0,
+            locked_until: 0,
+        });
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= LOGIN_FAILURE_LIMIT {
+            state.locked_until = now + LOGIN_LOCKOUT_MILLIS;
+        }
+    }
+
+    fn record_success(&self, username: &str) {
+        let mut attempts = self.attempts.lock().unwrap();
+        attempts.remove(&login_attempt_key(username));
+    }
+}
+
+fn login_attempt_key(username: &str) -> String {
+    username.trim().to_string()
 }
 
 #[derive(Clone)]
@@ -241,10 +321,13 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     let management_concurrency = config.server.limits.management_concurrency;
     let google_chat = GoogleChatClient::new();
     let storage = Storage::open(&config.storage.path)?;
+    storage.delete_expired_sessions()?;
+    bootstrap_admin_user(&config, &storage)?;
     let state = AppState {
         router: Arc::new(RouteEngine::new(config.as_ref().clone())?),
         aggregator: AlertAggregator::new(&config, google_chat),
         storage,
+        login_attempts: LoginAttemptLimiter::new(),
         config: Arc::clone(&config),
     };
 
@@ -261,6 +344,18 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     let management = Router::new()
         .route("/", get(operator_ui))
         .route("/ui", get(operator_ui))
+        .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
+        .route("/api/me", get(current_user))
+        .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{id}/password", post(change_user_password))
+        .route("/api/users/{id}/disable", post(disable_user))
+        .route("/api/teams", get(list_teams).post(create_team))
+        .route("/api/team-memberships", get(list_team_memberships))
+        .route(
+            "/api/teams/{team_id}/members/{user_id}",
+            put(set_team_membership).delete(remove_team_membership),
+        )
         .route("/debug/webhook", post(handle_debug_webhook))
         .route("/api/alert-groups", get(list_alert_groups))
         .route("/api/alert-events", get(list_alert_events))
@@ -444,11 +539,254 @@ async fn operator_ui() -> Html<&'static str> {
     Html(ui::OPERATOR_UI)
 }
 
+#[derive(Debug, Deserialize)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateUserRequest {
+    username: String,
+    display_name: String,
+    password: String,
+    #[serde(default = "default_viewer_role")]
+    global_role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangePasswordRequest {
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTeamRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetTeamMembershipRequest {
+    #[serde(default = "default_team_viewer_role")]
+    team_role: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    user: UserRecord,
+    csrf_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MeResponse {
+    authenticated: bool,
+    auth_kind: String,
+    user: Option<UserRecord>,
+    csrf_token: Option<String>,
+    role: String,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<impl IntoResponse, WebhookError> {
+    if !state.config.management_local_users_enabled() {
+        return Err(WebhookError::Unauthorized);
+    }
+
+    if !state.login_attempts.check_allowed(&request.username) {
+        return Err(WebhookError::TooManyLoginAttempts);
+    }
+
+    let Some(user) = state.storage.authenticate_user(&request.username)? else {
+        state.login_attempts.record_failure(&request.username);
+        return Err(WebhookError::Unauthorized);
+    };
+
+    if user.status != "active" || !verify_password(&user.password_hash, &request.password) {
+        state.login_attempts.record_failure(&request.username);
+        return Err(WebhookError::Unauthorized);
+    }
+
+    state.storage.delete_expired_sessions()?;
+    let token = new_secret_token();
+    let csrf_token = new_secret_token();
+    let token_hash = token_hash(&token);
+    let expires_at = storage::now_epoch_millis()
+        + i64::try_from(state.config.management.session_ttl_secs).unwrap_or(i64::MAX / 1000) * 1000;
+    state
+        .storage
+        .create_session(&token_hash, user.id, &csrf_token, expires_at)?;
+    state.storage.update_last_login(user.id)?;
+    state.login_attempts.record_success(&request.username);
+
+    Ok((
+        [(
+            header::SET_COOKIE,
+            session_cookie(&token, expires_at, state.config.management_secure_cookies()),
+        )],
+        Json(LoginResponse {
+            user: user.public_record(),
+            csrf_token,
+        }),
+    ))
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    if let Some(principal) = authenticate_session(&state, &headers)? {
+        require_csrf(&principal, &headers)?;
+        if let Some(token) = session_token_from_headers(&headers) {
+            state.storage.delete_session(&token_hash(&token))?;
+        }
+    } else if let Some(token) = session_token_from_headers(&headers) {
+        state.storage.delete_session(&token_hash(&token))?;
+    }
+
+    Ok((
+        [(
+            header::SET_COOKIE,
+            expired_session_cookie(state.config.management_secure_cookies()),
+        )],
+        StatusCode::NO_CONTENT,
+    ))
+}
+
+async fn current_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    let principal = authenticate_management(&state, &headers)?;
+    Ok(Json(MeResponse {
+        authenticated: principal.auth_kind != "anonymous",
+        auth_kind: principal.auth_kind.to_string(),
+        user: principal.user.clone(),
+        csrf_token: principal.csrf_token.clone(),
+        role: principal.role.as_str().to_string(),
+    }))
+}
+
+async fn list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    require_management(&state, &headers, Permission::Admin)?;
+    Ok(Json(state.storage.list_users()?))
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateUserRequest>,
+) -> Result<impl IntoResponse, WebhookError> {
+    let principal = require_management(&state, &headers, Permission::Admin)?;
+    require_csrf(&principal, &headers)?;
+    validate_password(&request.password)?;
+    let password_hash = hash_password(&request.password)?;
+    let user = state.storage.create_user(
+        &request.username,
+        &request.display_name,
+        &password_hash,
+        &request.global_role,
+    )?;
+    Ok((StatusCode::CREATED, Json(user)))
+}
+
+async fn change_user_password(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    Json(request): Json<ChangePasswordRequest>,
+) -> Result<impl IntoResponse, WebhookError> {
+    let principal = require_management(&state, &headers, Permission::Admin)?;
+    require_csrf(&principal, &headers)?;
+    validate_password(&request.password)?;
+    let password_hash = hash_password(&request.password)?;
+    state
+        .storage
+        .update_user_password(id, &password_hash, principal.audit_actor())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn disable_user(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    let principal = require_management(&state, &headers, Permission::Admin)?;
+    require_csrf(&principal, &headers)?;
+    if principal.user.as_ref().is_some_and(|user| user.id == id) {
+        return Err(WebhookError::Forbidden);
+    }
+
+    match state.storage.disable_user(id, principal.audit_actor())? {
+        DisableUserOutcome::Disabled => Ok(StatusCode::NO_CONTENT),
+        DisableUserOutcome::LastActiveAdmin => Err(WebhookError::Forbidden),
+    }
+}
+
+async fn list_teams(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    require_management(&state, &headers, Permission::Read)?;
+    Ok(Json(state.storage.list_teams()?))
+}
+
+async fn create_team(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTeamRequest>,
+) -> Result<impl IntoResponse, WebhookError> {
+    let principal = require_management(&state, &headers, Permission::Admin)?;
+    require_csrf(&principal, &headers)?;
+    let team = state
+        .storage
+        .create_team(&request.name, &request.description)?;
+    Ok((StatusCode::CREATED, Json(team)))
+}
+
+async fn list_team_memberships(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    require_management(&state, &headers, Permission::Read)?;
+    Ok(Json(state.storage.list_team_memberships()?))
+}
+
+async fn set_team_membership(
+    State(state): State<AppState>,
+    Path((team_id, user_id)): Path<(i64, i64)>,
+    headers: HeaderMap,
+    Json(request): Json<SetTeamMembershipRequest>,
+) -> Result<impl IntoResponse, WebhookError> {
+    let principal = require_management(&state, &headers, Permission::Admin)?;
+    require_csrf(&principal, &headers)?;
+    let membership = state
+        .storage
+        .set_team_membership(team_id, user_id, &request.team_role)?;
+    Ok(Json(membership))
+}
+
+async fn remove_team_membership(
+    State(state): State<AppState>,
+    Path((team_id, user_id)): Path<(i64, i64)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, WebhookError> {
+    let principal = require_management(&state, &headers, Permission::Admin)?;
+    require_csrf(&principal, &headers)?;
+    state.storage.remove_team_membership(team_id, user_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_alert_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
+    require_management(&state, &headers, Permission::Read)?;
     Ok(Json(state.storage.list_alert_groups()?))
 }
 
@@ -456,7 +794,7 @@ async fn list_alert_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
+    require_management(&state, &headers, Permission::Read)?;
     Ok(Json(state.storage.list_alert_events()?))
 }
 
@@ -464,7 +802,7 @@ async fn list_deliveries(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
+    require_management(&state, &headers, Permission::Read)?;
     Ok(Json(state.storage.list_deliveries()?))
 }
 
@@ -472,7 +810,7 @@ async fn list_advisories(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
+    require_management(&state, &headers, Permission::Read)?;
     Ok(Json(state.storage.list_advisories()?))
 }
 
@@ -480,7 +818,7 @@ async fn list_integrations(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
+    require_management(&state, &headers, Permission::Read)?;
     let integrations = state
         .config
         .integrations
@@ -494,7 +832,7 @@ async fn list_routes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
+    require_management(&state, &headers, Permission::Read)?;
     let routes = state
         .config
         .routing
@@ -517,8 +855,11 @@ async fn acknowledge_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
-    state.storage.acknowledge_group(id)?;
+    let principal = require_management(&state, &headers, Permission::Operate)?;
+    require_csrf(&principal, &headers)?;
+    state
+        .storage
+        .acknowledge_group_as(id, principal.audit_actor())?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -527,8 +868,11 @@ async fn resolve_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
-    state.storage.resolve_group(id)?;
+    let principal = require_management(&state, &headers, Permission::Operate)?;
+    require_csrf(&principal, &headers)?;
+    state
+        .storage
+        .resolve_group_as(id, principal.audit_actor())?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -537,8 +881,11 @@ async fn silence_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
-    state.storage.silence_group(id)?;
+    let principal = require_management(&state, &headers, Permission::Operate)?;
+    require_csrf(&principal, &headers)?;
+    state
+        .storage
+        .silence_group_as(id, principal.audit_actor())?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -547,8 +894,11 @@ async fn replay_delivery(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
-    state.storage.replay_delivery(id)?;
+    let principal = require_management(&state, &headers, Permission::Operate)?;
+    require_csrf(&principal, &headers)?;
+    state
+        .storage
+        .replay_delivery_as(id, principal.audit_actor())?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -557,7 +907,8 @@ async fn handle_debug_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, WebhookError> {
-    authorize_management(&state.config, &headers)?;
+    let principal = require_management(&state, &headers, Permission::Operate)?;
+    require_csrf(&principal, &headers)?;
 
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
     log_debug_json(
@@ -858,6 +1209,31 @@ fn redacted_delivery_error(error: google_chat::GoogleChatError) -> String {
     }
 }
 
+fn bootstrap_admin_user(config: &AppConfig, storage: &Storage) -> anyhow::Result<()> {
+    if !config.management_local_users_enabled() || storage.user_count()? > 0 {
+        return Ok(());
+    }
+
+    let env_name = &config.management.bootstrap_admin_password_env;
+    let Ok(password) = env::var(env_name) else {
+        warn!(
+            env = %env_name,
+            "local user auth is enabled but no bootstrap admin password env var is set"
+        );
+        return Ok(());
+    };
+
+    if password.is_empty() {
+        warn!(env = %env_name, "bootstrap admin password env var is empty");
+        return Ok(());
+    }
+
+    let password_hash = hash_password(&password)?;
+    storage.create_user("admin", "Administrator", &password_hash, "admin")?;
+    info!("initialized bootstrap admin user from environment");
+    Ok(())
+}
+
 fn authorize(auth: Option<&config::AuthConfig>, headers: &HeaderMap) -> Result<(), WebhookError> {
     let Some(auth) = auth else {
         return Ok(());
@@ -866,16 +1242,252 @@ fn authorize(auth: Option<&config::AuthConfig>, headers: &HeaderMap) -> Result<(
     authorize_required(Some(auth), headers)
 }
 
-fn authorize_management(config: &AppConfig, headers: &HeaderMap) -> Result<(), WebhookError> {
-    if config.management_allows_unauthenticated() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Permission {
+    Read,
+    Operate,
+    Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagementRole {
+    Admin,
+    Operator,
+    Viewer,
+}
+
+impl ManagementRole {
+    fn from_str(value: &str) -> Self {
+        match value {
+            "admin" => Self::Admin,
+            "operator" => Self::Operator,
+            _ => Self::Viewer,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Operator => "operator",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    fn allows(self, permission: Permission) -> bool {
+        matches!(
+            (self, permission),
+            (Self::Admin, _)
+                | (Self::Operator, Permission::Read | Permission::Operate)
+                | (Self::Viewer, Permission::Read)
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ManagementPrincipal {
+    role: ManagementRole,
+    user: Option<UserRecord>,
+    csrf_token: Option<String>,
+    auth_kind: &'static str,
+}
+
+impl ManagementPrincipal {
+    fn audit_actor(&self) -> AuditActor {
+        let Some(user) = &self.user else {
+            return AuditActor::default();
+        };
+
+        AuditActor {
+            user_id: Some(user.id),
+            display_name: Some(user.display_name.clone()),
+            team_id: None,
+        }
+    }
+}
+
+fn require_management(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: Permission,
+) -> Result<ManagementPrincipal, WebhookError> {
+    let principal = authenticate_management(state, headers)?;
+    if principal.role.allows(permission) {
+        Ok(principal)
+    } else {
+        Err(WebhookError::Forbidden)
+    }
+}
+
+fn authenticate_management(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, WebhookError> {
+    if state.config.management_allows_unauthenticated() {
+        return Ok(ManagementPrincipal {
+            role: ManagementRole::Admin,
+            user: None,
+            csrf_token: None,
+            auth_kind: "anonymous",
+        });
+    }
+
+    if let Some(auth) = state.config.management_auth()
+        && has_valid_bearer(auth, headers)
+    {
+        return Ok(ManagementPrincipal {
+            role: ManagementRole::Admin,
+            user: None,
+            csrf_token: None,
+            auth_kind: "bearer",
+        });
+    }
+
+    if let Some(principal) = authenticate_session(state, headers)? {
+        return Ok(principal);
+    }
+
+    if legacy_loopback_management_open(&state.config, &state.storage)? {
+        return Ok(ManagementPrincipal {
+            role: ManagementRole::Admin,
+            user: None,
+            csrf_token: None,
+            auth_kind: "legacy-loopback",
+        });
+    }
+
+    Err(WebhookError::Unauthorized)
+}
+
+fn authenticate_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<ManagementPrincipal>, WebhookError> {
+    if state.config.management_local_users_enabled()
+        && let Some(token) = session_token_from_headers(headers)
+        && let Some(session_user) = state.storage.session_user(&token_hash(&token))?
+    {
+        return Ok(Some(principal_from_session_user(session_user)));
+    }
+
+    Ok(None)
+}
+
+fn principal_from_session_user(user: SessionUserRecord) -> ManagementPrincipal {
+    ManagementPrincipal {
+        role: ManagementRole::from_str(&user.global_role),
+        user: Some(user.public_record()),
+        csrf_token: Some(user.csrf_token),
+        auth_kind: "session",
+    }
+}
+
+fn legacy_loopback_management_open(config: &AppConfig, storage: &Storage) -> anyhow::Result<bool> {
+    if config.management_auth().is_some()
+        || config.management_local_users_enabled() && storage.user_count()? > 0
+    {
+        return Ok(false);
+    }
+
+    let bind = config
+        .server
+        .bind
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid bind address {}", config.server.bind))?;
+    Ok(bind.ip().is_loopback())
+}
+
+fn require_csrf(principal: &ManagementPrincipal, headers: &HeaderMap) -> Result<(), WebhookError> {
+    if principal.auth_kind != "session" {
         return Ok(());
     }
 
-    if let Some(auth) = config.management_auth() {
-        authorize_required(Some(auth), headers)
-    } else {
+    let Some(expected) = principal.csrf_token.as_deref() else {
+        return Err(WebhookError::Unauthorized);
+    };
+    let Some(presented) = header_string(headers, CSRF_HEADER) else {
+        return Err(WebhookError::Unauthorized);
+    };
+
+    if presented.as_bytes().ct_eq(expected.as_bytes()).into() {
         Ok(())
+    } else {
+        Err(WebhookError::Unauthorized)
     }
+}
+
+fn has_valid_bearer(auth: &config::AuthConfig, headers: &HeaderMap) -> bool {
+    authorize_required(Some(auth), headers).is_ok()
+}
+
+fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        (name == SESSION_COOKIE && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn session_cookie(token: &str, expires_at: i64, secure: bool) -> String {
+    let max_age = ((expires_at - storage::now_epoch_millis()) / 1000).max(0);
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
+}
+
+fn expired_session_cookie(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
+}
+
+fn new_secret_token() -> String {
+    uuid::Uuid::new_v4().as_simple().to_string()
+}
+
+fn token_hash(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    hex_encode(&digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hash_password(password: &str) -> anyhow::Result<String> {
+    validate_password(password)?;
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|error| anyhow::anyhow!("failed to hash password: {error}"))?
+        .to_string())
+}
+
+fn verify_password(hash: &str, password: &str) -> bool {
+    let Ok(hash) = PasswordHash::new(hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &hash)
+        .is_ok()
+}
+
+fn validate_password(password: &str) -> anyhow::Result<()> {
+    if password.len() < 12 {
+        anyhow::bail!("password must be at least 12 characters");
+    }
+    Ok(())
+}
+
+fn default_viewer_role() -> String {
+    "viewer".to_string()
+}
+
+fn default_team_viewer_role() -> String {
+    "viewer".to_string()
 }
 
 fn authorize_required(
@@ -938,6 +1550,10 @@ async fn shutdown_signal() {
 enum WebhookError {
     #[error("missing or invalid authorization")]
     Unauthorized,
+    #[error("too many failed login attempts")]
+    TooManyLoginAttempts,
+    #[error("forbidden")]
+    Forbidden,
     #[error("invalid SigNoz payload: {0}")]
     InvalidPayload(#[from] signoz::AlertParseError),
     #[error("invalid integration payload: {0}")]
@@ -958,6 +1574,8 @@ impl IntoResponse for WebhookError {
         let error = self.to_string();
         let status = match &self {
             WebhookError::Unauthorized => StatusCode::UNAUTHORIZED,
+            WebhookError::TooManyLoginAttempts => StatusCode::TOO_MANY_REQUESTS,
+            WebhookError::Forbidden => StatusCode::FORBIDDEN,
             WebhookError::InvalidPayload(_) => StatusCode::BAD_REQUEST,
             WebhookError::Integration(integration::IntegrationError::Unknown(_)) => {
                 StatusCode::NOT_FOUND
@@ -1208,6 +1826,496 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(management_token.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn local_user_login_allows_admin_api_with_csrf() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "daniel",
+                            "display_name": "Daniel",
+                            "password": "correct horse battery",
+                            "global_role": "admin"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "daniel",
+                            "password": "correct horse battery"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let session_cookie = response_cookie(&login);
+        let bytes = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let csrf = body["csrf_token"].as_str().unwrap();
+
+        let users = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users")
+                    .header(header::COOKIE, session_cookie)
+                    .header(CSRF_HEADER, csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logout_requires_csrf_for_session_auth() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "logout-user",
+                            "display_name": "Logout User",
+                            "password": "correct horse battery",
+                            "global_role": "admin"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "logout-user",
+                            "password": "correct horse battery"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let session_cookie = response_cookie(&login);
+        let bytes = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let csrf = body["csrf_token"].as_str().unwrap();
+
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::UNAUTHORIZED);
+
+        let users = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .header(CSRF_HEADER, csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users.status(), StatusCode::OK);
+
+        let logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .header(header::COOKIE, session_cookie)
+                    .header(CSRF_HEADER, csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn login_attempt_key_preserves_username_case() {
+        assert_eq!(login_attempt_key(" Daniel "), "Daniel");
+        assert_ne!(login_attempt_key("daniel"), login_attempt_key("Daniel"));
+    }
+
+    #[tokio::test]
+    async fn login_rate_limiter_locks_after_repeated_failures() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "limited",
+                            "display_name": "Limited",
+                            "password": "correct horse battery",
+                            "global_role": "admin"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        for _ in 0..LOGIN_FAILURE_LIMIT {
+            assert_eq!(
+                login_status(app.clone(), "limited", "wrong horse battery").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        assert_eq!(
+            login_status(app, "limited", "correct horse battery").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_session_cannot_disable_itself() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "selfdisable",
+                            "display_name": "Self Disable",
+                            "password": "correct horse battery",
+                            "global_role": "admin"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let bytes = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let user_id = body["id"].as_i64().unwrap();
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "selfdisable",
+                            "password": "correct horse battery"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let session_cookie = response_cookie(&login);
+        let bytes = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let csrf = body["csrf_token"].as_str().unwrap();
+
+        let disable = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/users/{user_id}/disable"))
+                    .header(header::COOKIE, session_cookie)
+                    .header(CSRF_HEADER, csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(disable.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn viewer_session_cannot_mutate_lifecycle_actions() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "viewer",
+                            "display_name": "Viewer",
+                            "password": "correct horse battery",
+                            "global_role": "viewer"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "viewer",
+                            "password": "correct horse battery"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let session_cookie = response_cookie(&login);
+        let bytes = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let csrf = body["csrf_token"].as_str().unwrap();
+
+        let mutate = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alert-groups/1/ack")
+                    .header(header::COOKIE, session_cookie)
+                    .header(CSRF_HEADER, csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutate.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_admin_password_env_does_not_override_database_password() {
+        let env_name = format!("SAP_TEST_BOOTSTRAP_{}", uuid::Uuid::new_v4().as_simple());
+        let db_path = std::env::temp_dir().join(format!(
+            "simple-alert-proxy-{}.db",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        let mut config = test_config("http://127.0.0.1:1");
+        config.storage.path = db_path.to_string_lossy().to_string();
+        config.management.auth = None;
+        config.management.bootstrap_admin_password_env = env_name.clone();
+
+        unsafe {
+            env::set_var(&env_name, "initial bootstrap password");
+        }
+        let first = build_app(Arc::new(config.clone()), "/webhooks/signoz".to_string()).unwrap();
+        assert_eq!(
+            login_status(first, "admin", "initial bootstrap password").await,
+            StatusCode::OK
+        );
+
+        unsafe {
+            env::set_var(&env_name, "changed bootstrap password");
+        }
+        let second = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        assert_eq!(
+            login_status(second.clone(), "admin", "initial bootstrap password").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            login_status(second, "admin", "changed bootstrap password").await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        unsafe {
+            env::remove_var(&env_name);
+        }
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn session_cookie_uses_secure_attribute_when_enabled() {
+        let expires_at = storage::now_epoch_millis() + 60_000;
+
+        assert!(session_cookie("token", expires_at, true).contains("; Secure"));
+        assert!(expired_session_cookie(true).contains("; Secure"));
+        assert!(!session_cookie("token", expires_at, false).contains("; Secure"));
+        assert!(!expired_session_cookie(false).contains("; Secure"));
+    }
+
+    #[test]
+    fn password_change_audit_records_acting_admin() {
+        let storage = Storage::open(":memory:").unwrap();
+        let admin = storage
+            .create_user("admin", "Administrator", "hash", "admin")
+            .unwrap();
+        let user = storage
+            .create_user("target", "Target", "hash", "viewer")
+            .unwrap();
+
+        storage
+            .update_user_password(
+                user.id,
+                "new-hash",
+                AuditActor {
+                    user_id: Some(admin.id),
+                    display_name: Some(admin.display_name),
+                    team_id: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(storage.audit_actions().unwrap(), vec!["change_password"]);
+        assert_eq!(
+            storage.audit_actor_user_ids().unwrap(),
+            vec![Some(admin.id)]
+        );
+    }
+
+    #[test]
+    fn password_change_revokes_existing_sessions() {
+        let storage = Storage::open(":memory:").unwrap();
+        let user = storage
+            .create_user("target", "Target", "hash", "viewer")
+            .unwrap();
+        let now = storage::now_epoch_millis();
+        storage
+            .create_session("session-hash", user.id, "csrf-token", now + 60_000)
+            .unwrap();
+
+        storage
+            .update_user_password(user.id, "new-hash", AuditActor::default())
+            .unwrap();
+
+        assert!(storage.session_user("session-hash").unwrap().is_none());
+        assert_eq!(storage.session_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn cannot_disable_last_active_admin() {
+        let storage = Storage::open(":memory:").unwrap();
+        let first = storage
+            .create_user("first", "First", "hash", "admin")
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .disable_user(first.id, AuditActor::default())
+                .unwrap(),
+            DisableUserOutcome::LastActiveAdmin
+        );
+
+        storage
+            .create_user("second", "Second", "hash", "admin")
+            .unwrap();
+        assert_eq!(
+            storage
+                .disable_user(first.id, AuditActor::default())
+                .unwrap(),
+            DisableUserOutcome::Disabled
+        );
+    }
+
+    #[test]
+    fn expired_sessions_can_be_swept_without_token_lookup() {
+        let storage = Storage::open(":memory:").unwrap();
+        let user = storage
+            .create_user("session-user", "Session User", "hash", "admin")
+            .unwrap();
+        let now = storage::now_epoch_millis();
+        storage
+            .create_session("expired", user.id, "csrf-expired", now - 1)
+            .unwrap();
+        storage
+            .create_session("active", user.id, "csrf-active", now + 60_000)
+            .unwrap();
+
+        assert_eq!(storage.session_count().unwrap(), 2);
+        assert_eq!(storage.delete_expired_sessions().unwrap(), 1);
+        assert_eq!(storage.session_count().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -2662,6 +3770,39 @@ mod tests {
 
     fn fixture_payload() -> Value {
         serde_json::from_str(include_str!("../examples/signoz-webhook.json")).unwrap()
+    }
+
+    fn response_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("response should set cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn login_status(app: Router, username: &str, password: &str) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "username": username,
+                        "password": password
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
     }
 
     fn test_config(webhook_url: &str) -> AppConfig {

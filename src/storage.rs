@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::{alert::AlertEvent, routing::Delivery};
@@ -14,6 +14,12 @@ use crate::{alert::AlertEvent, routing::Delivery};
 #[derive(Debug, Clone)]
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisableUserOutcome {
+    Disabled,
+    LastActiveAdmin,
 }
 
 impl Storage {
@@ -124,9 +130,52 @@ impl Storage {
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
             );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                global_role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_login_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS teams (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS team_memberships (
+                user_id INTEGER NOT NULL,
+                team_id INTEGER NOT NULL,
+                team_role TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, team_id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(team_id) REFERENCES teams(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                csrf_token TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
             "#,
         )?;
         add_column_if_missing(&conn, "alert_events", "alert_group_id INTEGER")?;
+        add_column_if_missing(&conn, "audit_entries", "actor_user_id INTEGER")?;
+        add_column_if_missing(&conn, "audit_entries", "actor_display_name TEXT")?;
+        add_column_if_missing(&conn, "audit_entries", "actor_team_id INTEGER")?;
         Ok(())
     }
 
@@ -341,7 +390,16 @@ impl Storage {
         Ok(records)
     }
 
+    #[cfg(test)]
     pub fn acknowledge_group(&self, alert_group_id: i64) -> anyhow::Result<()> {
+        self.acknowledge_group_as(alert_group_id, AuditActor::default())
+    }
+
+    pub fn acknowledge_group_as(
+        &self,
+        alert_group_id: i64,
+        actor: AuditActor,
+    ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
         update_group_exists(&conn, alert_group_id)?;
@@ -350,11 +408,24 @@ impl Storage {
             params![alert_group_id, now],
         )?;
         cancel_escalations(&conn, alert_group_id, now)?;
-        insert_audit(&conn, Some(alert_group_id), None, "acknowledge", None, now)?;
+        insert_audit(
+            &conn,
+            Some(alert_group_id),
+            None,
+            &actor,
+            "acknowledge",
+            None,
+            now,
+        )?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn resolve_group(&self, alert_group_id: i64) -> anyhow::Result<()> {
+        self.resolve_group_as(alert_group_id, AuditActor::default())
+    }
+
+    pub fn resolve_group_as(&self, alert_group_id: i64, actor: AuditActor) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
         update_group_exists(&conn, alert_group_id)?;
@@ -363,11 +434,24 @@ impl Storage {
             params![alert_group_id, now],
         )?;
         cancel_escalations(&conn, alert_group_id, now)?;
-        insert_audit(&conn, Some(alert_group_id), None, "resolve", None, now)?;
+        insert_audit(
+            &conn,
+            Some(alert_group_id),
+            None,
+            &actor,
+            "resolve",
+            None,
+            now,
+        )?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn silence_group(&self, alert_group_id: i64) -> anyhow::Result<()> {
+        self.silence_group_as(alert_group_id, AuditActor::default())
+    }
+
+    pub fn silence_group_as(&self, alert_group_id: i64, actor: AuditActor) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let silenced_until = now + 60 * 60 * 1000;
         let conn = self.conn.lock().unwrap();
@@ -380,6 +464,7 @@ impl Storage {
             &conn,
             Some(alert_group_id),
             None,
+            &actor,
             "silence",
             Some("duration_millis=3600000"),
             now,
@@ -387,7 +472,12 @@ impl Storage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn replay_delivery(&self, delivery_id: i64) -> anyhow::Result<()> {
+        self.replay_delivery_as(delivery_id, AuditActor::default())
+    }
+
+    pub fn replay_delivery_as(&self, delivery_id: i64, actor: AuditActor) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
         update_delivery_exists(&conn, delivery_id)?;
@@ -402,7 +492,7 @@ impl Storage {
             "#,
             params![delivery_id, now],
         )?;
-        insert_audit(&conn, None, Some(delivery_id), "replay", None, now)?;
+        insert_audit(&conn, None, Some(delivery_id), &actor, "replay", None, now)?;
         Ok(())
     }
 
@@ -444,6 +534,319 @@ impl Storage {
         Ok(records)
     }
 
+    pub fn user_count(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?;
+        usize::try_from(count).context("user count overflowed usize")
+    }
+
+    pub fn create_user(
+        &self,
+        username: &str,
+        display_name: &str,
+        password_hash: &str,
+        global_role: &str,
+    ) -> anyhow::Result<UserRecord> {
+        let username = username.trim();
+        let display_name = display_name.trim();
+        if username.is_empty() {
+            anyhow::bail!("username must not be empty");
+        }
+        if display_name.is_empty() {
+            anyhow::bail!("display_name must not be empty");
+        }
+        validate_global_role(global_role)?;
+
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO users (
+                username, display_name, password_hash, global_role, status,
+                created_at, updated_at, last_login_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, NULL)
+            "#,
+            params![username, display_name, password_hash, global_role, now],
+        )?;
+        user_by_id(&conn, conn.last_insert_rowid())
+    }
+
+    pub fn list_users(&self) -> anyhow::Result<Vec<UserRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, username, display_name, global_role, status,
+                   created_at, updated_at, last_login_at
+            FROM users
+            ORDER BY username
+            "#,
+        )?;
+        let records = stmt
+            .query_map([], user_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn authenticate_user(
+        &self,
+        username: &str,
+    ) -> anyhow::Result<Option<UserCredentialRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            r#"
+            SELECT id, username, display_name, password_hash, global_role, status,
+                   created_at, updated_at, last_login_at
+            FROM users
+            WHERE username = ?1
+            "#,
+            params![username.trim()],
+            user_credential_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn update_last_login(&self, user_id: i64) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE users SET last_login_at = ?2, updated_at = ?2 WHERE id = ?1",
+            params![user_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_user_password(
+        &self,
+        user_id: i64,
+        password_hash: &str,
+        actor: AuditActor,
+    ) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        update_user_exists(&conn, user_id)?;
+        conn.execute(
+            "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
+            params![user_id, password_hash, now],
+        )?;
+        conn.execute(
+            "DELETE FROM auth_sessions WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        insert_audit(
+            &conn,
+            None,
+            None,
+            &actor,
+            "change_password",
+            Some(&format!("changed_user_id={user_id}")),
+            now,
+        )?;
+        Ok(())
+    }
+
+    pub fn disable_user(
+        &self,
+        user_id: i64,
+        actor: AuditActor,
+    ) -> anyhow::Result<DisableUserOutcome> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        update_user_exists(&conn, user_id)?;
+        if is_active_admin(&conn, user_id)? && active_admin_count(&conn)? <= 1 {
+            return Ok(DisableUserOutcome::LastActiveAdmin);
+        }
+        conn.execute(
+            "UPDATE users SET status = 'disabled', updated_at = ?2 WHERE id = ?1",
+            params![user_id, now],
+        )?;
+        conn.execute(
+            "DELETE FROM auth_sessions WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        insert_audit(
+            &conn,
+            None,
+            None,
+            &actor,
+            "disable_user",
+            Some(&format!("disabled_user_id={user_id}")),
+            now,
+        )?;
+        Ok(DisableUserOutcome::Disabled)
+    }
+
+    pub fn create_session(
+        &self,
+        token_hash: &str,
+        user_id: i64,
+        csrf_token: &str,
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO auth_sessions (
+                token_hash, user_id, csrf_token, expires_at, created_at, last_seen_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            "#,
+            params![token_hash, user_id, csrf_token, expires_at, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_expired_sessions(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?1",
+            params![now_epoch_millis()],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn session_user(&self, token_hash: &str) -> anyhow::Result<Option<SessionUserRecord>> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        let record = conn
+            .query_row(
+                r#"
+                SELECT users.id, users.username, users.display_name, users.global_role,
+                       users.status, auth_sessions.csrf_token, auth_sessions.expires_at
+                FROM auth_sessions
+                JOIN users ON users.id = auth_sessions.user_id
+                WHERE auth_sessions.token_hash = ?1
+                "#,
+                params![token_hash],
+                session_user_from_row,
+            )
+            .optional()?;
+
+        let Some(record) = record else {
+            return Ok(None);
+        };
+
+        if record.expires_at <= now || record.status != "active" {
+            conn.execute(
+                "DELETE FROM auth_sessions WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+            return Ok(None);
+        }
+
+        conn.execute(
+            "UPDATE auth_sessions SET last_seen_at = ?2 WHERE token_hash = ?1",
+            params![token_hash, now],
+        )?;
+        Ok(Some(record))
+    }
+
+    pub fn delete_session(&self, token_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM auth_sessions WHERE token_hash = ?1",
+            params![token_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_team(&self, name: &str, description: &str) -> anyhow::Result<TeamRecord> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("team name must not be empty");
+        }
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO teams (name, description, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?3)
+            "#,
+            params![name, description.trim(), now],
+        )?;
+        team_by_id(&conn, conn.last_insert_rowid())
+    }
+
+    pub fn list_teams(&self) -> anyhow::Result<Vec<TeamRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, description, created_at, updated_at
+            FROM teams
+            ORDER BY name
+            "#,
+        )?;
+        let records = stmt
+            .query_map([], team_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn list_team_memberships(&self) -> anyhow::Result<Vec<TeamMembershipRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT team_memberships.user_id, users.username,
+                   team_memberships.team_id, teams.name,
+                   team_memberships.team_role, team_memberships.created_at
+            FROM team_memberships
+            JOIN users ON users.id = team_memberships.user_id
+            JOIN teams ON teams.id = team_memberships.team_id
+            ORDER BY teams.name, users.username
+            "#,
+        )?;
+        let records = stmt
+            .query_map([], team_membership_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn set_team_membership(
+        &self,
+        team_id: i64,
+        user_id: i64,
+        team_role: &str,
+    ) -> anyhow::Result<TeamMembershipRecord> {
+        validate_team_role(team_role)?;
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        update_team_exists(&conn, team_id)?;
+        update_user_exists(&conn, user_id)?;
+        conn.execute(
+            r#"
+            INSERT INTO team_memberships (user_id, team_id, team_role, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(user_id, team_id) DO UPDATE SET team_role = excluded.team_role
+            "#,
+            params![user_id, team_id, team_role, now],
+        )?;
+        conn.query_row(
+            r#"
+            SELECT team_memberships.user_id, users.username,
+                   team_memberships.team_id, teams.name,
+                   team_memberships.team_role, team_memberships.created_at
+            FROM team_memberships
+            JOIN users ON users.id = team_memberships.user_id
+            JOIN teams ON teams.id = team_memberships.team_id
+            WHERE team_memberships.user_id = ?1 AND team_memberships.team_id = ?2
+            "#,
+            params![user_id, team_id],
+            team_membership_from_row,
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn remove_team_membership(&self, team_id: i64, user_id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM team_memberships WHERE user_id = ?1 AND team_id = ?2",
+            params![user_id, team_id],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn audit_actions(&self) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
@@ -452,6 +855,25 @@ impl Storage {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(actions)
+    }
+
+    #[cfg(test)]
+    pub fn audit_actor_user_ids(&self) -> anyhow::Result<Vec<Option<i64>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT actor_user_id FROM audit_entries ORDER BY id")?;
+        let actors = stmt
+            .query_map([], |row| row.get::<_, Option<i64>>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(actors)
+    }
+
+    #[cfg(test)]
+    pub fn session_count(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row("SELECT COUNT(*) FROM auth_sessions", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        usize::try_from(count).context("session count overflowed usize")
     }
 
     #[cfg(test)]
@@ -556,6 +978,98 @@ pub struct AdvisoryRecord {
     pub kind: String,
     pub value: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserRecord {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub global_role: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_login_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserCredentialRecord {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub password_hash: String,
+    pub global_role: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_login_at: Option<i64>,
+}
+
+impl UserCredentialRecord {
+    pub fn public_record(&self) -> UserRecord {
+        UserRecord {
+            id: self.id,
+            username: self.username.clone(),
+            display_name: self.display_name.clone(),
+            global_role: self.global_role.clone(),
+            status: self.status.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            last_login_at: self.last_login_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionUserRecord {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub global_role: String,
+    pub status: String,
+    pub csrf_token: String,
+    pub expires_at: i64,
+}
+
+impl SessionUserRecord {
+    pub fn public_record(&self) -> UserRecord {
+        UserRecord {
+            id: self.id,
+            username: self.username.clone(),
+            display_name: self.display_name.clone(),
+            global_role: self.global_role.clone(),
+            status: self.status.clone(),
+            created_at: 0,
+            updated_at: 0,
+            last_login_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamRecord {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TeamMembershipRecord {
+    pub user_id: i64,
+    pub username: String,
+    pub team_id: i64,
+    pub team_name: String,
+    pub team_role: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuditActor {
+    pub user_id: Option<i64>,
+    pub display_name: Option<String>,
+    pub team_id: Option<i64>,
 }
 
 fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow::Result<i64> {
@@ -692,6 +1206,93 @@ fn advisory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdvisoryRecord
     })
 }
 
+fn user_by_id(conn: &Connection, user_id: i64) -> anyhow::Result<UserRecord> {
+    conn.query_row(
+        r#"
+        SELECT id, username, display_name, global_role, status,
+               created_at, updated_at, last_login_at
+        FROM users
+        WHERE id = ?1
+        "#,
+        params![user_id],
+        user_from_row,
+    )
+    .map_err(Into::into)
+}
+
+fn user_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {
+    Ok(UserRecord {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        global_role: row.get(3)?,
+        status: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        last_login_at: row.get(7)?,
+    })
+}
+
+fn user_credential_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserCredentialRecord> {
+    Ok(UserCredentialRecord {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        password_hash: row.get(3)?,
+        global_role: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        last_login_at: row.get(8)?,
+    })
+}
+
+fn session_user_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionUserRecord> {
+    Ok(SessionUserRecord {
+        id: row.get(0)?,
+        username: row.get(1)?,
+        display_name: row.get(2)?,
+        global_role: row.get(3)?,
+        status: row.get(4)?,
+        csrf_token: row.get(5)?,
+        expires_at: row.get(6)?,
+    })
+}
+
+fn team_by_id(conn: &Connection, team_id: i64) -> anyhow::Result<TeamRecord> {
+    conn.query_row(
+        r#"
+        SELECT id, name, description, created_at, updated_at
+        FROM teams
+        WHERE id = ?1
+        "#,
+        params![team_id],
+        team_from_row,
+    )
+    .map_err(Into::into)
+}
+
+fn team_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamRecord> {
+    Ok(TeamRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn team_membership_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMembershipRecord> {
+    Ok(TeamMembershipRecord {
+        user_id: row.get(0)?,
+        username: row.get(1)?,
+        team_id: row.get(2)?,
+        team_name: row.get(3)?,
+        team_role: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
 fn add_column_if_missing(conn: &Connection, table: &str, column_sql: &str) -> anyhow::Result<()> {
     let column_name = column_sql.split_whitespace().next().unwrap_or_default();
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -734,10 +1335,69 @@ fn update_delivery_exists(conn: &Connection, delivery_id: i64) -> anyhow::Result
     }
 }
 
+fn update_user_exists(conn: &Connection, user_id: i64) -> anyhow::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1)",
+        params![user_id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        anyhow::bail!("user {user_id} not found")
+    }
+}
+
+fn is_active_admin(conn: &Connection, user_id: i64) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND status = 'active' AND global_role = 'admin')",
+        params![user_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn active_admin_count(conn: &Connection) -> anyhow::Result<usize> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE status = 'active' AND global_role = 'admin'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    usize::try_from(count).context("active admin count overflowed usize")
+}
+
+fn update_team_exists(conn: &Connection, team_id: i64) -> anyhow::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM teams WHERE id = ?1)",
+        params![team_id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        anyhow::bail!("team {team_id} not found")
+    }
+}
+
+fn validate_global_role(role: &str) -> anyhow::Result<()> {
+    match role {
+        "admin" | "operator" | "viewer" => Ok(()),
+        _ => anyhow::bail!("global_role must be admin, operator, or viewer"),
+    }
+}
+
+fn validate_team_role(role: &str) -> anyhow::Result<()> {
+    match role {
+        "owner" | "operator" | "viewer" => Ok(()),
+        _ => anyhow::bail!("team_role must be owner, operator, or viewer"),
+    }
+}
+
 fn insert_audit(
     conn: &Connection,
     alert_group_id: Option<i64>,
     delivery_record_id: Option<i64>,
+    actor: &AuditActor,
     action: &str,
     detail: Option<&str>,
     now: i64,
@@ -745,11 +1405,21 @@ fn insert_audit(
     conn.execute(
         r#"
         INSERT INTO audit_entries (
-            alert_group_id, delivery_record_id, action, detail, created_at
+            alert_group_id, delivery_record_id, actor_user_id, actor_display_name,
+            actor_team_id, action, detail, created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         "#,
-        params![alert_group_id, delivery_record_id, action, detail, now],
+        params![
+            alert_group_id,
+            delivery_record_id,
+            actor.user_id,
+            actor.display_name.as_deref(),
+            actor.team_id,
+            action,
+            detail,
+            now
+        ],
     )?;
     Ok(())
 }
