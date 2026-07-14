@@ -136,7 +136,7 @@ impl LoginAttemptLimiter {
 }
 
 fn login_attempt_key(username: &str) -> String {
-    username.trim().to_ascii_lowercase()
+    username.trim().to_string()
 }
 
 #[derive(Clone)]
@@ -637,7 +637,12 @@ async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    if let Some(token) = session_token_from_headers(&headers) {
+    if let Some(principal) = authenticate_session(&state, &headers)? {
+        require_csrf(&principal, &headers)?;
+        if let Some(token) = session_token_from_headers(&headers) {
+            state.storage.delete_session(&token_hash(&token))?;
+        }
+    } else if let Some(token) = session_token_from_headers(&headers) {
         state.storage.delete_session(&token_hash(&token))?;
     }
 
@@ -1337,11 +1342,8 @@ fn authenticate_management(
         });
     }
 
-    if state.config.management_local_users_enabled()
-        && let Some(token) = session_token_from_headers(headers)
-        && let Some(session_user) = state.storage.session_user(&token_hash(&token))?
-    {
-        return Ok(principal_from_session_user(session_user));
+    if let Some(principal) = authenticate_session(state, headers)? {
+        return Ok(principal);
     }
 
     if legacy_loopback_management_open(&state.config, &state.storage)? {
@@ -1354,6 +1356,20 @@ fn authenticate_management(
     }
 
     Err(WebhookError::Unauthorized)
+}
+
+fn authenticate_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<ManagementPrincipal>, WebhookError> {
+    if state.config.management_local_users_enabled()
+        && let Some(token) = session_token_from_headers(headers)
+        && let Some(session_user) = state.storage.session_user(&token_hash(&token))?
+    {
+        return Ok(Some(principal_from_session_user(session_user)));
+    }
+
+    Ok(None)
 }
 
 fn principal_from_session_user(user: SessionUserRecord) -> ManagementPrincipal {
@@ -1877,6 +1893,108 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(users.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn logout_requires_csrf_for_session_auth() {
+        let config = test_config("http://127.0.0.1:1");
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "logout-user",
+                            "display_name": "Logout User",
+                            "password": "correct horse battery",
+                            "global_role": "admin"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "logout-user",
+                            "password": "correct horse battery"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let session_cookie = response_cookie(&login);
+        let bytes = to_bytes(login.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let csrf = body["csrf_token"].as_str().unwrap();
+
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_csrf.status(), StatusCode::UNAUTHORIZED);
+
+        let users = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/users")
+                    .header(header::COOKIE, session_cookie.clone())
+                    .header(CSRF_HEADER, csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(users.status(), StatusCode::OK);
+
+        let logout = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .header(header::COOKIE, session_cookie)
+                    .header(CSRF_HEADER, csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn login_attempt_key_preserves_username_case() {
+        assert_eq!(login_attempt_key(" Daniel "), "Daniel");
+        assert_ne!(login_attempt_key("daniel"), login_attempt_key("Daniel"));
     }
 
     #[tokio::test]
