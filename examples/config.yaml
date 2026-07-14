@@ -14,6 +14,11 @@ server:
 management:
   auth:
     bearer_token: "replace-me"
+  local_users: true
+  bootstrap_admin_password_env: "SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD"
+  session_ttl_secs: 28800
+  # Set true when TLS terminates at a trusted reverse proxy in front of the app.
+  secure_cookies: true
   allow_unauthenticated: false
 
 debug:
