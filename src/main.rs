@@ -1532,6 +1532,43 @@ mod tests {
     }
 
     #[test]
+    fn active_alert_group_preserves_ack_and_silence_state_on_duplicate_event() {
+        let storage = Storage::open(":memory:").unwrap();
+        let first_event = AlertEvent::new(
+            "test",
+            "test",
+            "firing",
+            "critical",
+            "Continuation Test",
+            "continuation-test",
+            serde_json::json!({}),
+        );
+        storage.store_event(&first_event).unwrap();
+        let group_id = storage.list_alert_groups().unwrap()[0].id;
+
+        storage.acknowledge_group(group_id).unwrap();
+        storage.silence_group(group_id).unwrap();
+
+        let second_event = AlertEvent::new(
+            "test",
+            "test",
+            "firing",
+            "critical",
+            "Continuation Test",
+            "continuation-test",
+            serde_json::json!({}),
+        );
+        storage.store_event(&second_event).unwrap();
+
+        let groups = storage.list_alert_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, "active");
+        assert_eq!(groups[0].event_count, 2);
+        assert!(groups[0].acknowledged_at.is_some());
+        assert!(groups[0].silenced_until.is_some());
+    }
+
+    #[test]
     fn reactivated_alert_group_clears_stale_ack_and_silence_state() {
         let storage = Storage::open(":memory:").unwrap();
         let first_event = AlertEvent::new(
