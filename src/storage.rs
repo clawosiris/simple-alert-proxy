@@ -1075,9 +1075,9 @@ pub struct AuditActor {
 fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow::Result<i64> {
     let existing = conn
         .query_row(
-            "SELECT id FROM alert_groups WHERE fingerprint = ?1",
+            "SELECT id, status FROM alert_groups WHERE fingerprint = ?1",
             params![event.fingerprint],
-            |row| row.get::<_, i64>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .ok();
 
@@ -1087,20 +1087,38 @@ fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow
         "active"
     };
 
-    if let Some(id) = existing {
-        conn.execute(
-            r#"
-            UPDATE alert_groups
-            SET status = ?2,
-                severity = ?3,
-                title = ?4,
-                event_count = event_count + 1,
-                last_event_at = ?5,
-                updated_at = ?5
-            WHERE id = ?1
-            "#,
-            params![id, group_status, event.severity, event.title, now],
-        )?;
+    if let Some((id, existing_status)) = existing {
+        if existing_status == "resolved" && group_status == "active" {
+            conn.execute(
+                r#"
+                UPDATE alert_groups
+                SET status = ?2,
+                    severity = ?3,
+                    title = ?4,
+                    event_count = event_count + 1,
+                    acknowledged_at = NULL,
+                    silenced_until = NULL,
+                    last_event_at = ?5,
+                    updated_at = ?5
+                WHERE id = ?1
+                "#,
+                params![id, group_status, event.severity, event.title, now],
+            )?;
+        } else {
+            conn.execute(
+                r#"
+                UPDATE alert_groups
+                SET status = ?2,
+                    severity = ?3,
+                    title = ?4,
+                    event_count = event_count + 1,
+                    last_event_at = ?5,
+                    updated_at = ?5
+                WHERE id = ?1
+                "#,
+                params![id, group_status, event.severity, event.title, now],
+            )?;
+        }
         return Ok(id);
     }
 
