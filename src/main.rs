@@ -946,18 +946,27 @@ async fn handle_signoz_webhook(
     for alert in &alerts {
         let event = alert.to_alert_event("signoz");
         let plan = state.router.plan(&event);
+        let mut alert_event_id = None;
 
         for delivery in &plan.deliveries {
             let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
                 error!(receiver = %delivery.receiver, "route selected missing receiver");
                 continue;
             };
+            let event_id = match alert_event_id {
+                Some(event_id) => event_id,
+                None => {
+                    let event_id = state.storage.store_event(&event)?;
+                    alert_event_id = Some(event_id);
+                    event_id
+                }
+            };
 
             match receiver {
                 config::ReceiverConfig::GoogleChat(receiver) => {
                     queue_signoz_google_chat_delivery(
                         &state,
-                        &event,
+                        event_id,
                         receiver,
                         alert.clone(),
                         delivery.clone(),
@@ -965,7 +974,13 @@ async fn handle_signoz_webhook(
                     delivered_receivers.push(delivery.receiver.clone());
                 }
                 receiver => {
-                    queue_target_event_delivery(&state, &event, receiver, delivery.clone())?;
+                    queue_target_event_delivery(
+                        &state,
+                        &event,
+                        event_id,
+                        receiver,
+                        delivery.clone(),
+                    )?;
                     delivered_receivers.push(delivery.receiver.clone());
                 }
             }
@@ -1013,14 +1028,23 @@ async fn handle_generic_webhook(
 
     for event in &events {
         let plan = state.router.plan(event);
+        let mut alert_event_id = None;
 
         for delivery in &plan.deliveries {
             let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
                 error!(receiver = %delivery.receiver, "route selected missing receiver");
                 continue;
             };
+            let event_id = match alert_event_id {
+                Some(event_id) => event_id,
+                None => {
+                    let event_id = state.storage.store_event(event)?;
+                    alert_event_id = Some(event_id);
+                    event_id
+                }
+            };
 
-            queue_target_event_delivery(&state, event, receiver, delivery.clone())?;
+            queue_target_event_delivery(&state, event, event_id, receiver, delivery.clone())?;
             delivered_receivers.push(delivery.receiver.clone());
         }
     }
@@ -1040,12 +1064,11 @@ async fn handle_generic_webhook(
 
 fn queue_signoz_google_chat_delivery(
     state: &AppState,
-    event: &AlertEvent,
+    alert_event_id: i64,
     receiver: &GoogleChatReceiverConfig,
     alert: SigNozAlert,
     delivery: Delivery,
 ) -> Result<(), WebhookError> {
-    let alert_event_id = state.storage.store_event(event)?;
     let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
     queue_escalation_if_configured(state, alert_event_id, &delivery)?;
     let worker = DeliveryWorker::new(
@@ -1079,10 +1102,10 @@ fn queue_signoz_google_chat_delivery(
 fn queue_target_event_delivery(
     state: &AppState,
     event: &AlertEvent,
+    alert_event_id: i64,
     receiver: &ReceiverConfig,
     delivery: Delivery,
 ) -> Result<(), WebhookError> {
-    let alert_event_id = state.storage.store_event(event)?;
     let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
     queue_escalation_if_configured(state, alert_event_id, &delivery)?;
     let worker = DeliveryWorker::new(
@@ -3076,6 +3099,125 @@ mod tests {
         assert!(deliveries.as_array().unwrap().iter().all(|record| {
             record["status"] == "succeeded" && record["attempt_count"].as_u64() == Some(1)
         }));
+    }
+
+    #[tokio::test]
+    async fn end_to_end_continue_matching_delivers_one_event_to_multiple_receivers() {
+        let primary_received = Arc::new(Mutex::new(Vec::new()));
+        let secondary_received = Arc::new(Mutex::new(Vec::new()));
+        let primary_url = spawn_mock_google_chat(Arc::clone(&primary_received)).await;
+        let secondary_url = spawn_mock_google_chat(Arc::clone(&secondary_received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.integrations = synthetic_test_integrations();
+        config.routing.default_receiver = None;
+        config.routing.routes = vec![
+            config::RouteConfig {
+                name: "primary-critical".to_string(),
+                receiver: "primary-target".to_string(),
+                escalation_policy: None,
+                continue_matching: true,
+                matchers: vec![config::MatcherConfig {
+                    field: "severity".to_string(),
+                    equals: Some("critical".to_string()),
+                    regex: None,
+                    contains: None,
+                }],
+            },
+            config::RouteConfig {
+                name: "checkout-service".to_string(),
+                receiver: "secondary-target".to_string(),
+                escalation_policy: None,
+                continue_matching: false,
+                matchers: vec![config::MatcherConfig {
+                    field: "label.service".to_string(),
+                    equals: Some("checkout".to_string()),
+                    regex: None,
+                    contains: None,
+                }],
+            },
+        ];
+        config.receivers = BTreeMap::from([
+            (
+                "primary-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: primary_url,
+                    timeout_secs: 10,
+                }),
+            ),
+            (
+                "secondary-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: secondary_url,
+                    timeout_secs: 10,
+                }),
+            ),
+        ]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        let mut generator = SyntheticWebhookGenerator::new();
+
+        let response = app
+            .clone()
+            .oneshot(synthetic_request(generator.alert(
+                "svc-cpu",
+                "firing",
+                "critical",
+                "checkout",
+                "CPU saturated",
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&primary_received, 1).await;
+        wait_for_received_count(&secondary_received, 1).await;
+        wait_for_succeeded_deliveries(app.clone(), 2).await;
+
+        assert_eq!(
+            primary_received.lock().unwrap()[0]["delivery"]["route"],
+            "primary-critical"
+        );
+        assert_eq!(
+            secondary_received.lock().unwrap()[0]["delivery"]["route"],
+            "checkout-service"
+        );
+
+        let events = get_api_json(app.clone(), "/api/alert-events").await;
+        assert_eq!(events.as_array().unwrap().len(), 1);
+
+        let groups = get_api_json(app.clone(), "/api/alert-groups").await;
+        assert_eq!(groups.as_array().unwrap().len(), 1);
+        assert_eq!(groups[0]["fingerprint"], "svc-cpu");
+        assert_eq!(groups[0]["event_count"], 1);
+
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        let delivery_records = deliveries.as_array().unwrap();
+        assert_eq!(delivery_records.len(), 2);
+        assert!(
+            delivery_records
+                .iter()
+                .all(|record| record["alert_event_id"] == events[0]["id"])
+        );
+        let routed_targets = delivery_records
+            .iter()
+            .map(|record| {
+                let summary: Value =
+                    serde_json::from_str(record["request_summary"].as_str().unwrap()).unwrap();
+                (
+                    summary["route"].as_str().unwrap().to_string(),
+                    summary["receiver"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            routed_targets
+                .contains(&("primary-critical".to_string(), "primary-target".to_string()))
+        );
+        assert!(routed_targets.contains(&(
+            "checkout-service".to_string(),
+            "secondary-target".to_string()
+        )));
     }
 
     #[tokio::test]
