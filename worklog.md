@@ -34,3 +34,8 @@
 - Started issue #30 implementation on `feat/user-management-rbac`: local users with Argon2id password hashes, SQLite-backed sessions, CSRF-protected cookie auth, bootstrap admin from `SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD`, admin user/team APIs, basic global RBAC, actor-aware lifecycle audit, WebUI login/admin panels, and docs/Quadlet env updates.
 - Addressed Copilot review on PR #31: `POST /auth/logout` now requires CSRF for valid session-cookie logout requests, and login rate limiting preserves username case to match case-sensitive user lookup semantics.
 - Started release `v0.0.9`: bumped Cargo/README version references after PR #31 local user management and PR #32 alert reactivation lifecycle fixes landed on `main`. Verified `cargo fmt --check`, `cargo test --locked`, `cargo clippy --all-targets -- -D warnings`, and `git diff --check`.
+
+2026-07-17
+
+- Started README/current-branch cleanup: fast-forwarded local `main` to `origin/main`, reviewed current README/config/source state, and expanded README input setup docs so generic JSON integrations and supported presets are covered alongside SigNoz.
+- Rebased local `devel` onto current `main` by dropping the old devel-only patch range after audit showed the relevant behavior was already present or superseded on `main`; kept the README/current-state documentation update on rebased `devel`.
