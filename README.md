@@ -5,10 +5,10 @@ and generic JSON alert webhooks, normalizes them into canonical alert events,
 routes them to chat or webhook targets, persists delivery state in SQLite, and
 serves a small operator UI for inspecting and acting on alerts.
 
-The v2 branch keeps the original SigNoz-to-Google-Chat behavior as a
-compatibility path while adding source-agnostic integrations, durable delivery,
-alert lifecycle APIs, additional targets, escalation scheduling, and optional
-advisory intelligence scaffolding.
+The current mainline implementation keeps the original SigNoz-to-Google-Chat
+behavior as a compatibility path while adding source-agnostic integrations,
+durable delivery, alert lifecycle APIs, additional targets, escalation
+scheduling, and optional advisory intelligence scaffolding.
 
 ## Feature Set
 
@@ -180,7 +180,7 @@ non-loopback binds require effective management auth unless
 
 See [examples/config.yaml](examples/config.yaml) for a complete working
 configuration and [docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md](docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md)
-for the v2 implementation plan. [docs/SPEC.md](docs/SPEC.md) still contains
+for the current implementation plan. [docs/SPEC.md](docs/SPEC.md) still contains
 lower-level API and compatibility notes.
 
 The original SigNoz path remains configurable:
@@ -440,7 +440,7 @@ alert_grouping:
   debounce_millis: 1000
 ```
 
-Gateway v2 also persists normalized alert groups keyed by fingerprint. Repeated
+The gateway also persists normalized alert groups keyed by fingerprint. Repeated
 active events increment the group count and update timestamps; resolved events
 mark the group resolved.
 
