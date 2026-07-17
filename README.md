@@ -326,6 +326,65 @@ intelligence:
   allow_lifecycle_mutation: false
 ```
 
+## Input Setup
+
+`simple-alert-proxy` supports two intake styles:
+
+- SigNoz compatibility through `POST /webhooks/signoz`
+- Configured generic JSON integrations through `POST /webhooks/{integration}`
+
+Generic JSON integrations do not require Rust changes for simple payload shapes.
+Each integration maps fields from an incoming JSON document into the canonical
+alert event model used by routing, persistence, lifecycle actions, and delivery.
+Mappings accept dotted object paths such as `finding.title`; JSON pointer syntax
+is also supported by the integration mapper for keys that are easier to address
+that way.
+
+The optional `preset` field is validation and operator metadata for the source
+family. The current supported preset names are:
+
+- `alertmanager`
+- `grafana`
+- `openobserve`
+- `openvas_scan`
+
+The bundled example uses the `openvas_scan` preset:
+
+```yaml
+integrations:
+  openvas-example:
+    type: "generic_json"
+    preset: "openvas_scan"
+    path: "/webhooks/openvas-example"
+    auth:
+      bearer_token: "replace-me"
+    source: "openvas"
+    status: "state"
+    severity: "risk.level"
+    title: "finding.title"
+    body: "finding.description"
+    fingerprint: "finding.id"
+    starts_at: "observed_at"
+    labels:
+      asset: "asset.host"
+    annotations:
+      plugin: "finding.plugin"
+    links:
+      source: "finding.url"
+```
+
+Send a matching generic JSON alert with:
+
+```bash
+curl -X POST http://127.0.0.1:8080/webhooks/openvas-example \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer replace-me' \
+  --data @examples/generic-json-webhook.json
+```
+
+Use `POST /debug/webhook` while integrating a new source if you need to inspect
+the redacted inbound payload before committing a mapping.
+
 ## SigNoz Setup
 
 SigNoz's current docs route webhook setup through
