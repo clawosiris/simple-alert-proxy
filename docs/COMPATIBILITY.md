@@ -1,14 +1,14 @@
 # Compatibility Baseline
 
-This file names the behavior that Alert Webhook Gateway v2 must preserve while
-new integrations, storage, lifecycle APIs, and UI work are added.
+This file names the behavior that the mainline alert webhook gateway must
+preserve while integrations, storage, lifecycle APIs, and UI work continue.
 
 ## SigNoz Compatibility Integration
 
 The current SigNoz integration remains the compatibility baseline:
 
-- Endpoint: `POST /webhooks/signoz` by default, configurable with
-  `server.webhook_path`.
+- Endpoint: `POST /webhooks/signoz` by default, now representable as a built-in
+  configured integration and still compatible with legacy `server.webhook_path`.
 - Payload: Alertmanager-style SigNoz webhook JSON with `status`,
   `commonLabels`, `commonAnnotations`, and `alerts[]`.
 - Routing: existing YAML `routing.default_receiver`, `routing.routes`, and
@@ -20,7 +20,8 @@ The current SigNoz integration remains the compatibility baseline:
 - Grouping: SigNoz alerts sharing `ruleId` produce one outbound Google Chat
   notification with separate instance rows after the debounce window.
 
-No migration is required for the current `examples/config.yaml` shape.
+No migration is required for older configs that rely on `server.webhook_path`;
+new configs should represent SigNoz under `integrations`.
 
 ## Compatibility Test Matrix
 

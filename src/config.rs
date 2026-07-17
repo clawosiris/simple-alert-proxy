@@ -66,11 +66,15 @@ impl AppConfig {
         for (name, integration) in &self.integrations {
             validate_integration_name(name)?;
             match integration {
+                IntegrationConfig::Builtin(config) => {
+                    config.validate(name)?;
+                }
                 IntegrationConfig::GenericJson(config) => {
                     config.validate(name)?;
                 }
             }
         }
+        self.validate_integration_paths()?;
 
         if self.alert_grouping.enabled && self.alert_grouping.debounce_millis == 0 {
             bail!("alert_grouping.debounce_millis must be greater than zero when enabled");
@@ -153,6 +157,18 @@ impl AppConfig {
         bail!(
             "management auth is required when server.bind is not loopback; set management.auth.bearer_token or management.allow_unauthenticated: true"
         )
+    }
+
+    fn validate_integration_paths(&self) -> anyhow::Result<()> {
+        let mut paths = BTreeMap::new();
+        for (name, integration) in &self.integrations {
+            let path = integration.path();
+            if let Some(previous) = paths.insert(path, name) {
+                bail!("integration {name} path {path} duplicates integration {previous}");
+            }
+        }
+
+        Ok(())
     }
 
     fn require_receiver(&self, name: &str) -> anyhow::Result<()> {
@@ -423,7 +439,46 @@ impl DeliveryConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IntegrationConfig {
-    GenericJson(GenericJsonIntegrationConfig),
+    Builtin(BuiltinIntegrationConfig),
+    GenericJson(Box<GenericJsonIntegrationConfig>),
+}
+
+impl IntegrationConfig {
+    pub fn path(&self) -> &str {
+        match self {
+            IntegrationConfig::Builtin(config) => &config.path,
+            IntegrationConfig::GenericJson(config) => &config.path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuiltinIntegrationConfig {
+    pub preset: String,
+    pub path: String,
+    pub auth: Option<AuthConfig>,
+}
+
+impl BuiltinIntegrationConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        if self.path.is_empty() {
+            bail!("integration {name} path must not be empty");
+        }
+
+        validate_builtin_preset(name, &self.preset)?;
+
+        if !self.path.starts_with("/webhooks/") {
+            bail!("integration {name} path must start with /webhooks/");
+        }
+
+        if let Some(auth) = &self.auth
+            && auth.bearer_token.is_empty()
+        {
+            bail!("integration {name} auth.bearer_token must not be empty");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -754,6 +809,13 @@ fn validate_source_preset(integration_name: &str, preset: &str) -> anyhow::Resul
     }
 }
 
+fn validate_builtin_preset(integration_name: &str, preset: &str) -> anyhow::Result<()> {
+    match preset {
+        "signoz" | "alertmanager" => Ok(()),
+        _ => bail!("integration {integration_name} builtin preset {preset} is not supported"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,7 +883,7 @@ mod tests {
             management: ManagementConfig::default(),
             integrations: BTreeMap::from([(
                 "openvas".to_string(),
-                IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+                IntegrationConfig::GenericJson(Box::new(GenericJsonIntegrationConfig {
                     preset: None,
                     path: "/webhooks/openvas".to_string(),
                     auth: None,
@@ -836,7 +898,7 @@ mod tests {
                     labels: BTreeMap::new(),
                     annotations: BTreeMap::new(),
                     links: BTreeMap::new(),
-                }),
+                })),
             )]),
             storage: StorageConfig {
                 r#type: "sqlite".to_string(),

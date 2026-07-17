@@ -82,9 +82,9 @@ single-container deployment path stays simple.
 
 ### `POST /webhooks/signoz`
 
-This is the current SigNoz compatibility integration path. Gateway v2 work must
-keep accepting this path by default unless the operator explicitly changes
-`server.webhook_path`.
+This is the default SigNoz compatibility integration path. The current gateway
+keeps accepting this path by default for older configs, and new configs can
+represent it as a built-in configured integration under `integrations`.
 
 Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 

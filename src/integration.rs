@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     alert::{AlertEvent, AlertLink},
-    config::{GenericJsonIntegrationConfig, IntegrationConfig},
+    config::{BuiltinIntegrationConfig, GenericJsonIntegrationConfig, IntegrationConfig},
     signoz::{self, SigNozAlert},
 };
 
@@ -96,26 +96,27 @@ pub enum IntegrationError {
     MissingRequired { field: &'static str, path: String },
 }
 
-pub fn configured_integration<'a>(
-    integrations: &'a BTreeMap<String, IntegrationConfig>,
-    segment: &str,
-) -> Result<(&'a str, &'a GenericJsonIntegrationConfig), IntegrationError> {
-    if let Some((name, IntegrationConfig::GenericJson(config))) =
-        integrations.get_key_value(segment)
-    {
-        return Ok((name, config));
-    }
+pub enum ConfiguredIntegration<'a> {
+    Builtin(&'a str, &'a BuiltinIntegrationConfig),
+    GenericJson(&'a str, &'a GenericJsonIntegrationConfig),
+}
 
-    let expected_path = format!("/webhooks/{segment}");
+pub fn configured_integration_for_path<'a>(
+    integrations: &'a BTreeMap<String, IntegrationConfig>,
+    path: &str,
+) -> Result<ConfiguredIntegration<'a>, IntegrationError> {
     integrations
         .iter()
         .find_map(|(name, integration)| match integration {
-            IntegrationConfig::GenericJson(config) if config.path == expected_path => {
-                Some((name.as_str(), config))
+            IntegrationConfig::Builtin(config) if config.path == path => {
+                Some(ConfiguredIntegration::Builtin(name.as_str(), config))
+            }
+            IntegrationConfig::GenericJson(config) if config.path == path => {
+                Some(ConfiguredIntegration::GenericJson(name.as_str(), config))
             }
             _ => None,
         })
-        .ok_or_else(|| IntegrationError::Unknown(segment.to_string()))
+        .ok_or_else(|| IntegrationError::Unknown(path.to_string()))
 }
 
 fn required_string(

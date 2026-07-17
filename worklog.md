@@ -39,3 +39,4 @@
 
 - Started README/current-branch cleanup: fast-forwarded local `main` to `origin/main`, reviewed current README/config/source state, and expanded README input setup docs so generic JSON integrations and supported presets are covered alongside SigNoz.
 - Rebased local `devel` onto current `main` by dropping the old devel-only patch range after audit showed the relevant behavior was already present or superseded on `main`; kept the README/current-state documentation update on rebased `devel`.
+- Started issue #41 implementation on `feat/unify-signoz-integration`: adding built-in configured SigNoz/Alertmanager integration support while keeping `/webhooks/signoz` compatibility and grouped Google Chat delivery.
