@@ -538,6 +538,21 @@ podman pull ghcr.io/clawosiris/simple-alert-proxy:0.0.9
 podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
 ```
 
+Nightly builds run from the `Nightly` GitHub Actions workflow. They verify the
+Rust project, build the container image, and publish these GHCR tags from
+`main`:
+
+```bash
+podman pull ghcr.io/clawosiris/simple-alert-proxy:nightly
+podman pull ghcr.io/clawosiris/simple-alert-proxy:nightly-YYYYMMDD
+podman pull ghcr.io/clawosiris/simple-alert-proxy:nightly-<short-sha>
+```
+
+The `nightly` tag moves with the latest successful nightly build. Date and
+short-SHA nightly tags are retained in GHCR until package cleanup removes them.
+Manual `Nightly` workflow runs on non-`main` branches build the image for
+validation but do not publish package tags.
+
 ## Quadlet Deployment
 
 The repo includes a Quadlet unit at
