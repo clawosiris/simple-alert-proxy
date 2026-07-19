@@ -26,6 +26,13 @@ debug:
   log_full_payloads: false
 
 integrations:
+  signoz:
+    type: "builtin"
+    preset: "signoz"
+    path: "/webhooks/signoz"
+    auth:
+      bearer_token: "replace-me"
+
   openvas-example:
     type: "generic_json"
     preset: "openvas_scan"

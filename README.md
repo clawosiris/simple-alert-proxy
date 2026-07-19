@@ -5,10 +5,10 @@ and generic JSON alert webhooks, normalizes them into canonical alert events,
 routes them to chat or webhook targets, persists delivery state in SQLite, and
 serves a small operator UI for inspecting and acting on alerts.
 
-The v2 branch keeps the original SigNoz-to-Google-Chat behavior as a
-compatibility path while adding source-agnostic integrations, durable delivery,
-alert lifecycle APIs, additional targets, escalation scheduling, and optional
-advisory intelligence scaffolding.
+The current mainline implementation keeps the original SigNoz-to-Google-Chat
+behavior as a compatibility path while adding source-agnostic integrations,
+durable delivery, alert lifecycle APIs, additional targets, escalation
+scheduling, and optional advisory intelligence scaffolding.
 
 ## Feature Set
 
@@ -180,10 +180,12 @@ non-loopback binds require effective management auth unless
 
 See [examples/config.yaml](examples/config.yaml) for a complete working
 configuration and [docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md](docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md)
-for the v2 implementation plan. [docs/SPEC.md](docs/SPEC.md) still contains
+for the current implementation plan. [docs/SPEC.md](docs/SPEC.md) still contains
 lower-level API and compatibility notes.
 
-The original SigNoz path remains configurable:
+The default SigNoz compatibility path remains `/webhooks/signoz`. Older configs
+can still use `server.webhook_path`; new configs should model SigNoz as a
+configured built-in integration alongside other inputs:
 
 ```yaml
 server:
@@ -204,6 +206,14 @@ management:
   session_ttl_secs: 28800
   secure_cookies: true
   allow_unauthenticated: false
+
+integrations:
+  signoz:
+    type: "builtin"
+    preset: "signoz"
+    path: "/webhooks/signoz"
+    auth:
+      bearer_token: "replace-me"
 ```
 
 The built-in operator UI supports local user login backed by SQLite sessions.
@@ -230,8 +240,20 @@ requests. Saturated route classes return `503 Service Unavailable` with a small
 JSON error body; `/healthz` is not behind those route-class limits. Use a
 trusted reverse proxy or ingress for per-client/IP rate limiting.
 
+Built-in integrations preserve source-specific parsing behavior while using the
+same configured path/auth model as generic inputs. Supported built-in presets
+are:
+
+- `signoz`
+- `alertmanager`
+
 Generic JSON integrations use dotted paths or JSON pointers to map payload
-fields:
+fields. Supported generic JSON presets are:
+
+- `alertmanager`
+- `grafana`
+- `openobserve`
+- `openvas_scan`
 
 ```yaml
 integrations:
@@ -252,13 +274,6 @@ integrations:
     annotations:
       plugin: "finding.plugin"
 ```
-
-Supported generic JSON presets are:
-
-- `alertmanager`
-- `grafana`
-- `openobserve`
-- `openvas_scan`
 
 SQLite persistence and retry policy:
 
@@ -330,8 +345,14 @@ intelligence:
 
 `simple-alert-proxy` supports two intake styles:
 
-- SigNoz compatibility through `POST /webhooks/signoz`
+- Built-in source presets such as SigNoz through `POST /webhooks/signoz`
 - Configured generic JSON integrations through `POST /webhooks/{integration}`
+
+Built-in integrations are configured under `integrations` and keep parser logic
+for payload shapes that need source-specific handling. SigNoz and
+Alertmanager-compatible payloads use this path so `alerts[]`, common
+labels/annotations, rule metadata, and grouped Google Chat delivery keep their
+existing behavior.
 
 Generic JSON integrations do not require Rust changes for simple payload shapes.
 Each integration maps fields from an incoming JSON document into the canonical
@@ -340,8 +361,9 @@ Mappings accept dotted object paths such as `finding.title`; JSON pointer syntax
 is also supported by the integration mapper for keys that are easier to address
 that way.
 
-The optional `preset` field is validation and operator metadata for the source
-family. The current supported preset names are:
+For generic JSON integrations, the optional `preset` field is validation and
+operator metadata for the source family. The current supported generic preset
+names are:
 
 - `alertmanager`
 - `grafana`
@@ -440,7 +462,7 @@ alert_grouping:
   debounce_millis: 1000
 ```
 
-Gateway v2 also persists normalized alert groups keyed by fingerprint. Repeated
+The gateway also persists normalized alert groups keyed by fingerprint. Repeated
 active events increment the group count and update timestamps; resolved events
 mark the group resolved.
 
@@ -515,6 +537,21 @@ Release images are published to GitHub Container Registry:
 podman pull ghcr.io/clawosiris/simple-alert-proxy:0.0.9
 podman pull ghcr.io/clawosiris/simple-alert-proxy:latest
 ```
+
+Nightly builds run from the `Nightly` GitHub Actions workflow. They verify the
+Rust project, build the container image, and publish these GHCR tags from
+`main`:
+
+```bash
+podman pull ghcr.io/clawosiris/simple-alert-proxy:nightly
+podman pull ghcr.io/clawosiris/simple-alert-proxy:nightly-YYYYMMDD
+podman pull ghcr.io/clawosiris/simple-alert-proxy:nightly-<short-sha>
+```
+
+The `nightly` tag moves with the latest successful nightly build. Date and
+short-SHA nightly tags are retained in GHCR until package cleanup removes them.
+Manual `Nightly` workflow runs on non-`main` branches build the image for
+validation but do not publish package tags.
 
 ## Quadlet Deployment
 

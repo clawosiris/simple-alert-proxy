@@ -7,7 +7,7 @@ use axum::{
     BoxError, Json, Router,
     body::Bytes,
     error_handling::HandleErrorLayer,
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, OriginalUri, Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -332,15 +332,16 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     };
 
     let health = Router::new().route("/healthz", post(healthz).get(healthz));
-    let webhooks = Router::new()
-        .route(&webhook_path, post(handle_signoz_webhook))
-        .route("/webhooks/{integration}", post(handle_generic_webhook))
-        .layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(handle_overload))
-                .layer(LoadShedLayer::new())
-                .layer(ConcurrencyLimitLayer::new(webhook_concurrency)),
-        );
+    let mut webhooks = Router::new().route("/webhooks/{*integration}", post(handle_webhook));
+    if !webhook_path.starts_with("/webhooks/") {
+        webhooks = webhooks.route(&webhook_path, post(handle_legacy_signoz_webhook));
+    }
+    let webhooks = webhooks.layer(
+        ServiceBuilder::new()
+            .layer(HandleErrorLayer::new(handle_overload))
+            .layer(LoadShedLayer::new())
+            .layer(ConcurrencyLimitLayer::new(webhook_concurrency)),
+    );
     let management = Router::new()
         .route("/", get(operator_ui))
         .route("/ui", get(operator_ui))
@@ -819,12 +820,39 @@ async fn list_integrations(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
     require_management(&state, &headers, Permission::Read)?;
-    let integrations = state
+    let mut integrations = state
         .config
         .integrations
-        .keys()
-        .map(|name| serde_json::json!({ "name": name }))
+        .iter()
+        .map(|(name, integration)| match integration {
+            config::IntegrationConfig::Builtin(config) => serde_json::json!({
+                "name": name,
+                "type": "builtin",
+                "preset": config.preset,
+                "path": config.path,
+            }),
+            config::IntegrationConfig::GenericJson(config) => serde_json::json!({
+                "name": name,
+                "type": "generic_json",
+                "preset": config.preset,
+                "path": config.path,
+            }),
+        })
         .collect::<Vec<_>>();
+    if !state
+        .config
+        .integrations
+        .values()
+        .any(|integration| integration.path() == state.config.server.webhook_path)
+    {
+        integrations.push(serde_json::json!({
+            "name": "signoz",
+            "type": "builtin",
+            "preset": "signoz",
+            "path": state.config.server.webhook_path,
+            "compatibility_default": true,
+        }));
+    }
     Ok(Json(integrations))
 }
 
@@ -923,7 +951,7 @@ async fn handle_debug_webhook(
     ))
 }
 
-async fn handle_signoz_webhook(
+async fn handle_legacy_signoz_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
@@ -933,18 +961,103 @@ async fn handle_signoz_webhook(
     let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
     if state.config.debug.log_alerts {
         log_debug_json(
-            "incoming alert",
+            "incoming signoz alert",
             &payload,
             state.config.debug.log_full_payloads,
         );
     }
 
-    let signoz = SigNozIntegration::new("signoz");
+    process_signoz_alerts(&state, "signoz", payload)
+}
+
+async fn handle_webhook(
+    State(state): State<AppState>,
+    Path(_integration): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, WebhookError> {
+    let path = uri.path();
+    match integration::configured_integration_for_path(&state.config.integrations, path) {
+        Ok(integration::ConfiguredIntegration::Builtin(name, config)) => {
+            authorize(
+                config.auth.as_ref().or(state.config.server.auth.as_ref()),
+                &headers,
+            )?;
+            let payload =
+                serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
+            if state.config.debug.log_alerts {
+                log_debug_json(
+                    "incoming builtin alert",
+                    &payload,
+                    state.config.debug.log_full_payloads,
+                );
+            }
+
+            process_builtin_alerts(&state, name, &config.preset, payload)
+        }
+        Ok(integration::ConfiguredIntegration::GenericJson(name, config)) => {
+            authorize(
+                config.auth.as_ref().or(state.config.server.auth.as_ref()),
+                &headers,
+            )?;
+            let payload =
+                serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
+            if state.config.debug.log_alerts {
+                log_debug_json(
+                    "incoming generic alert",
+                    &payload,
+                    state.config.debug.log_full_payloads,
+                );
+            }
+
+            let integration = GenericJsonIntegration::new(name, config);
+            let events = integration.normalize(payload)?;
+            process_generic_events(&state, &events)
+        }
+        Err(integration::IntegrationError::Unknown(_))
+            if path == state.config.server.webhook_path =>
+        {
+            authorize(state.config.server.auth.as_ref(), &headers)?;
+            let payload =
+                serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
+            if state.config.debug.log_alerts {
+                log_debug_json(
+                    "incoming default signoz alert",
+                    &payload,
+                    state.config.debug.log_full_payloads,
+                );
+            }
+
+            process_signoz_alerts(&state, "signoz", payload)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn process_builtin_alerts(
+    state: &AppState,
+    name: &str,
+    preset: &str,
+    payload: Value,
+) -> Result<(StatusCode, Json<Value>), WebhookError> {
+    match preset {
+        "signoz" | "alertmanager" => process_signoz_alerts(state, name, payload),
+        _ => Err(integration::IntegrationError::Unknown(preset.to_string()).into()),
+    }
+}
+
+fn process_signoz_alerts(
+    state: &AppState,
+    name: &str,
+    payload: Value,
+) -> Result<(StatusCode, Json<Value>), WebhookError> {
+    let signoz = SigNozIntegration::new(name);
     let alerts = signoz.parse_alerts(payload)?;
     let mut delivered_receivers = Vec::new();
 
     for alert in &alerts {
-        let event = alert.to_alert_event("signoz");
+        let event = alert.to_alert_event(name);
         let plan = state.router.plan(&event);
         let mut alert_event_id = None;
 
@@ -965,7 +1078,7 @@ async fn handle_signoz_webhook(
             match receiver {
                 config::ReceiverConfig::GoogleChat(receiver) => {
                     queue_signoz_google_chat_delivery(
-                        &state,
+                        state,
                         event_id,
                         receiver,
                         alert.clone(),
@@ -975,7 +1088,7 @@ async fn handle_signoz_webhook(
                 }
                 receiver => {
                     queue_target_event_delivery(
-                        &state,
+                        state,
                         &event,
                         event_id,
                         receiver,
@@ -1000,33 +1113,13 @@ async fn handle_signoz_webhook(
     ))
 }
 
-async fn handle_generic_webhook(
-    State(state): State<AppState>,
-    Path(integration): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, WebhookError> {
-    let (name, config) =
-        integration::configured_integration(&state.config.integrations, &integration)?;
-    authorize(
-        config.auth.as_ref().or(state.config.server.auth.as_ref()),
-        &headers,
-    )?;
-
-    let payload = serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
-    if state.config.debug.log_alerts {
-        log_debug_json(
-            "incoming generic alert",
-            &payload,
-            state.config.debug.log_full_payloads,
-        );
-    }
-
-    let integration = GenericJsonIntegration::new(name, config);
-    let events = integration.normalize(payload)?;
+fn process_generic_events(
+    state: &AppState,
+    events: &[AlertEvent],
+) -> Result<(StatusCode, Json<Value>), WebhookError> {
     let mut delivered_receivers = Vec::new();
 
-    for event in &events {
+    for event in events {
         let plan = state.router.plan(event);
         let mut alert_event_id = None;
 
@@ -1044,7 +1137,7 @@ async fn handle_generic_webhook(
                 }
             };
 
-            queue_target_event_delivery(&state, event, event_id, receiver, delivery.clone())?;
+            queue_target_event_delivery(state, event, event_id, receiver, delivery.clone())?;
             delivered_receivers.push(delivery.receiver.clone());
         }
     }
@@ -1618,11 +1711,11 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, AuthConfig, DebugConfig, DeliveryConfig, EscalationConfig,
-        EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
-        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
-        IntelligenceConfig, ManagementConfig, ReceiverConfig, RoutingConfig, ServerConfig,
-        ServerLimitsConfig, StorageConfig,
+        AlertGroupingConfig, AuthConfig, BuiltinIntegrationConfig, DebugConfig, DeliveryConfig,
+        EscalationConfig, EscalationPolicyConfig, EscalationStepConfig,
+        GenericJsonIntegrationConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
+        IntegrationConfig, IntelligenceConfig, ManagementConfig, ReceiverConfig, RoutingConfig,
+        ServerConfig, ServerLimitsConfig, StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -2418,6 +2511,11 @@ mod tests {
             config.integrations.get("openvas-example"),
             Some(IntegrationConfig::GenericJson(_))
         ));
+        assert!(matches!(
+            config.integrations.get("signoz"),
+            Some(IntegrationConfig::Builtin(integration))
+                if integration.preset == "signoz" && integration.path == "/webhooks/signoz"
+        ));
         assert_eq!(
             config.routing.default_receiver.as_deref(),
             Some("default-chat")
@@ -2426,6 +2524,44 @@ mod tests {
             config.receivers.get("critical-chat"),
             Some(ReceiverConfig::GoogleChat(_))
         ));
+    }
+
+    #[test]
+    fn duplicate_integration_paths_are_rejected() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.integrations = BTreeMap::from([
+            (
+                "signoz".to_string(),
+                IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                    preset: "signoz".to_string(),
+                    path: "/webhooks/shared".to_string(),
+                    auth: None,
+                }),
+            ),
+            (
+                "openvas".to_string(),
+                IntegrationConfig::GenericJson(Box::new(GenericJsonIntegrationConfig {
+                    preset: None,
+                    path: "/webhooks/shared".to_string(),
+                    auth: None,
+                    source: "openvas".to_string(),
+                    status: "state".to_string(),
+                    severity: None,
+                    title: "title".to_string(),
+                    body: None,
+                    fingerprint: "id".to_string(),
+                    starts_at: None,
+                    ends_at: None,
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    links: BTreeMap::new(),
+                })),
+            ),
+        ]);
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.to_string().contains("duplicates integration"));
     }
 
     #[tokio::test]
@@ -2450,6 +2586,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_server_webhook_path_under_webhooks_still_accepts_signoz() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.webhook_path = "/webhooks/legacy-signoz".to_string();
+        let app = build_app(Arc::new(config.clone()), config.server.webhook_path).unwrap();
+
+        let response = app
+            .oneshot(signoz_request_to(
+                "/webhooks/legacy-signoz",
+                fixture_payload(),
+                "test-token",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+    }
+
+    #[tokio::test]
+    async fn configured_builtin_signoz_path_accepts_existing_payload() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.integrations = BTreeMap::from([(
+            "sig-noz-prod".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "signoz".to_string(),
+                path: "/webhooks/sig-noz-prod".to_string(),
+                auth: Some(AuthConfig {
+                    bearer_token: "integration-token".to_string(),
+                }),
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(signoz_request_to(
+                "/webhooks/sig-noz-prod",
+                fixture_payload(),
+                "integration-token",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        let received = received.lock().unwrap();
+        assert_eq!(
+            received[0]["cardsV2"][0]["card"]["header"]["title"].as_str(),
+            Some("[firing] HighErrorRate via critical-production")
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_builtin_signoz_auth_overrides_server_auth() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.integrations = BTreeMap::from([(
+            "signoz".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "signoz".to_string(),
+                path: "/webhooks/signoz".to_string(),
+                auth: Some(AuthConfig {
+                    bearer_token: "integration-token".to_string(),
+                }),
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let server_auth_response = app
+            .clone()
+            .oneshot(signoz_request_to(
+                "/webhooks/signoz",
+                fixture_payload(),
+                "test-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(server_auth_response.status(), StatusCode::UNAUTHORIZED);
+
+        let integration_auth_response = app
+            .oneshot(signoz_request_to(
+                "/webhooks/signoz",
+                fixture_payload(),
+                "integration-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(integration_auth_response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+    }
+
+    #[tokio::test]
     async fn generic_webhook_path_normalizes_and_delivers_event() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
@@ -2463,7 +2695,7 @@ mod tests {
         }];
         config.integrations = BTreeMap::from([(
             "openvas".to_string(),
-            IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+            IntegrationConfig::GenericJson(Box::new(GenericJsonIntegrationConfig {
                 preset: None,
                 path: "/webhooks/openvas".to_string(),
                 auth: None,
@@ -2478,7 +2710,7 @@ mod tests {
                 labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
                 annotations: BTreeMap::from([("asset".to_string(), "asset.host".to_string())]),
                 links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
-            }),
+            })),
         )]);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
 
@@ -3799,11 +4031,15 @@ mod tests {
     }
 
     fn signoz_request(payload: Value) -> Request<Body> {
+        signoz_request_to("/webhooks/signoz", payload, "test-token")
+    }
+
+    fn signoz_request_to(uri: &str, payload: Value, token: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
-            .uri("/webhooks/signoz")
+            .uri(uri)
             .header(header::CONTENT_TYPE, "application/json")
-            .header(header::AUTHORIZATION, "Bearer test-token")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from(payload.to_string()))
             .unwrap()
     }
@@ -3866,7 +4102,7 @@ mod tests {
     fn generic_test_integrations() -> BTreeMap<String, IntegrationConfig> {
         BTreeMap::from([(
             "openvas".to_string(),
-            IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+            IntegrationConfig::GenericJson(Box::new(GenericJsonIntegrationConfig {
                 preset: None,
                 path: "/webhooks/openvas".to_string(),
                 auth: None,
@@ -3881,14 +4117,14 @@ mod tests {
                 labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
                 annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
                 links: BTreeMap::new(),
-            }),
+            })),
         )])
     }
 
     fn synthetic_test_integrations() -> BTreeMap<String, IntegrationConfig> {
         BTreeMap::from([(
             "synthetic".to_string(),
-            IntegrationConfig::GenericJson(GenericJsonIntegrationConfig {
+            IntegrationConfig::GenericJson(Box::new(GenericJsonIntegrationConfig {
                 preset: None,
                 path: "/webhooks/synthetic".to_string(),
                 auth: None,
@@ -3906,7 +4142,7 @@ mod tests {
                 ]),
                 annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
                 links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
-            }),
+            })),
         )])
     }
 
