@@ -201,6 +201,7 @@ mod tests {
             storage: StorageConfig {
                 r#type: "sqlite".to_string(),
                 path: ":memory:".to_string(),
+                retention_days: 90,
             },
             delivery: DeliveryConfig::default(),
             escalation: crate::config::EscalationConfig::default(),

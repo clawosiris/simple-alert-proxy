@@ -261,12 +261,17 @@ outbound delivery is attempted. The default database path is
 storage:
   type: sqlite
   path: "simple-alert-proxy.db"
+  retention_days: 90
 
 delivery:
   max_attempts: 3
   initial_backoff_millis: 250
   max_backoff_millis: 30000
 ```
+
+`storage.retention_days` defaults to `90`. The service prunes alert events older
+than the configured number of days from SQLite and removes dependent delivery,
+advisory, escalation, audit, and orphaned alert-group records.
 
 Delivery records store target name, status, attempt count, next retry time,
 last redacted error, request summary, and response summary. Delivery failures

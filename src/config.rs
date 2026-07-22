@@ -292,6 +292,8 @@ pub struct StorageConfig {
     pub r#type: String,
     #[serde(default = "default_storage_path")]
     pub path: String,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
 }
 
 impl Default for StorageConfig {
@@ -299,6 +301,7 @@ impl Default for StorageConfig {
         Self {
             r#type: default_storage_type(),
             path: default_storage_path(),
+            retention_days: default_retention_days(),
         }
     }
 }
@@ -311,6 +314,10 @@ impl StorageConfig {
 
         if self.path.is_empty() {
             bail!("storage.path must not be empty");
+        }
+
+        if self.retention_days == 0 {
+            bail!("storage.retention_days must be greater than zero");
         }
 
         Ok(())
@@ -751,6 +758,10 @@ fn default_storage_path() -> String {
     "simple-alert-proxy.db".to_string()
 }
 
+fn default_retention_days() -> u64 {
+    90
+}
+
 fn default_max_attempts() -> u32 {
     3
 }
@@ -903,6 +914,7 @@ mod tests {
             storage: StorageConfig {
                 r#type: "sqlite".to_string(),
                 path: ":memory:".to_string(),
+                retention_days: 90,
             },
             delivery: DeliveryConfig::default(),
             escalation: EscalationConfig::default(),
@@ -958,6 +970,27 @@ mod tests {
             error
                 .to_string()
                 .contains("server.limits.management_concurrency must be greater than zero")
+        );
+    }
+
+    #[test]
+    fn defaults_storage_retention_to_ninety_days() {
+        assert_eq!(StorageConfig::default().retention_days, 90);
+    }
+
+    #[test]
+    fn rejects_zero_storage_retention() {
+        let config = StorageConfig {
+            retention_days: 0,
+            ..Default::default()
+        };
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("storage.retention_days must be greater than zero")
         );
     }
 

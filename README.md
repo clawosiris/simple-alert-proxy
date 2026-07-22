@@ -52,6 +52,7 @@ server:
   bind: "0.0.0.0:8080"
 storage:
   path: "/var/lib/simple-alert-proxy/data/simple-alert-proxy.db"
+  retention_days: 90
 ```
 
 The image runs as the non-root `simple-alert-proxy` user. Make the mounted data
@@ -281,12 +282,17 @@ SQLite persistence and retry policy:
 storage:
   type: "sqlite"
   path: "simple-alert-proxy.db"
+  retention_days: 90
 
 delivery:
   max_attempts: 3
   initial_backoff_millis: 250
   max_backoff_millis: 30000
 ```
+
+`storage.retention_days` is measured in days and defaults to `90` when unset.
+Alert events older than the retention window are dropped from SQLite along with
+their dependent delivery and alert-group records.
 
 Receiver types:
 
