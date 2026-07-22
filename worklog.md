@@ -44,3 +44,7 @@
 2026-07-18
 
 - Implemented issue #43 on `issue-43-nightly-builds`: added scheduled/manual nightly Rust verification and container image build/publish workflow, documented nightly GHCR tags and retention behavior, and verified with `actionlint`, `cargo fmt --check`, `cargo test --locked`, `cargo clippy --all-targets -- -D warnings`, and `git diff --check`.
+
+2026-07-22
+
+- Continued interrupted issue #45 implementation: configurable SQLite alert retention defaulting to 90 days, startup/daily pruning, dependency cleanup, docs/config examples, and tests.

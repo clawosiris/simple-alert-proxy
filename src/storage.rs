@@ -707,6 +707,24 @@ impl Storage {
         Ok(deleted)
     }
 
+    pub fn prune_alerts_older_than_days(&self, retention_days: u64) -> anyhow::Result<usize> {
+        const MILLIS_PER_DAY: u64 = 24 * 60 * 60 * 1_000;
+        let retention_millis = retention_days
+            .checked_mul(MILLIS_PER_DAY)
+            .and_then(|millis| i64::try_from(millis).ok())
+            .unwrap_or(i64::MAX);
+        let cutoff = now_epoch_millis().saturating_sub(retention_millis);
+        self.prune_alerts_before(cutoff)
+    }
+
+    fn prune_alerts_before(&self, cutoff: i64) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let deleted_events = prune_alerts_before_tx(&tx, cutoff)?;
+        tx.commit()?;
+        Ok(deleted_events)
+    }
+
     pub fn session_user(&self, token_hash: &str) -> anyhow::Result<Option<SessionUserRecord>> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
@@ -913,6 +931,24 @@ impl Storage {
             row.get::<_, i64>(0)
         })?;
         usize::try_from(count).context("alert event count overflowed usize")
+    }
+
+    #[cfg(test)]
+    pub fn alert_group_count(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row("SELECT COUNT(*) FROM alert_groups", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        usize::try_from(count).context("alert group count overflowed usize")
+    }
+
+    #[cfg(test)]
+    pub fn advisory_count(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count = conn.query_row("SELECT COUNT(*) FROM advisory_enrichments", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        usize::try_from(count).context("advisory count overflowed usize")
     }
 }
 
@@ -1436,4 +1472,246 @@ fn cancel_escalations(conn: &Connection, alert_group_id: i64, now: i64) -> anyho
         params![alert_group_id, now],
     )?;
     Ok(())
+}
+
+fn prune_alerts_before_tx(conn: &Connection, cutoff: i64) -> anyhow::Result<usize> {
+    conn.execute("DROP TABLE IF EXISTS retention_old_events", [])?;
+    conn.execute("DROP TABLE IF EXISTS retention_old_deliveries", [])?;
+    conn.execute("DROP TABLE IF EXISTS retention_orphan_groups", [])?;
+
+    conn.execute(
+        r#"
+        CREATE TEMP TABLE retention_old_events AS
+        SELECT id, alert_group_id
+        FROM alert_events
+        WHERE created_at < ?1
+        "#,
+        params![cutoff],
+    )?;
+    conn.execute(
+        r#"
+        CREATE TEMP TABLE retention_old_deliveries AS
+        SELECT id
+        FROM delivery_records
+        WHERE alert_event_id IN (SELECT id FROM retention_old_events)
+        "#,
+        [],
+    )?;
+
+    let deleted_events =
+        conn.query_row("SELECT COUNT(*) FROM retention_old_events", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+
+    conn.execute(
+        "DELETE FROM audit_entries WHERE delivery_record_id IN (SELECT id FROM retention_old_deliveries)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM delivery_records WHERE id IN (SELECT id FROM retention_old_deliveries)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM alert_events WHERE id IN (SELECT id FROM retention_old_events)",
+        [],
+    )?;
+    conn.execute(
+        r#"
+        CREATE TEMP TABLE retention_orphan_groups AS
+        SELECT DISTINCT old.alert_group_id AS id
+        FROM retention_old_events old
+        WHERE old.alert_group_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM alert_events remaining
+              WHERE remaining.alert_group_id = old.alert_group_id
+          )
+        "#,
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM advisory_enrichments WHERE alert_group_id IN (SELECT id FROM retention_orphan_groups)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM escalation_tasks WHERE alert_group_id IN (SELECT id FROM retention_orphan_groups)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM audit_entries WHERE alert_group_id IN (SELECT id FROM retention_orphan_groups)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM alert_groups WHERE id IN (SELECT id FROM retention_orphan_groups)",
+        [],
+    )?;
+    conn.execute(
+        r#"
+        UPDATE alert_groups
+        SET event_count = (
+                SELECT COUNT(*)
+                FROM alert_events
+                WHERE alert_events.alert_group_id = alert_groups.id
+            ),
+            first_event_at = (
+                SELECT MIN(created_at)
+                FROM alert_events
+                WHERE alert_events.alert_group_id = alert_groups.id
+            ),
+            last_event_at = (
+                SELECT MAX(created_at)
+                FROM alert_events
+                WHERE alert_events.alert_group_id = alert_groups.id
+            ),
+            updated_at = MAX(
+                updated_at,
+                (
+                    SELECT MAX(created_at)
+                    FROM alert_events
+                    WHERE alert_events.alert_group_id = alert_groups.id
+                )
+            )
+        WHERE id IN (
+            SELECT DISTINCT alert_group_id
+            FROM retention_old_events
+            WHERE alert_group_id IS NOT NULL
+        )
+          AND id NOT IN (SELECT id FROM retention_orphan_groups)
+        "#,
+        [],
+    )?;
+
+    conn.execute("DROP TABLE retention_old_events", [])?;
+    conn.execute("DROP TABLE retention_old_deliveries", [])?;
+    conn.execute("DROP TABLE retention_orphan_groups", [])?;
+
+    usize::try_from(deleted_events).context("deleted alert event count overflowed usize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alert::{AlertEvent, AlertLink};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn default_retention_keeps_recent_alerts() {
+        let storage = Storage::open(":memory:").unwrap();
+        seed_alert(&storage, "recent", now_epoch_millis()).unwrap();
+
+        let deleted = storage.prune_alerts_older_than_days(90).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert_eq!(storage.event_count().unwrap(), 1);
+        assert_eq!(storage.alert_group_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn custom_retention_drops_old_alerts_and_dependents() {
+        let storage = Storage::open(":memory:").unwrap();
+        let now = now_epoch_millis();
+        let old = now - 3 * 24 * 60 * 60 * 1_000;
+        let recent = now - 12 * 60 * 60 * 1_000;
+
+        let old_group_id = seed_alert(&storage, "old", old).unwrap();
+        storage
+            .add_advisory(Some(old_group_id), "test", "note", "drop me")
+            .unwrap();
+        seed_alert(&storage, "recent", recent).unwrap();
+
+        let deleted = storage.prune_alerts_older_than_days(1).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(storage.event_count().unwrap(), 1);
+        assert_eq!(storage.alert_group_count().unwrap(), 1);
+        assert_eq!(storage.delivery_statuses().unwrap().len(), 1);
+        assert_eq!(storage.advisory_count().unwrap(), 0);
+        assert_eq!(
+            storage.list_alert_groups().unwrap()[0].fingerprint,
+            "recent"
+        );
+    }
+
+    #[test]
+    fn retention_recalculates_group_event_count_after_partial_prune() {
+        let storage = Storage::open(":memory:").unwrap();
+        let now = now_epoch_millis();
+        let old = now - 3 * 24 * 60 * 60 * 1_000;
+        let recent = now - 12 * 60 * 60 * 1_000;
+
+        seed_alert(&storage, "shared", old).unwrap();
+        seed_alert(&storage, "shared", recent).unwrap();
+
+        let deleted = storage.prune_alerts_older_than_days(1).unwrap();
+
+        assert_eq!(deleted, 1);
+        let groups = storage.list_alert_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].event_count, 1);
+        assert_eq!(groups[0].first_event_at, recent);
+        assert_eq!(groups[0].last_event_at, recent);
+    }
+
+    fn seed_alert(storage: &Storage, fingerprint: &str, created_at: i64) -> anyhow::Result<i64> {
+        let event = AlertEvent {
+            event_id: format!("event-{fingerprint}-{created_at}"),
+            integration: "test".to_string(),
+            source: "test".to_string(),
+            received_at: None,
+            status: "firing".to_string(),
+            severity: "warning".to_string(),
+            title: format!("Alert {fingerprint}"),
+            body: None,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            links: Vec::<AlertLink>::new(),
+            starts_at: None,
+            ends_at: None,
+            fingerprint: fingerprint.to_string(),
+            raw_payload: serde_json::json!({ "fingerprint": fingerprint }),
+        };
+        let event_id = storage.store_event(&event)?;
+        storage.queue_delivery(
+            event_id,
+            &Delivery {
+                route_name: "default".to_string(),
+                receiver: "chat".to_string(),
+                escalation_policy: None,
+            },
+        )?;
+
+        let conn = storage.conn.lock().unwrap();
+        let group_id: i64 = conn.query_row(
+            "SELECT alert_group_id FROM alert_events WHERE id = ?1",
+            params![event_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE alert_events SET created_at = ?2 WHERE id = ?1",
+            params![event_id, created_at],
+        )?;
+        conn.execute(
+            r#"
+            UPDATE alert_groups
+            SET first_event_at = (
+                    SELECT MIN(created_at)
+                    FROM alert_events
+                    WHERE alert_group_id = ?1
+                ),
+                last_event_at = (
+                    SELECT MAX(created_at)
+                    FROM alert_events
+                    WHERE alert_group_id = ?1
+                ),
+                updated_at = (
+                    SELECT MAX(created_at)
+                    FROM alert_events
+                    WHERE alert_group_id = ?1
+                )
+            WHERE id = ?1
+            "#,
+            params![group_id],
+        )?;
+        Ok(group_id)
+    }
 }

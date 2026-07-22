@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info, warn};
@@ -160,6 +160,7 @@ struct PendingAggregation {
     delivery: Delivery,
     alerts: Vec<SigNozAlert>,
     debug_enabled: bool,
+    completions: Vec<oneshot::Sender<Result<(), String>>>,
 }
 
 impl AlertAggregator {
@@ -178,7 +179,7 @@ impl AlertAggregator {
         alert: SigNozAlert,
         delivery: Delivery,
         debug_enabled: bool,
-    ) -> Result<(), WebhookError> {
+    ) -> Result<(), String> {
         let Some(rule_id) = alert
             .rule_id()
             .filter(|rule_id| self.enabled && !rule_id.is_empty())
@@ -189,7 +190,8 @@ impl AlertAggregator {
             });
             self.google_chat
                 .send(receiver, &alert, &delivery, debug)
-                .await?;
+                .await
+                .map_err(redacted_delivery_error)?;
             return Ok(());
         };
 
@@ -200,6 +202,7 @@ impl AlertAggregator {
             rule_id,
         };
         let mut should_spawn = false;
+        let (completion, delivered) = oneshot::channel();
 
         {
             use std::collections::btree_map::Entry;
@@ -212,12 +215,15 @@ impl AlertAggregator {
                         delivery,
                         alerts: vec![alert],
                         debug_enabled,
+                        completions: vec![completion],
                     });
                     should_spawn = true;
                 }
                 Entry::Occupied(mut entry) => {
                     let bucket = entry.get_mut();
                     bucket.alerts.push(alert);
+                    bucket.completions.push(completion);
+                    bucket.debug_enabled |= debug_enabled;
                 }
             }
         }
@@ -229,7 +235,9 @@ impl AlertAggregator {
             });
         }
 
-        Ok(())
+        delivered
+            .await
+            .unwrap_or_else(|_| Err("grouped alert delivery canceled".to_string()))
     }
 
     async fn flush_after(&self, key: AggregationKey) {
@@ -239,8 +247,12 @@ impl AlertAggregator {
             return;
         };
 
-        if let Err(error) = self.flush_bucket(&bucket).await {
+        let result = self.flush_bucket(&bucket).await;
+        if let Err(error) = &result {
             error!(%error, "grouped alert delivery failed");
+        }
+        for completion in bucket.completions {
+            let _ = completion.send(result.clone());
         }
     }
 
@@ -255,7 +267,7 @@ impl AlertAggregator {
         self.google_chat
             .send(&bucket.receiver, &alert, &bucket.delivery, debug)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(redacted_delivery_error)
     }
 }
 
@@ -321,8 +333,17 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     let management_concurrency = config.server.limits.management_concurrency;
     let google_chat = GoogleChatClient::new();
     let storage = Storage::open(&config.storage.path)?;
+    let pruned_alerts = storage.prune_alerts_older_than_days(config.storage.retention_days)?;
+    if pruned_alerts > 0 {
+        info!(
+            pruned_alerts,
+            retention_days = config.storage.retention_days,
+            "pruned alert records past retention period"
+        );
+    }
     storage.delete_expired_sessions()?;
     bootstrap_admin_user(&config, &storage)?;
+    start_retention_pruner(storage.clone(), config.storage.retention_days);
     let state = AppState {
         router: Arc::new(RouteEngine::new(config.as_ref().clone())?),
         aggregator: AlertAggregator::new(&config, google_chat),
@@ -382,6 +403,27 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(log_webhook_failures))
         .with_state(state))
+}
+
+fn start_retention_pruner(storage: Storage, retention_days: u64) {
+    tokio::spawn(async move {
+        let retention_interval = Duration::from_secs(24 * 60 * 60);
+        loop {
+            tokio::time::sleep(retention_interval).await;
+            match storage.prune_alerts_older_than_days(retention_days) {
+                Ok(pruned_alerts) if pruned_alerts > 0 => {
+                    info!(
+                        pruned_alerts,
+                        retention_days, "pruned alert records past retention period"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    error!(%error, retention_days, "failed to prune alert records");
+                }
+            }
+        }
+    });
 }
 
 async fn handle_overload(_error: BoxError) -> Response {
@@ -1183,7 +1225,6 @@ fn queue_signoz_google_chat_delivery(
                     aggregator
                         .enqueue_google_chat(&receiver, alert, delivery, debug_enabled)
                         .await
-                        .map_err(|error| error.to_string())
                 }
             })
             .await;
@@ -2801,6 +2842,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grouped_google_chat_delivery_dead_letters_when_flush_fails() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_rejecting_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.management.allow_unauthenticated = true;
+        config.alert_grouping.enabled = true;
+        config.alert_grouping.debounce_millis = 1;
+        config.delivery = DeliveryConfig {
+            max_attempts: 1,
+            initial_backoff_millis: 1,
+            max_backoff_millis: 1,
+        };
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_delivery_status(app.clone(), "dead_letter", 1).await;
+        wait_for_received_count(&received, 1).await;
+
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        assert_eq!(deliveries[0]["status"], "dead_letter");
+        assert_eq!(
+            deliveries[0]["last_error"],
+            "target rejected delivery with status 500 Internal Server Error"
+        );
+    }
+
+    #[tokio::test]
     async fn alert_group_api_tracks_repeated_and_resolved_events() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
@@ -3976,6 +4051,28 @@ mod tests {
         format!("http://{addr}/chat")
     }
 
+    async fn spawn_rejecting_mock_google_chat(received: Arc<Mutex<Vec<Value>>>) -> String {
+        let app =
+            Router::new()
+                .route(
+                    "/chat",
+                    post(
+                        |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                         Json(payload): Json<Value>| async move {
+                            received.lock().unwrap().push(payload);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        },
+                    ),
+                )
+                .with_state(received);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/chat")
+    }
+
     async fn wait_for_received_count(received: &Arc<Mutex<Vec<Value>>>, expected: usize) {
         for _ in 0..100 {
             if received.lock().unwrap().len() >= expected {
@@ -4019,6 +4116,21 @@ mod tests {
 
         let deliveries = get_api_json(app, "/api/deliveries").await;
         panic!("timed out waiting for {expected} succeeded deliveries: {deliveries}");
+    }
+
+    async fn wait_for_delivery_status(app: Router, status: &str, expected: usize) {
+        for _ in 0..100 {
+            let deliveries = get_api_json(app.clone(), "/api/deliveries").await;
+            if deliveries.as_array().is_some_and(|records| {
+                records.len() == expected && records.iter().all(|record| record["status"] == status)
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        panic!("timed out waiting for {expected} {status} deliveries: {deliveries}");
     }
 
     fn find_record<'a>(records: &'a Value, field: &str, expected: &str) -> &'a Value {
@@ -4200,6 +4312,7 @@ mod tests {
             storage: StorageConfig {
                 r#type: "sqlite".to_string(),
                 path: ":memory:".to_string(),
+                retention_days: 90,
             },
             delivery: DeliveryConfig {
                 max_attempts: 3,
