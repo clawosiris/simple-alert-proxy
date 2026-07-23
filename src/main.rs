@@ -3185,6 +3185,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alert_events_api_redacts_sensitive_raw_payload_fields() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.integrations = generic_test_integrations();
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "risk": { "level": "high" },
+                "finding": {
+                    "id": "api-redaction-1",
+                    "title": "API redaction alert",
+                    "description": "api",
+                    "plugin": "test"
+                },
+                "asset": {
+                    "service": "checkout",
+                    "host": "checkout-1"
+                },
+                "metadata": {
+                    "api_key": "key-123",
+                    "Authorization": "Bearer token-123",
+                    "normal": "kept"
+                }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let events = get_api_json(app, "/api/alert-events").await;
+        let event = find_record(&events, "fingerprint", "api-redaction-1");
+
+        assert_eq!(event["raw_payload"]["metadata"]["api_key"], "[redacted]");
+        assert_eq!(
+            event["raw_payload"]["metadata"]["Authorization"],
+            "[redacted]"
+        );
+        assert_eq!(event["raw_payload"]["metadata"]["normal"], "kept");
+        assert_eq!(event["raw_payload"]["asset"]["service"], "checkout");
+        assert_eq!(event["raw_payload"]["asset"]["host"], "checkout-1");
+    }
+
+    #[tokio::test]
     async fn generic_webhook_receiver_gets_canonical_event_payload() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;

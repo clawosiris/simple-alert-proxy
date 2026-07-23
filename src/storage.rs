@@ -9,7 +9,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::{alert::AlertEvent, routing::Delivery};
+use crate::{alert::AlertEvent, redaction, routing::Delivery};
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -1199,6 +1199,10 @@ fn alert_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertGroupR
 }
 
 fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventRecord> {
+    let raw_payload = serde_json::from_str(&row.get::<_, String>(9)?)
+        .map(|payload| redaction::redact_json_value(&payload))
+        .unwrap_or(serde_json::Value::Null);
+
     Ok(AlertEventRecord {
         id: row.get(0)?,
         alert_group_id: row.get(1)?,
@@ -1209,8 +1213,7 @@ fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventR
         severity: row.get(6)?,
         title: row.get(7)?,
         fingerprint: row.get(8)?,
-        raw_payload: serde_json::from_str(&row.get::<_, String>(9)?)
-            .unwrap_or(serde_json::Value::Null),
+        raw_payload,
         created_at: row.get(10)?,
     })
 }
