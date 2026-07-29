@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::Path,
     sync::{Arc, Mutex},
@@ -473,14 +474,19 @@ impl Storage {
     }
 
     #[cfg(test)]
-    pub fn replay_delivery(&self, delivery_id: i64) -> anyhow::Result<()> {
+    pub fn replay_delivery(&self, delivery_id: i64) -> anyhow::Result<DeliveryReplayRecord> {
         self.replay_delivery_as(delivery_id, AuditActor::default())
     }
 
-    pub fn replay_delivery_as(&self, delivery_id: i64, actor: AuditActor) -> anyhow::Result<()> {
+    pub fn replay_delivery_as(
+        &self,
+        delivery_id: i64,
+        actor: AuditActor,
+    ) -> anyhow::Result<DeliveryReplayRecord> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
         update_delivery_exists(&conn, delivery_id)?;
+        let replay = delivery_replay_record(&conn, delivery_id)?;
         conn.execute(
             r#"
             UPDATE delivery_records
@@ -493,7 +499,7 @@ impl Storage {
             params![delivery_id, now],
         )?;
         insert_audit(&conn, None, Some(delivery_id), &actor, "replay", None, now)?;
-        Ok(())
+        Ok(replay)
     }
 
     #[cfg(test)]
@@ -1006,6 +1012,12 @@ pub struct DeliveryRecord {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct DeliveryReplayRecord {
+    pub event: AlertEvent,
+    pub delivery: Delivery,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AdvisoryRecord {
     pub id: i64,
@@ -1231,6 +1243,97 @@ fn delivery_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Deliver
         response_summary: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+    })
+}
+
+fn delivery_replay_record(
+    conn: &Connection,
+    delivery_id: i64,
+) -> anyhow::Result<DeliveryReplayRecord> {
+    let (
+        event_id,
+        integration,
+        source,
+        status,
+        severity,
+        title,
+        fingerprint,
+        raw_payload,
+        target,
+        request_summary,
+    ): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn.query_row(
+        r#"
+        SELECT alert_events.event_id, alert_events.integration, alert_events.source,
+               alert_events.status, alert_events.severity, alert_events.title,
+               alert_events.fingerprint, alert_events.raw_payload,
+               delivery_records.target, delivery_records.request_summary
+        FROM delivery_records
+        JOIN alert_events ON alert_events.id = delivery_records.alert_event_id
+        WHERE delivery_records.id = ?1
+        "#,
+        params![delivery_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        },
+    )?;
+    let request_summary = serde_json::from_str::<serde_json::Value>(&request_summary)
+        .unwrap_or(serde_json::Value::Null);
+    let route_name = request_summary
+        .get("route")
+        .and_then(|value| value.as_str())
+        .unwrap_or("replay")
+        .to_string();
+    let receiver = request_summary
+        .get("receiver")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| target.clone());
+
+    Ok(DeliveryReplayRecord {
+        event: AlertEvent {
+            event_id,
+            integration,
+            source,
+            received_at: None,
+            status,
+            severity,
+            title,
+            body: None,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            links: Vec::new(),
+            starts_at: None,
+            ends_at: None,
+            fingerprint,
+            raw_payload: serde_json::from_str(&raw_payload).unwrap_or(serde_json::Value::Null),
+        },
+        delivery: Delivery {
+            route_name,
+            receiver,
+            escalation_policy: None,
+        },
     })
 }
 

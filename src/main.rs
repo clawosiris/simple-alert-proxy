@@ -968,7 +968,8 @@ async fn replay_delivery(
     require_csrf(&principal, &headers)?;
     state
         .storage
-        .replay_delivery_as(id, principal.audit_actor())?;
+        .replay_delivery_as(id, principal.audit_actor())
+        .and_then(|replay| spawn_replayed_delivery(&state, id, replay.event, replay.delivery))?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -1250,6 +1251,49 @@ fn queue_target_event_delivery(
     let target_client = state.aggregator.google_chat.clone();
     let receiver = receiver.clone();
     let event = event.clone();
+
+    tokio::spawn(async move {
+        worker
+            .run(delivery_id, move |debug_enabled| {
+                let target_client = target_client.clone();
+                let receiver = receiver.clone();
+                let event = event.clone();
+                let delivery = delivery.clone();
+                async move {
+                    let debug = debug_enabled.then_some(DebugDeliveryLog {
+                        route_name: delivery.route_name.as_str(),
+                        receiver_name: delivery.receiver.as_str(),
+                    });
+                    target_client
+                        .send_receiver_event(&receiver, &event, &delivery, debug)
+                        .await
+                        .map_err(redacted_delivery_error)
+                }
+            })
+            .await;
+    });
+
+    Ok(())
+}
+
+fn spawn_replayed_delivery(
+    state: &AppState,
+    delivery_id: i64,
+    event: AlertEvent,
+    delivery: Delivery,
+) -> anyhow::Result<()> {
+    let receiver = state
+        .config
+        .receivers
+        .get(&delivery.receiver)
+        .with_context(|| format!("replay receiver {} is not configured", delivery.receiver))?
+        .clone();
+    let worker = DeliveryWorker::new(
+        state.storage.clone(),
+        state.config.delivery.clone(),
+        state.config.debug.log_alerts,
+    );
+    let target_client = state.aggregator.google_chat.clone();
 
     tokio::spawn(async move {
         worker
@@ -2967,6 +3011,49 @@ mod tests {
             storage.audit_actions().unwrap(),
             vec!["acknowledge", "silence", "resolve", "replay"]
         );
+    }
+
+    #[tokio::test]
+    async fn replay_delivery_resends_stored_event_to_receiver() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&webhook_url);
+        config.server.auth = None;
+        config.management.allow_unauthenticated = true;
+        config.routing.routes = Vec::new();
+        config.routing.default_receiver = Some("critical-chat".to_string());
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/signoz")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(include_str!("../examples/signoz-webhook.json")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+
+        let deliveries = get_api_json(app.clone(), "/api/deliveries").await;
+        let delivery_id = deliveries[0]["id"].as_i64().unwrap();
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/deliveries/{delivery_id}/replay"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 2).await;
     }
 
     #[test]
