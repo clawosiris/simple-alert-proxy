@@ -49,3 +49,7 @@
 
 - Continued interrupted issue #45 implementation: configurable SQLite alert retention defaulting to 90 days, startup/daily pruning, dependency cleanup, docs/config examples, and tests.
 - Started release `v0.0.10`: bumped Cargo/README version references after PR #46 configurable retention landed on `main`.
+
+2026-07-23
+
+- Started issue #56 on `fix/issue-56`: redact `raw_payload` values returned by the alert-events management API while preserving stored raw payloads, plus focused API regression coverage.
