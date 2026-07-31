@@ -668,6 +668,8 @@ pub struct RoutingConfig {
 pub struct RouteConfig {
     pub name: String,
     pub receiver: String,
+    #[serde(default, alias = "team")]
+    pub owner_team: Option<String>,
     pub escalation_policy: Option<String>,
     #[serde(default)]
     pub continue_matching: bool,
@@ -693,9 +695,23 @@ pub enum ReceiverConfig {
     Discord(ChatWebhookReceiverConfig),
 }
 
+impl ReceiverConfig {
+    pub fn owner_team(&self) -> Option<&str> {
+        match self {
+            Self::GoogleChat(receiver) => receiver.owner_team.as_deref(),
+            Self::GenericWebhook(receiver) => receiver.owner_team.as_deref(),
+            Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
+                receiver.owner_team.as_deref()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GoogleChatReceiverConfig {
     pub webhook_url: String,
+    #[serde(default, alias = "team")]
+    pub owner_team: Option<String>,
     #[serde(default = "default_title_template")]
     pub title_template: String,
     #[serde(default = "default_timeout_secs")]
@@ -705,6 +721,8 @@ pub struct GoogleChatReceiverConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenericWebhookReceiverConfig {
     pub webhook_url: String,
+    #[serde(default, alias = "team")]
+    pub owner_team: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -712,6 +730,8 @@ pub struct GenericWebhookReceiverConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatWebhookReceiverConfig {
     pub webhook_url: String,
+    #[serde(default, alias = "team")]
+    pub owner_team: Option<String>,
     #[serde(default = "default_title_template")]
     pub title_template: String,
     #[serde(default = "default_timeout_secs")]
@@ -926,6 +946,7 @@ mod tests {
                 "default".to_string(),
                 ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                     webhook_url: "https://chat.googleapis.test/default".to_string(),
+                    owner_team: None,
                     title_template: "[{{status}}] {{alertname}}".to_string(),
                     timeout_secs: 10,
                 }),
@@ -1074,6 +1095,7 @@ mod tests {
                 "default".to_string(),
                 ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                     webhook_url: "https://chat.example.test/hook".to_string(),
+                    owner_team: None,
                     title_template: default_title_template(),
                     timeout_secs: default_timeout_secs(),
                 }),

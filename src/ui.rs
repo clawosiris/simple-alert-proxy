@@ -161,6 +161,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     <section>
       <div class="section-head">
         <h2>Alert Groups</h2>
+        <select id="team-filter"></select>
         <span id="count" class="muted"></span>
       </div>
       <div class="table-wrap">
@@ -171,6 +172,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
               <th>Severity</th>
               <th>Title</th>
               <th>Source</th>
+              <th>Team</th>
               <th>Events</th>
               <th>Last Event</th>
               <th>Ack</th>
@@ -200,7 +202,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     const state = {
       me: null, groups: [], events: [], deliveries: [], advisories: [],
       routes: [], integrations: [], users: [], teams: [], memberships: [],
-      selected: null
+      selected: null, teamFilter: "all"
     };
     const $ = (id) => document.getElementById(id);
     const authHeaders = () => {
@@ -231,6 +233,9 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
     })[ch]);
     const canAdmin = () => state.me?.role === "admin";
     const canOperate = () => ["admin", "operator"].includes(state.me?.role);
+    const canOperateGroup = (group) => canOperate() || state.memberships.some((membership) =>
+      membership.team_id === group.team_id && ["owner", "operator"].includes(membership.team_role)
+    );
 
     async function load() {
       $("token").value = sessionStorage.getItem(TOKEN_KEY) || "";
@@ -256,13 +261,25 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
         ? `${state.me.user.display_name} (${state.me.role})`
         : state.me.auth_kind;
       $("access-state").textContent = state.me.auth_kind;
-      $("count").textContent = `${state.groups.length} groups`;
-      $("groups").innerHTML = state.groups.map((group) => `
+      const teamFilter = $("team-filter");
+      const teamOptions = [`<option value="all">All teams</option>`, `<option value="unowned">Unowned</option>`]
+        .concat(state.teams.map((team) => `<option value="${team.id}">${esc(team.name)}</option>`));
+      teamFilter.innerHTML = teamOptions.join("");
+      teamFilter.value = state.teamFilter;
+      teamFilter.onchange = () => { state.teamFilter = teamFilter.value; render(); };
+      const visibleGroups = state.groups.filter((group) => {
+        if (state.teamFilter === "all") return true;
+        if (state.teamFilter === "unowned") return !group.team_id;
+        return String(group.team_id) === state.teamFilter;
+      });
+      $("count").textContent = `${visibleGroups.length} groups`;
+      $("groups").innerHTML = visibleGroups.map((group) => `
         <tr data-id="${group.id}" data-selected="${group.id === state.selected}">
           <td><span class="pill ${esc(group.status)}">${esc(group.status)}</span></td>
           <td class="${esc(group.severity)}">${esc(group.severity)}</td>
           <td>${esc(group.title)}<div class="muted">${esc(group.fingerprint)}</div></td>
           <td>${esc(group.source)}<div class="muted">${esc(group.integration)}</div></td>
+          <td>${group.team_name ? `<span class="pill">${esc(group.team_name)}</span>` : `<span class="muted">Unowned</span>`}</td>
           <td>${group.event_count}</td>
           <td>${esc(fmtTime(group.last_event_at))}</td>
           <td>${group.acknowledged_at ? esc(fmtTime(group.acknowledged_at)) : ""}</td>
@@ -289,15 +306,16 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
       const latest = events[0];
       $("detail").innerHTML = `
         <div class="actions">
-          <button data-action="ack" ${canOperate() ? "" : "disabled"}>Ack</button>
-          <button data-action="resolve" ${canOperate() ? "" : "disabled"}>Resolve</button>
-          <button data-action="silence" ${canOperate() ? "" : "disabled"}>Silence</button>
+          <button data-action="ack" ${canOperateGroup(group) ? "" : "disabled"}>Ack</button>
+          <button data-action="resolve" ${canOperateGroup(group) ? "" : "disabled"}>Resolve</button>
+          <button data-action="silence" ${canOperateGroup(group) ? "" : "disabled"}>Silence</button>
         </div>
         <div class="kv">
           <div>Status</div><div>${esc(group.status)}</div>
           <div>Severity</div><div>${esc(group.severity)}</div>
           <div>Title</div><div>${esc(group.title)}</div>
           <div>Source</div><div>${esc(group.source)} / ${esc(group.integration)}</div>
+          <div>Team</div><div>${group.team_name ? esc(group.team_name) : "Unowned"}</div>
           <div>Fingerprint</div><div>${esc(group.fingerprint)}</div>
           <div>Events</div><div>${group.event_count}</div>
         </div>
@@ -319,7 +337,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
               <span class="pill">${esc(delivery.status)}</span>
               <span class="muted">attempts ${delivery.attempt_count}</span>
               ${delivery.last_error ? `<div>${esc(delivery.last_error)}</div>` : ""}
-              <div class="actions"><button data-replay="${delivery.id}" ${canOperate() ? "" : "disabled"}>Replay</button></div>
+              <div class="actions"><button data-replay="${delivery.id}" ${canOperateGroup(group) ? "" : "disabled"}>Replay</button></div>
             </div>
           `).join("") || `<div class="muted">No deliveries.</div>`}
         </div>
@@ -327,6 +345,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
           <h2>Route Explanation</h2>
           ${state.routes.map((route) => `
             <div class="item">${esc(route.name)} -> ${esc(route.receiver)}
+              ${route.owner_team ? `<span class="pill">${esc(route.owner_team)}</span>` : ""}
               <span class="muted">${route.matcher_count} matchers</span>
             </div>
           `).join("")}
@@ -371,6 +390,7 @@ pub const OPERATOR_UI: &str = r##"<!doctype html>
               <input id="new-password" type="password" placeholder="Password">
               <select id="new-role">
                 <option value="viewer">Viewer</option>
+                <option value="scoped">Scoped</option>
                 <option value="operator">Operator</option>
                 <option value="admin">Admin</option>
               </select>

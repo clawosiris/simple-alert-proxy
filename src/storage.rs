@@ -71,6 +71,7 @@ impl Storage {
             CREATE TABLE IF NOT EXISTS alert_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fingerprint TEXT NOT NULL UNIQUE,
+                team_id INTEGER,
                 integration TEXT NOT NULL,
                 source TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -81,7 +82,8 @@ impl Storage {
                 silenced_until INTEGER,
                 first_event_at INTEGER NOT NULL,
                 last_event_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(team_id) REFERENCES teams(id)
             );
 
             CREATE TABLE IF NOT EXISTS delivery_records (
@@ -174,17 +176,31 @@ impl Storage {
             "#,
         )?;
         add_column_if_missing(&conn, "alert_events", "alert_group_id INTEGER")?;
+        add_column_if_missing(&conn, "alert_groups", "team_id INTEGER")?;
         add_column_if_missing(&conn, "audit_entries", "actor_user_id INTEGER")?;
         add_column_if_missing(&conn, "audit_entries", "actor_display_name TEXT")?;
         add_column_if_missing(&conn, "audit_entries", "actor_team_id INTEGER")?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn store_event(&self, event: &AlertEvent) -> anyhow::Result<i64> {
+        self.store_event_with_team(event, None)
+    }
+
+    pub fn store_event_with_team(
+        &self,
+        event: &AlertEvent,
+        owner_team: Option<&str>,
+    ) -> anyhow::Result<i64> {
         let raw_payload = serde_json::to_string(&event.raw_payload)?;
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
-        let alert_group_id = upsert_alert_group(&conn, event, now)?;
+        let team_id = owner_team
+            .map(|team| team_id_by_name(&conn, team))
+            .transpose()?
+            .flatten();
+        let alert_group_id = upsert_alert_group(&conn, event, team_id, now)?;
         conn.execute(
             r#"
             INSERT INTO alert_events (
@@ -344,17 +360,34 @@ impl Storage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, fingerprint, integration, source, status, severity, title,
+            SELECT alert_groups.id, fingerprint, team_id, teams.name,
+                   integration, source, status, severity, title,
                    event_count, acknowledged_at, silenced_until,
-                   first_event_at, last_event_at, updated_at
+                   first_event_at, last_event_at, alert_groups.updated_at
             FROM alert_groups
-            ORDER BY last_event_at DESC, id DESC
+            LEFT JOIN teams ON teams.id = alert_groups.team_id
+            ORDER BY last_event_at DESC, alert_groups.id DESC
             "#,
         )?;
         let records = stmt
             .query_map([], alert_group_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    pub fn list_alert_groups_for_teams(
+        &self,
+        team_ids: &[i64],
+    ) -> anyhow::Result<Vec<AlertGroupRecord>> {
+        let records = self.list_alert_groups()?;
+        Ok(records
+            .into_iter()
+            .filter(|group| {
+                group
+                    .team_id
+                    .is_none_or(|team_id| team_ids.contains(&team_id))
+            })
+            .collect())
     }
 
     pub fn list_alert_events(&self) -> anyhow::Result<Vec<AlertEventRecord>> {
@@ -374,14 +407,32 @@ impl Storage {
         Ok(records)
     }
 
+    pub fn list_alert_events_for_groups(
+        &self,
+        alert_group_ids: &[i64],
+    ) -> anyhow::Result<Vec<AlertEventRecord>> {
+        let records = self.list_alert_events()?;
+        Ok(records
+            .into_iter()
+            .filter(|event| {
+                event
+                    .alert_group_id
+                    .is_none_or(|group_id| alert_group_ids.contains(&group_id))
+            })
+            .collect())
+    }
+
     pub fn list_deliveries(&self) -> anyhow::Result<Vec<DeliveryRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, alert_event_id, target, status, attempt_count, next_retry_at,
-                   last_error, request_summary, response_summary, created_at, updated_at
+            SELECT delivery_records.id, alert_event_id, alert_events.alert_group_id,
+                   target, delivery_records.status, attempt_count, next_retry_at,
+                   last_error, request_summary, response_summary,
+                   delivery_records.created_at, delivery_records.updated_at
             FROM delivery_records
-            ORDER BY updated_at DESC, id DESC
+            JOIN alert_events ON alert_events.id = delivery_records.alert_event_id
+            ORDER BY delivery_records.updated_at DESC, delivery_records.id DESC
             LIMIT 500
             "#,
         )?;
@@ -389,6 +440,21 @@ impl Storage {
             .query_map([], delivery_record_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    pub fn list_deliveries_for_groups(
+        &self,
+        alert_group_ids: &[i64],
+    ) -> anyhow::Result<Vec<DeliveryRecord>> {
+        let records = self.list_deliveries()?;
+        Ok(records
+            .into_iter()
+            .filter(|delivery| {
+                delivery
+                    .alert_group_id
+                    .is_none_or(|group_id| alert_group_ids.contains(&group_id))
+            })
+            .collect())
     }
 
     #[cfg(test)]
@@ -538,6 +604,21 @@ impl Storage {
             .query_map([], advisory_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    pub fn list_advisories_for_groups(
+        &self,
+        alert_group_ids: &[i64],
+    ) -> anyhow::Result<Vec<AdvisoryRecord>> {
+        let records = self.list_advisories()?;
+        Ok(records
+            .into_iter()
+            .filter(|advisory| {
+                advisory
+                    .alert_group_id
+                    .is_none_or(|group_id| alert_group_ids.contains(&group_id))
+            })
+            .collect())
     }
 
     pub fn user_count(&self) -> anyhow::Result<usize> {
@@ -827,6 +908,29 @@ impl Storage {
         Ok(records)
     }
 
+    pub fn list_team_memberships_for_user(
+        &self,
+        user_id: i64,
+    ) -> anyhow::Result<Vec<TeamMembershipRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT team_memberships.user_id, users.username,
+                   team_memberships.team_id, teams.name,
+                   team_memberships.team_role, team_memberships.created_at
+            FROM team_memberships
+            JOIN users ON users.id = team_memberships.user_id
+            JOIN teams ON teams.id = team_memberships.team_id
+            WHERE team_memberships.user_id = ?1
+            ORDER BY teams.name
+            "#,
+        )?;
+        let records = stmt
+            .query_map(params![user_id], team_membership_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
     pub fn set_team_membership(
         &self,
         team_id: i64,
@@ -869,6 +973,32 @@ impl Storage {
             params![user_id, team_id],
         )?;
         Ok(())
+    }
+
+    pub fn alert_group_team_id(&self, alert_group_id: i64) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT team_id FROM alert_groups WHERE id = ?1",
+            params![alert_group_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    pub fn delivery_alert_group_team_id(&self, delivery_id: i64) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            r#"
+            SELECT alert_groups.team_id
+            FROM delivery_records
+            JOIN alert_events ON alert_events.id = delivery_records.alert_event_id
+            LEFT JOIN alert_groups ON alert_groups.id = alert_events.alert_group_id
+            WHERE delivery_records.id = ?1
+            "#,
+            params![delivery_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -969,6 +1099,8 @@ pub fn now_epoch_millis() -> i64 {
 pub struct AlertGroupRecord {
     pub id: i64,
     pub fingerprint: String,
+    pub team_id: Option<i64>,
+    pub team_name: Option<String>,
     pub integration: String,
     pub source: String,
     pub status: String,
@@ -1001,6 +1133,7 @@ pub struct AlertEventRecord {
 pub struct DeliveryRecord {
     pub id: i64,
     pub alert_event_id: i64,
+    pub alert_group_id: Option<i64>,
     pub target: String,
     pub status: String,
     pub attempt_count: u32,
@@ -1120,7 +1253,12 @@ pub struct AuditActor {
     pub team_id: Option<i64>,
 }
 
-fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow::Result<i64> {
+fn upsert_alert_group(
+    conn: &Connection,
+    event: &AlertEvent,
+    team_id: Option<i64>,
+    now: i64,
+) -> anyhow::Result<i64> {
     let existing = conn
         .query_row(
             "SELECT id, status FROM alert_groups WHERE fingerprint = ?1",
@@ -1146,11 +1284,12 @@ fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow
                     event_count = event_count + 1,
                     acknowledged_at = NULL,
                     silenced_until = NULL,
-                    last_event_at = ?5,
-                    updated_at = ?5
+                    team_id = COALESCE(team_id, ?5),
+                    last_event_at = ?6,
+                    updated_at = ?6
                 WHERE id = ?1
                 "#,
-                params![id, group_status, event.severity, event.title, now],
+                params![id, group_status, event.severity, event.title, team_id, now],
             )?;
         } else {
             conn.execute(
@@ -1160,11 +1299,12 @@ fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow
                     severity = ?3,
                     title = ?4,
                     event_count = event_count + 1,
-                    last_event_at = ?5,
-                    updated_at = ?5
+                    team_id = COALESCE(team_id, ?5),
+                    last_event_at = ?6,
+                    updated_at = ?6
                 WHERE id = ?1
                 "#,
-                params![id, group_status, event.severity, event.title, now],
+                params![id, group_status, event.severity, event.title, team_id, now],
             )?;
         }
         return Ok(id);
@@ -1173,14 +1313,15 @@ fn upsert_alert_group(conn: &Connection, event: &AlertEvent, now: i64) -> anyhow
     conn.execute(
         r#"
         INSERT INTO alert_groups (
-            fingerprint, integration, source, status, severity, title,
+            fingerprint, team_id, integration, source, status, severity, title,
             event_count, acknowledged_at, silenced_until,
             first_event_at, last_event_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, NULL, NULL, ?7, ?7, ?7)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, NULL, NULL, ?8, ?8, ?8)
         "#,
         params![
             event.fingerprint,
+            team_id,
             event.integration,
             event.source,
             group_status,
@@ -1196,17 +1337,19 @@ fn alert_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertGroupR
     Ok(AlertGroupRecord {
         id: row.get(0)?,
         fingerprint: row.get(1)?,
-        integration: row.get(2)?,
-        source: row.get(3)?,
-        status: row.get(4)?,
-        severity: row.get(5)?,
-        title: row.get(6)?,
-        event_count: row.get(7)?,
-        acknowledged_at: row.get(8)?,
-        silenced_until: row.get(9)?,
-        first_event_at: row.get(10)?,
-        last_event_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        team_id: row.get(2)?,
+        team_name: row.get(3)?,
+        integration: row.get(4)?,
+        source: row.get(5)?,
+        status: row.get(6)?,
+        severity: row.get(7)?,
+        title: row.get(8)?,
+        event_count: row.get(9)?,
+        acknowledged_at: row.get(10)?,
+        silenced_until: row.get(11)?,
+        first_event_at: row.get(12)?,
+        last_event_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -1234,15 +1377,16 @@ fn delivery_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Deliver
     Ok(DeliveryRecord {
         id: row.get(0)?,
         alert_event_id: row.get(1)?,
-        target: row.get(2)?,
-        status: row.get(3)?,
-        attempt_count: row.get(4)?,
-        next_retry_at: row.get(5)?,
-        last_error: row.get(6)?,
-        request_summary: row.get(7)?,
-        response_summary: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        alert_group_id: row.get(2)?,
+        target: row.get(3)?,
+        status: row.get(4)?,
+        attempt_count: row.get(5)?,
+        next_retry_at: row.get(6)?,
+        last_error: row.get(7)?,
+        request_summary: row.get(8)?,
+        response_summary: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -1332,6 +1476,7 @@ fn delivery_replay_record(
         delivery: Delivery {
             route_name,
             receiver,
+            owner_team: None,
             escalation_policy: None,
         },
     })
@@ -1411,6 +1556,21 @@ fn team_by_id(conn: &Connection, team_id: i64) -> anyhow::Result<TeamRecord> {
         params![team_id],
         team_from_row,
     )
+    .map_err(Into::into)
+}
+
+fn team_id_by_name(conn: &Connection, name: &str) -> anyhow::Result<Option<i64>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    conn.query_row(
+        "SELECT id FROM teams WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
     .map_err(Into::into)
 }
 
@@ -1523,8 +1683,8 @@ fn update_team_exists(conn: &Connection, team_id: i64) -> anyhow::Result<()> {
 
 fn validate_global_role(role: &str) -> anyhow::Result<()> {
     match role {
-        "admin" | "operator" | "viewer" => Ok(()),
-        _ => anyhow::bail!("global_role must be admin, operator, or viewer"),
+        "admin" | "operator" | "viewer" | "scoped" => Ok(()),
+        _ => anyhow::bail!("global_role must be admin, operator, viewer, or scoped"),
     }
 }
 
@@ -1782,6 +1942,7 @@ mod tests {
             &Delivery {
                 route_name: "default".to_string(),
                 receiver: "chat".to_string(),
+                owner_team: None,
                 escalation_policy: None,
             },
         )?;

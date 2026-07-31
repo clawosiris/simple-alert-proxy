@@ -13,6 +13,7 @@ pub struct DeliveryPlan {
 pub struct Delivery {
     pub route_name: String,
     pub receiver: String,
+    pub owner_team: Option<String>,
     pub escalation_policy: Option<String>,
 }
 
@@ -43,6 +44,7 @@ impl RouteEngine {
                 deliveries.push(Delivery {
                     route_name: route.name.clone(),
                     receiver: route.receiver.clone(),
+                    owner_team: route.owner_team.clone(),
                     escalation_policy: route.escalation_policy.clone(),
                 });
 
@@ -58,6 +60,7 @@ impl RouteEngine {
             deliveries.push(Delivery {
                 route_name: "default".to_string(),
                 receiver: receiver.clone(),
+                owner_team: None,
                 escalation_policy: None,
             });
         }
@@ -70,6 +73,7 @@ impl RouteEngine {
 struct CompiledRoute {
     name: String,
     receiver: String,
+    owner_team: Option<String>,
     escalation_policy: Option<String>,
     continue_matching: bool,
     matchers: Vec<CompiledMatcher>,
@@ -85,6 +89,7 @@ impl CompiledRoute {
         Ok(Self {
             name: route.name,
             receiver: route.receiver,
+            owner_team: route.owner_team,
             escalation_policy: route.escalation_policy,
             continue_matching: route.continue_matching,
             matchers,
@@ -216,6 +221,7 @@ mod tests {
                 routes: vec![RouteConfig {
                     name: "prod-critical".to_string(),
                     receiver: "prod".to_string(),
+                    owner_team: None,
                     escalation_policy: None,
                     continue_matching: false,
                     matchers: vec![MatcherConfig {
@@ -231,6 +237,7 @@ mod tests {
                     "prod".to_string(),
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "https://chat.googleapis.test/prod".to_string(),
+                        owner_team: None,
                         title_template: "[{{status}}] {{alertname}}".to_string(),
                         timeout_secs: 10,
                     }),
@@ -239,6 +246,7 @@ mod tests {
                     "default".to_string(),
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "https://chat.googleapis.test/default".to_string(),
+                        owner_team: None,
                         title_template: "[{{status}}] {{alertname}}".to_string(),
                         timeout_secs: 10,
                     }),
