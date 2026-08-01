@@ -186,7 +186,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AlertGroupingConfig, DebugConfig, DeliveryConfig, GoogleChatReceiverConfig,
-        ManagementConfig, ReceiverConfig, RoutingConfig, ServerLimitsConfig, StorageConfig,
+        ManagementConfig, ReceiverConfig, RoutingConfig, ScheduleConfig, ServerLimitsConfig,
+        StorageConfig,
     };
     use std::collections::BTreeMap;
 
@@ -210,6 +211,7 @@ mod tests {
             },
             delivery: DeliveryConfig::default(),
             escalation: crate::config::EscalationConfig::default(),
+            schedules: ScheduleConfig::default(),
             intelligence: crate::config::IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig {

@@ -2002,7 +2002,7 @@ mod tests {
         EscalationConfig, EscalationPolicyConfig, EscalationStepConfig,
         GenericJsonIntegrationConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
         IntegrationConfig, IntelligenceConfig, ManagementConfig, ReceiverConfig, RoutingConfig,
-        ServerConfig, ServerLimitsConfig, StorageConfig,
+        ScheduleConfig, ServerConfig, ServerLimitsConfig, StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -3442,7 +3442,8 @@ mod tests {
                 "primary".to_string(),
                 EscalationPolicyConfig {
                     steps: vec![EscalationStepConfig {
-                        receiver: "critical-chat".to_string(),
+                        receiver: Some("critical-chat".to_string()),
+                        schedule: None,
                         delay_millis: 1_000,
                         stop_on_ack: true,
                         stop_on_resolve: true,
@@ -4752,6 +4753,7 @@ mod tests {
                 max_backoff_millis: 1,
             },
             escalation: EscalationConfig::default(),
+            schedules: ScheduleConfig::default(),
             intelligence: IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig {
                 enabled: true,

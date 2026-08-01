@@ -304,7 +304,8 @@ Add delayed routing behavior that reacts to alert lifecycle state.
 - Routes can select an `escalation_policy`; accepted active alerts persist a
   scheduled escalation task for the first step.
 - Acknowledge and resolve actions cancel scheduled escalation tasks.
-- Static YAML is the initial schedule source, with external schedule systems
+- Static YAML on-call schedules are the initial schedule source, with entries
+  targeting exactly one receiver, user, or team. External schedule systems are
   intended to feed the same config shape.
 
 ### Acceptance
