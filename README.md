@@ -300,6 +300,7 @@ Receiver types:
 receivers:
   default-chat:
     type: "google_chat"
+    owner_team: "platform"
     webhook_url: "https://chat.googleapis.com/v1/spaces/example/messages?key=example&token=example"
 
   generic-webhook:
@@ -335,8 +336,14 @@ routing:
   routes:
     - name: "critical-production"
       receiver: "critical-chat"
+      owner_team: "platform"
       escalation_policy: "primary-on-duty"
 ```
+
+Routes and receivers can declare `owner_team` to scope alert groups to a team.
+Route ownership wins; receiver ownership is used as the fallback for default or
+otherwise unowned routes. The named team must exist in the management database
+before matching alerts are stored as team-owned.
 
 Optional intelligence is disabled by default. Advisory output is stored
 separately from canonical alert and lifecycle state:

@@ -495,12 +495,14 @@ mod tests {
         .unwrap();
         let receiver = GoogleChatReceiverConfig {
             webhook_url: "https://chat.googleapis.test/ops".to_string(),
+            owner_team: None,
             title_template: "[{{status}}] {{alertname}}".to_string(),
             timeout_secs: 10,
         };
         let delivery = Delivery {
             route_name: "ops".to_string(),
             receiver: "ops-chat".to_string(),
+            owner_team: None,
             escalation_policy: None,
         };
 
@@ -559,12 +561,14 @@ mod tests {
         .unwrap();
         let receiver = GoogleChatReceiverConfig {
             webhook_url: "https://chat.googleapis.test/ops".to_string(),
+            owner_team: None,
             title_template: "[{{status}}] {{alertname}}".to_string(),
             timeout_secs: 10,
         };
         let delivery = Delivery {
             route_name: "ops".to_string(),
             receiver: "ops-chat".to_string(),
+            owner_team: None,
             escalation_policy: None,
         };
 
@@ -601,12 +605,14 @@ mod tests {
             .insert("asset".to_string(), "edge-1".to_string());
         let receiver = GoogleChatReceiverConfig {
             webhook_url: "https://chat.googleapis.test/ops".to_string(),
+            owner_team: None,
             title_template: "[{{status}}] {{alertname}}".to_string(),
             timeout_secs: 10,
         };
         let delivery = Delivery {
             route_name: "ops".to_string(),
             receiver: "ops-chat".to_string(),
+            owner_team: None,
             escalation_policy: None,
         };
 

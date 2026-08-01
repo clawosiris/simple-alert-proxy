@@ -385,12 +385,20 @@ routing:
   routes:
     - name: "critical-prod"
       receiver: "critical-chat"
+      owner_team: "platform"
       matchers:
         - field: "label.severity"
           equals: "critical"
         - field: "label.environment"
           regex: "prod|production"
 ```
+
+Routes and receivers may set `owner_team` (or the short alias `team`) to bind
+matched alert groups to a management team. Route ownership takes precedence over
+receiver ownership. Unowned historical groups remain visible to authenticated
+readers; team-owned groups require global access or membership in the owning
+team, and lifecycle actions require global operator/admin access or a matching
+team `operator`/`owner` role.
 
 ## Receivers
 
@@ -401,6 +409,7 @@ webhooks, Slack, Mattermost, and Discord.
 receivers:
   critical-chat:
     type: google_chat
+    owner_team: "platform"
     webhook_url: "https://chat.googleapis.com/v1/spaces/..."
     title_template: "[{{status}}] {{alertname}}"
     timeout_secs: 10

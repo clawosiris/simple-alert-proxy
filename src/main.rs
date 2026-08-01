@@ -50,7 +50,10 @@ use crate::{
     integration::{GenericJsonIntegration, Integration, SigNozIntegration},
     routing::{Delivery, RouteEngine},
     signoz::SigNozAlert,
-    storage::{AuditActor, DisableUserOutcome, SessionUserRecord, Storage, UserRecord},
+    storage::{
+        AuditActor, DisableUserOutcome, SessionUserRecord, Storage, TeamMembershipRecord,
+        UserRecord,
+    },
 };
 
 const SESSION_COOKIE: &str = "sap_session";
@@ -750,7 +753,7 @@ async fn change_user_password(
     let password_hash = hash_password(&request.password)?;
     state
         .storage
-        .update_user_password(id, &password_hash, principal.audit_actor())?;
+        .update_user_password(id, &password_hash, principal.audit_actor(None))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -765,7 +768,10 @@ async fn disable_user(
         return Err(WebhookError::Forbidden);
     }
 
-    match state.storage.disable_user(id, principal.audit_actor())? {
+    match state
+        .storage
+        .disable_user(id, principal.audit_actor(None))?
+    {
         DisableUserOutcome::Disabled => Ok(StatusCode::NO_CONTENT),
         DisableUserOutcome::LastActiveAdmin => Err(WebhookError::Forbidden),
     }
@@ -775,7 +781,7 @@ async fn list_teams(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
+    require_read_management(&state, &headers)?;
     Ok(Json(state.storage.list_teams()?))
 }
 
@@ -796,7 +802,7 @@ async fn list_team_memberships(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
+    require_read_management(&state, &headers)?;
     Ok(Json(state.storage.list_team_memberships()?))
 }
 
@@ -829,39 +835,53 @@ async fn list_alert_groups(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
-    Ok(Json(state.storage.list_alert_groups()?))
+    let principal = require_read_management(&state, &headers)?;
+    Ok(Json(visible_alert_groups(&state, &principal)?))
 }
 
 async fn list_alert_events(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
-    Ok(Json(state.storage.list_alert_events()?))
+    let principal = require_read_management(&state, &headers)?;
+    if principal.can_read_everything() {
+        return Ok(Json(state.storage.list_alert_events()?));
+    }
+    let group_ids = visible_alert_group_ids(&state, &principal)?;
+    Ok(Json(
+        state.storage.list_alert_events_for_groups(&group_ids)?,
+    ))
 }
 
 async fn list_deliveries(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
-    Ok(Json(state.storage.list_deliveries()?))
+    let principal = require_read_management(&state, &headers)?;
+    if principal.can_read_everything() {
+        return Ok(Json(state.storage.list_deliveries()?));
+    }
+    let group_ids = visible_alert_group_ids(&state, &principal)?;
+    Ok(Json(state.storage.list_deliveries_for_groups(&group_ids)?))
 }
 
 async fn list_advisories(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
-    Ok(Json(state.storage.list_advisories()?))
+    let principal = require_read_management(&state, &headers)?;
+    if principal.can_read_everything() {
+        return Ok(Json(state.storage.list_advisories()?));
+    }
+    let group_ids = visible_alert_group_ids(&state, &principal)?;
+    Ok(Json(state.storage.list_advisories_for_groups(&group_ids)?))
 }
 
 async fn list_integrations(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
+    require_read_management(&state, &headers)?;
     let mut integrations = state
         .config
         .integrations
@@ -902,16 +922,21 @@ async fn list_routes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    require_management(&state, &headers, Permission::Read)?;
+    let principal = require_read_management(&state, &headers)?;
     let routes = state
         .config
         .routing
         .routes
         .iter()
+        .filter(|route| {
+            principal.can_read_everything()
+                || principal_can_read_team_name(&principal, route.owner_team.as_deref())
+        })
         .map(|route| {
             serde_json::json!({
                 "name": route.name,
                 "receiver": route.receiver,
+                "owner_team": route.owner_team,
                 "continue_matching": route.continue_matching,
                 "matcher_count": route.matchers.len(),
             })
@@ -925,11 +950,12 @@ async fn acknowledge_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    let principal = require_management(&state, &headers, Permission::Operate)?;
+    let principal = require_lifecycle_management(&state, &headers)?;
     require_csrf(&principal, &headers)?;
+    let team_id = require_group_operation(&state, &principal, id)?;
     state
         .storage
-        .acknowledge_group_as(id, principal.audit_actor())?;
+        .acknowledge_group_as(id, principal.audit_actor(team_id))?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -938,11 +964,12 @@ async fn resolve_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    let principal = require_management(&state, &headers, Permission::Operate)?;
+    let principal = require_lifecycle_management(&state, &headers)?;
     require_csrf(&principal, &headers)?;
+    let team_id = require_group_operation(&state, &principal, id)?;
     state
         .storage
-        .resolve_group_as(id, principal.audit_actor())?;
+        .resolve_group_as(id, principal.audit_actor(team_id))?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -951,11 +978,12 @@ async fn silence_group(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    let principal = require_management(&state, &headers, Permission::Operate)?;
+    let principal = require_lifecycle_management(&state, &headers)?;
     require_csrf(&principal, &headers)?;
+    let team_id = require_group_operation(&state, &principal, id)?;
     state
         .storage
-        .silence_group_as(id, principal.audit_actor())?;
+        .silence_group_as(id, principal.audit_actor(team_id))?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -964,11 +992,12 @@ async fn replay_delivery(
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, WebhookError> {
-    let principal = require_management(&state, &headers, Permission::Operate)?;
+    let principal = require_lifecycle_management(&state, &headers)?;
     require_csrf(&principal, &headers)?;
+    require_delivery_operation(&state, &principal, id)?;
     state
         .storage
-        .replay_delivery_as(id, principal.audit_actor())
+        .replay_delivery_as(id, principal.audit_actor(None))
         .and_then(|replay| spawn_replayed_delivery(&state, id, replay.event, replay.delivery))?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -1102,9 +1131,11 @@ fn process_signoz_alerts(
     for alert in &alerts {
         let event = alert.to_alert_event(name);
         let plan = state.router.plan(&event);
+        let deliveries = deliveries_with_receiver_ownership(state, plan.deliveries);
+        let owner_team = first_owner_team(&deliveries);
         let mut alert_event_id = None;
 
-        for delivery in &plan.deliveries {
+        for delivery in &deliveries {
             let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
                 error!(receiver = %delivery.receiver, "route selected missing receiver");
                 continue;
@@ -1112,7 +1143,9 @@ fn process_signoz_alerts(
             let event_id = match alert_event_id {
                 Some(event_id) => event_id,
                 None => {
-                    let event_id = state.storage.store_event(&event)?;
+                    let event_id = state
+                        .storage
+                        .store_event_with_team(&event, owner_team.as_deref())?;
                     alert_event_id = Some(event_id);
                     event_id
                 }
@@ -1164,9 +1197,11 @@ fn process_generic_events(
 
     for event in events {
         let plan = state.router.plan(event);
+        let deliveries = deliveries_with_receiver_ownership(state, plan.deliveries);
+        let owner_team = first_owner_team(&deliveries);
         let mut alert_event_id = None;
 
-        for delivery in &plan.deliveries {
+        for delivery in &deliveries {
             let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
                 error!(receiver = %delivery.receiver, "route selected missing receiver");
                 continue;
@@ -1174,7 +1209,9 @@ fn process_generic_events(
             let event_id = match alert_event_id {
                 Some(event_id) => event_id,
                 None => {
-                    let event_id = state.storage.store_event(event)?;
+                    let event_id = state
+                        .storage
+                        .store_event_with_team(event, owner_team.as_deref())?;
                     alert_event_id = Some(event_id);
                     event_id
                 }
@@ -1196,6 +1233,33 @@ fn process_generic_events(
         StatusCode::ACCEPTED,
         Json(delivery_summary(&delivered_receivers)),
     ))
+}
+
+fn deliveries_with_receiver_ownership(
+    state: &AppState,
+    deliveries: Vec<Delivery>,
+) -> Vec<Delivery> {
+    deliveries
+        .into_iter()
+        .map(|mut delivery| {
+            if delivery.owner_team.is_none() {
+                delivery.owner_team = state
+                    .config
+                    .receivers
+                    .get(&delivery.receiver)
+                    .and_then(ReceiverConfig::owner_team)
+                    .map(ToOwned::to_owned);
+            }
+            delivery
+        })
+        .collect()
+}
+
+fn first_owner_team(deliveries: &[Delivery]) -> Option<String> {
+    deliveries
+        .iter()
+        .find_map(|delivery| delivery.owner_team.as_ref())
+        .cloned()
 }
 
 fn queue_signoz_google_chat_delivery(
@@ -1455,6 +1519,7 @@ enum ManagementRole {
     Admin,
     Operator,
     Viewer,
+    Scoped,
 }
 
 impl ManagementRole {
@@ -1462,6 +1527,7 @@ impl ManagementRole {
         match value {
             "admin" => Self::Admin,
             "operator" => Self::Operator,
+            "scoped" => Self::Scoped,
             _ => Self::Viewer,
         }
     }
@@ -1471,6 +1537,7 @@ impl ManagementRole {
             Self::Admin => "admin",
             Self::Operator => "operator",
             Self::Viewer => "viewer",
+            Self::Scoped => "scoped",
         }
     }
 
@@ -1488,12 +1555,13 @@ impl ManagementRole {
 struct ManagementPrincipal {
     role: ManagementRole,
     user: Option<UserRecord>,
+    team_memberships: Vec<TeamMembershipRecord>,
     csrf_token: Option<String>,
     auth_kind: &'static str,
 }
 
 impl ManagementPrincipal {
-    fn audit_actor(&self) -> AuditActor {
+    fn audit_actor(&self, team_id: Option<i64>) -> AuditActor {
         let Some(user) = &self.user else {
             return AuditActor::default();
         };
@@ -1501,8 +1569,48 @@ impl ManagementPrincipal {
         AuditActor {
             user_id: Some(user.id),
             display_name: Some(user.display_name.clone()),
-            team_id: None,
+            team_id,
         }
+    }
+
+    fn can_read_everything(&self) -> bool {
+        self.role.allows(Permission::Read)
+    }
+
+    fn can_operate_everything(&self) -> bool {
+        self.role.allows(Permission::Operate)
+    }
+
+    fn can_operate_any_team(&self) -> bool {
+        self.team_memberships
+            .iter()
+            .any(|membership| matches!(membership.team_role.as_str(), "owner" | "operator"))
+    }
+
+    fn can_read_any_team(&self) -> bool {
+        !self.team_memberships.is_empty()
+    }
+
+    fn readable_team_ids(&self) -> Vec<i64> {
+        self.team_memberships
+            .iter()
+            .map(|membership| membership.team_id)
+            .collect()
+    }
+
+    fn can_operate_team(&self, team_id: Option<i64>) -> bool {
+        if self.can_operate_everything() {
+            return true;
+        }
+
+        let Some(team_id) = team_id else {
+            return false;
+        };
+
+        self.team_memberships.iter().any(|membership| {
+            membership.team_id == team_id
+                && matches!(membership.team_role.as_str(), "owner" | "operator")
+        })
     }
 }
 
@@ -1519,6 +1627,30 @@ fn require_management(
     }
 }
 
+fn require_lifecycle_management(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, WebhookError> {
+    let principal = authenticate_management(state, headers)?;
+    if principal.can_operate_everything() || principal.can_operate_any_team() {
+        Ok(principal)
+    } else {
+        Err(WebhookError::Forbidden)
+    }
+}
+
+fn require_read_management(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ManagementPrincipal, WebhookError> {
+    let principal = authenticate_management(state, headers)?;
+    if principal.can_read_everything() || principal.can_read_any_team() {
+        Ok(principal)
+    } else {
+        Err(WebhookError::Forbidden)
+    }
+}
+
 fn authenticate_management(
     state: &AppState,
     headers: &HeaderMap,
@@ -1527,6 +1659,7 @@ fn authenticate_management(
         return Ok(ManagementPrincipal {
             role: ManagementRole::Admin,
             user: None,
+            team_memberships: Vec::new(),
             csrf_token: None,
             auth_kind: "anonymous",
         });
@@ -1538,6 +1671,7 @@ fn authenticate_management(
         return Ok(ManagementPrincipal {
             role: ManagementRole::Admin,
             user: None,
+            team_memberships: Vec::new(),
             csrf_token: None,
             auth_kind: "bearer",
         });
@@ -1551,6 +1685,7 @@ fn authenticate_management(
         return Ok(ManagementPrincipal {
             role: ManagementRole::Admin,
             user: None,
+            team_memberships: Vec::new(),
             csrf_token: None,
             auth_kind: "legacy-loopback",
         });
@@ -1567,18 +1702,85 @@ fn authenticate_session(
         && let Some(token) = session_token_from_headers(headers)
         && let Some(session_user) = state.storage.session_user(&token_hash(&token))?
     {
-        return Ok(Some(principal_from_session_user(session_user)));
+        let memberships = state
+            .storage
+            .list_team_memberships_for_user(session_user.id)?;
+        return Ok(Some(principal_from_session_user(session_user, memberships)));
     }
 
     Ok(None)
 }
 
-fn principal_from_session_user(user: SessionUserRecord) -> ManagementPrincipal {
+fn principal_from_session_user(
+    user: SessionUserRecord,
+    team_memberships: Vec<TeamMembershipRecord>,
+) -> ManagementPrincipal {
     ManagementPrincipal {
         role: ManagementRole::from_str(&user.global_role),
         user: Some(user.public_record()),
+        team_memberships,
         csrf_token: Some(user.csrf_token),
         auth_kind: "session",
+    }
+}
+
+fn visible_alert_groups(
+    state: &AppState,
+    principal: &ManagementPrincipal,
+) -> anyhow::Result<Vec<storage::AlertGroupRecord>> {
+    if principal.can_read_everything() {
+        return state.storage.list_alert_groups();
+    }
+
+    state
+        .storage
+        .list_alert_groups_for_teams(&principal.readable_team_ids())
+}
+
+fn visible_alert_group_ids(
+    state: &AppState,
+    principal: &ManagementPrincipal,
+) -> anyhow::Result<Vec<i64>> {
+    Ok(visible_alert_groups(state, principal)?
+        .into_iter()
+        .map(|group| group.id)
+        .collect())
+}
+
+fn principal_can_read_team_name(principal: &ManagementPrincipal, team_name: Option<&str>) -> bool {
+    let Some(team_name) = team_name else {
+        return true;
+    };
+
+    principal
+        .team_memberships
+        .iter()
+        .any(|membership| membership.team_name == team_name)
+}
+
+fn require_group_operation(
+    state: &AppState,
+    principal: &ManagementPrincipal,
+    alert_group_id: i64,
+) -> Result<Option<i64>, WebhookError> {
+    let team_id = state.storage.alert_group_team_id(alert_group_id)?;
+    if principal.can_operate_team(team_id) {
+        Ok(team_id)
+    } else {
+        Err(WebhookError::Forbidden)
+    }
+}
+
+fn require_delivery_operation(
+    state: &AppState,
+    principal: &ManagementPrincipal,
+    delivery_id: i64,
+) -> Result<(), WebhookError> {
+    let team_id = state.storage.delivery_alert_group_team_id(delivery_id)?;
+    if principal.can_operate_team(team_id) {
+        Ok(())
+    } else {
+        Err(WebhookError::Forbidden)
     }
 }
 
@@ -2377,6 +2579,69 @@ mod tests {
         assert_eq!(mutate.status(), StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn team_owned_alert_groups_gate_lifecycle_permissions() {
+        let storage = Storage::open(":memory:").unwrap();
+        let ops = storage.create_team("ops", "Ops team").unwrap();
+        let db = storage.create_team("db", "Database team").unwrap();
+        let user = storage
+            .create_user("casey", "Casey", "hash", "scoped")
+            .unwrap();
+        storage
+            .set_team_membership(ops.id, user.id, "operator")
+            .unwrap();
+        storage
+            .set_team_membership(db.id, user.id, "viewer")
+            .unwrap();
+
+        storage
+            .store_event_with_team(&test_alert_event("owned-fingerprint"), Some("ops"))
+            .unwrap();
+        storage
+            .store_event(&test_alert_event("unowned-fingerprint"))
+            .unwrap();
+
+        let groups = storage.list_alert_groups().unwrap();
+        let owned_group = groups
+            .iter()
+            .find(|group| group.fingerprint == "owned-fingerprint")
+            .unwrap();
+        assert_eq!(owned_group.team_id, Some(ops.id));
+        assert_eq!(owned_group.team_name.as_deref(), Some("ops"));
+
+        let principal = ManagementPrincipal {
+            role: ManagementRole::Scoped,
+            user: Some(user.clone()),
+            team_memberships: storage.list_team_memberships_for_user(user.id).unwrap(),
+            csrf_token: None,
+            auth_kind: "session",
+        };
+        let config = Arc::new(test_config("http://127.0.0.1:1"));
+        let state = AppState {
+            config: config.clone(),
+            router: Arc::new(RouteEngine::new(config.as_ref().clone()).unwrap()),
+            aggregator: AlertAggregator::new(config.as_ref(), GoogleChatClient::new()),
+            storage,
+            login_attempts: LoginAttemptLimiter::new(),
+        };
+
+        let visible_groups = visible_alert_groups(&state, &principal).unwrap();
+        assert_eq!(visible_groups.len(), 2);
+        assert!(require_group_operation(&state, &principal, owned_group.id).is_ok());
+
+        let unowned_group = state
+            .storage
+            .list_alert_groups()
+            .unwrap()
+            .into_iter()
+            .find(|group| group.fingerprint == "unowned-fingerprint")
+            .unwrap();
+        assert!(matches!(
+            require_group_operation(&state, &principal, unowned_group.id),
+            Err(WebhookError::Forbidden)
+        ));
+    }
+
     #[tokio::test]
     async fn bootstrap_admin_password_env_does_not_override_database_password() {
         let env_name = format!("SAP_TEST_BOOTSTRAP_{}", uuid::Uuid::new_v4().as_simple());
@@ -2861,6 +3126,7 @@ mod tests {
         let delivery = Delivery {
             route_name: "default".to_string(),
             receiver: "dead-target".to_string(),
+            owner_team: None,
             escalation_policy: None,
         };
         let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
@@ -2988,6 +3254,7 @@ mod tests {
         let delivery = Delivery {
             route_name: "default".to_string(),
             receiver: "target".to_string(),
+            owner_team: None,
             escalation_policy: None,
         };
         let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
@@ -3332,6 +3599,7 @@ mod tests {
             "generic-target".to_string(),
             ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
                 webhook_url,
+                owner_team: None,
                 timeout_secs: 10,
             }),
         );
@@ -3375,6 +3643,7 @@ mod tests {
             config::RouteConfig {
                 name: "critical-synthetic".to_string(),
                 receiver: "critical-target".to_string(),
+                owner_team: None,
                 escalation_policy: None,
                 continue_matching: false,
                 matchers: vec![config::MatcherConfig {
@@ -3387,6 +3656,7 @@ mod tests {
             config::RouteConfig {
                 name: "warning-synthetic".to_string(),
                 receiver: "warning-target".to_string(),
+                owner_team: None,
                 escalation_policy: None,
                 continue_matching: false,
                 matchers: vec![config::MatcherConfig {
@@ -3402,6 +3672,7 @@ mod tests {
                 "critical-target".to_string(),
                 ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
                     webhook_url: critical_url,
+                    owner_team: None,
                     timeout_secs: 10,
                 }),
             ),
@@ -3409,6 +3680,7 @@ mod tests {
                 "warning-target".to_string(),
                 ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
                     webhook_url: warning_url,
+                    owner_team: None,
                     timeout_secs: 10,
                 }),
             ),
@@ -3416,6 +3688,7 @@ mod tests {
                 "default-target".to_string(),
                 ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
                     webhook_url: default_url,
+                    owner_team: None,
                     timeout_secs: 10,
                 }),
             ),
@@ -3558,6 +3831,7 @@ mod tests {
             config::RouteConfig {
                 name: "primary-critical".to_string(),
                 receiver: "primary-target".to_string(),
+                owner_team: None,
                 escalation_policy: None,
                 continue_matching: true,
                 matchers: vec![config::MatcherConfig {
@@ -3570,6 +3844,7 @@ mod tests {
             config::RouteConfig {
                 name: "checkout-service".to_string(),
                 receiver: "secondary-target".to_string(),
+                owner_team: None,
                 escalation_policy: None,
                 continue_matching: false,
                 matchers: vec![config::MatcherConfig {
@@ -3585,6 +3860,7 @@ mod tests {
                 "primary-target".to_string(),
                 ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
                     webhook_url: primary_url,
+                    owner_team: None,
                     timeout_secs: 10,
                 }),
             ),
@@ -3592,6 +3868,7 @@ mod tests {
                 "secondary-target".to_string(),
                 ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
                     webhook_url: secondary_url,
+                    owner_team: None,
                     timeout_secs: 10,
                 }),
             ),
@@ -4397,6 +4674,26 @@ mod tests {
         serde_json::from_str(include_str!("../examples/signoz-webhook.json")).unwrap()
     }
 
+    fn test_alert_event(fingerprint: &str) -> AlertEvent {
+        AlertEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            integration: "test".to_string(),
+            source: "unit".to_string(),
+            received_at: None,
+            status: "firing".to_string(),
+            severity: "critical".to_string(),
+            title: "Test alert".to_string(),
+            body: None,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            links: Vec::new(),
+            starts_at: None,
+            ends_at: None,
+            fingerprint: fingerprint.to_string(),
+            raw_payload: serde_json::json!({ "fingerprint": fingerprint }),
+        }
+    }
+
     fn response_cookie(response: &Response) -> String {
         response
             .headers()
@@ -4469,6 +4766,7 @@ mod tests {
                 routes: vec![config::RouteConfig {
                     name: "critical-production".to_string(),
                     receiver: "critical-chat".to_string(),
+                    owner_team: None,
                     escalation_policy: None,
                     continue_matching: false,
                     matchers: vec![config::MatcherConfig {
@@ -4484,6 +4782,7 @@ mod tests {
                     "default-chat".to_string(),
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "http://127.0.0.1:1".to_string(),
+                        owner_team: None,
                         title_template: "[{{status}}] {{alertname}}".to_string(),
                         timeout_secs: 10,
                     }),
@@ -4492,6 +4791,7 @@ mod tests {
                     "critical-chat".to_string(),
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: webhook_url.to_string(),
+                        owner_team: None,
                         title_template: "[{{status}}] {{alertname}}".to_string(),
                         timeout_secs: 10,
                     }),

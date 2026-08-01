@@ -53,3 +53,7 @@
 2026-07-23
 
 - Started issue #56 on `fix/issue-56`: redact `raw_payload` values returned by the alert-events management API while preserving stored raw payloads, plus focused API regression coverage.
+
+2026-07-31
+
+- Implemented OnCall core follow-up items 1 and 2 on `feat/team-ownership-scope`: cleaned the local `origin/main` tag ambiguity, fast-forwarded local `main` to `refs/remotes/origin/main`, diagnosed/fixed the Scorecard publish failure, added route/receiver team ownership, persisted alert group ownership, enforced scoped read/lifecycle permissions, added a `scoped` global role for membership-only users, updated UI/docs/examples, and verified with fmt, tests, clippy, and diff checks.
