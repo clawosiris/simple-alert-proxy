@@ -71,6 +71,10 @@ escalation:
           delay_millis: 300000
           stop_on_ack: true
           stop_on_resolve: true
+        - receiver: "critical-chat"
+          delay_millis: 600000
+          stop_on_ack: true
+          stop_on_resolve: true
 
 schedules:
   on_call:

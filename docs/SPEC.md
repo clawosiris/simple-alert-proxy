@@ -287,8 +287,9 @@ group `resolved`.
 
 Escalation policies are config-defined ordered steps. Routes can select a policy
 with `escalation_policy`; the first step is persisted as a scheduled escalation
-task when an active alert is accepted. Acknowledging or resolving the alert group
-cancels scheduled escalation tasks.
+task when an active alert is accepted. The escalation worker claims due tasks,
+executes the step, and schedules the next step. Acknowledging or resolving the
+alert group cancels scheduled escalation tasks.
 
 ```yaml
 escalation:
@@ -297,6 +298,10 @@ escalation:
       steps:
         - schedule: "primary"
           delay_millis: 300000
+          stop_on_ack: true
+          stop_on_resolve: true
+        - receiver: "critical-chat"
+          delay_millis: 600000
           stop_on_ack: true
           stop_on_resolve: true
 
@@ -313,13 +318,16 @@ routing:
       escalation_policy: "primary-on-duty"
 ```
 
+Each escalation step waits `delay_millis`, then targets exactly one `receiver`,
+`webhook`, `schedule`, `user`, or `team`. Receiver, webhook, and schedule
+receiver entries create delivery records; user and team entries are recorded as
+deferred until personal notification policies are configured.
+
 Static YAML on-call schedules are the first supported schedule source. Each
 entry names exactly one responder target: a receiver, user, or team. Receiver
-entries are validated against configured receivers; user and team entries are
-accepted as responder targets for the escalation worker/user-notification slices
-that build on this schedule model. External schedule sources such as iCalendar,
-Google Calendar, CalDAV, or GoAlert can be represented by generated config or
-later scheduler inputs.
+entries are validated against configured receivers. External schedule sources
+such as iCalendar, Google Calendar, CalDAV, or GoAlert can be represented by
+generated config or later scheduler inputs.
 
 ## Optional Intelligence
 

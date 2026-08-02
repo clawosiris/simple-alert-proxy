@@ -61,3 +61,7 @@
 2026-08-01
 
 - Daniel said to proceed after #62 was blocked by required review rather than mergeable state. Started the #3 on-call schedule slice stacked on `feat/team-ownership-scope`: static YAML on-call schedule config, escalation steps that can target a schedule instead of a direct receiver, validation/tests, and docs/examples.
+
+2026-08-02
+
+- Closed issue #30 after PRs #31 and #62 completed the user/team/RBAC ownership scope. Started #4 on `feat/escalation-chain-actions`: escalation worker execution for ordered steps, richer step targets, next-step scheduling, and chain regression coverage.
