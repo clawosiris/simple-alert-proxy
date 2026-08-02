@@ -67,10 +67,16 @@ escalation:
   policies:
     primary-on-duty:
       steps:
-        - receiver: "critical-chat"
+        - schedule: "primary"
           delay_millis: 300000
           stop_on_ack: true
           stop_on_resolve: true
+
+schedules:
+  on_call:
+    primary:
+      entries:
+        - receiver: "critical-chat"
 
 intelligence:
   enabled: false

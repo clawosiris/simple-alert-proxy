@@ -16,6 +16,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub escalation: EscalationConfig,
     #[serde(default)]
+    pub schedules: ScheduleConfig,
+    #[serde(default)]
     pub intelligence: IntelligenceConfig,
     #[serde(default)]
     pub alert_grouping: AlertGroupingConfig,
@@ -47,7 +49,26 @@ impl AppConfig {
 
         self.storage.validate()?;
         self.delivery.validate()?;
+        self.schedules.validate()?;
         self.escalation.validate()?;
+        for (policy_name, policy) in &self.escalation.policies {
+            for (index, step) in policy.steps.iter().enumerate() {
+                if let Some(receiver) = &step.receiver {
+                    self.require_receiver(receiver).with_context(|| {
+                        format!(
+                            "escalation policy {policy_name} step {index} references unknown receiver"
+                        )
+                    })?;
+                }
+                if let Some(schedule) = &step.schedule {
+                    self.require_schedule(schedule).with_context(|| {
+                        format!(
+                            "escalation policy {policy_name} step {index} references unknown on-call schedule"
+                        )
+                    })?;
+                }
+            }
+        }
         self.intelligence.validate()?;
 
         if let Some(auth) = &self.server.auth
@@ -88,6 +109,16 @@ impl AppConfig {
             self.require_receiver(&route.receiver)?;
             if let Some(policy) = &route.escalation_policy {
                 self.require_escalation_policy(policy)?;
+            }
+        }
+
+        for (name, schedule) in &self.schedules.on_call {
+            for (index, entry) in schedule.entries.iter().enumerate() {
+                if let Some(receiver) = &entry.receiver {
+                    self.require_receiver(receiver).with_context(|| {
+                        format!("on-call schedule {name} entry {index} references unknown receiver")
+                    })?;
+                }
             }
         }
 
@@ -184,6 +215,14 @@ impl AppConfig {
             Ok(())
         } else {
             bail!("route references unknown escalation policy {name}")
+        }
+    }
+
+    fn require_schedule(&self, name: &str) -> anyhow::Result<()> {
+        if self.schedules.on_call.contains_key(name) {
+            Ok(())
+        } else {
+            bail!("escalation step references unknown on-call schedule {name}")
         }
     }
 }
@@ -366,8 +405,22 @@ impl EscalationPolicyConfig {
                     "escalation policy {name} step {index} delay_millis must be greater than zero"
                 );
             }
-            if step.receiver.is_empty() {
-                bail!("escalation policy {name} step {index} receiver must not be empty");
+            match (&step.receiver, &step.schedule) {
+                (Some(receiver), None) if receiver.is_empty() => {
+                    bail!("escalation policy {name} step {index} receiver must not be empty");
+                }
+                (None, Some(schedule)) if schedule.is_empty() => {
+                    bail!("escalation policy {name} step {index} schedule must not be empty");
+                }
+                (Some(_), Some(_)) => {
+                    bail!(
+                        "escalation policy {name} step {index} must set either receiver or schedule, not both"
+                    );
+                }
+                (None, None) => {
+                    bail!("escalation policy {name} step {index} must set receiver or schedule");
+                }
+                _ => {}
             }
         }
 
@@ -377,12 +430,70 @@ impl EscalationPolicyConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EscalationStepConfig {
-    pub receiver: String,
+    pub receiver: Option<String>,
+    pub schedule: Option<String>,
     pub delay_millis: u64,
     #[serde(default = "default_stop_on_ack")]
     pub stop_on_ack: bool,
     #[serde(default = "default_stop_on_resolve")]
     pub stop_on_resolve: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ScheduleConfig {
+    #[serde(default)]
+    pub on_call: BTreeMap<String, OnCallScheduleConfig>,
+}
+
+impl ScheduleConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        for (name, schedule) in &self.on_call {
+            schedule.validate(name)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OnCallScheduleConfig {
+    pub entries: Vec<OnCallScheduleEntryConfig>,
+}
+
+impl OnCallScheduleConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        if self.entries.is_empty() {
+            bail!("on-call schedule {name} must have at least one entry");
+        }
+
+        for (index, entry) in self.entries.iter().enumerate() {
+            match (&entry.receiver, &entry.user, &entry.team) {
+                (Some(receiver), None, None) if receiver.is_empty() => {
+                    bail!("on-call schedule {name} entry {index} receiver must not be empty");
+                }
+                (None, Some(user), None) if user.is_empty() => {
+                    bail!("on-call schedule {name} entry {index} user must not be empty");
+                }
+                (None, None, Some(team)) if team.is_empty() => {
+                    bail!("on-call schedule {name} entry {index} team must not be empty");
+                }
+                (Some(_), None, None) | (None, Some(_), None) | (None, None, Some(_)) => {}
+                _ => {
+                    bail!(
+                        "on-call schedule {name} entry {index} must set exactly one of receiver, user, or team"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OnCallScheduleEntryConfig {
+    pub receiver: Option<String>,
+    pub user: Option<String>,
+    pub team: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -938,6 +1049,7 @@ mod tests {
             },
             delivery: DeliveryConfig::default(),
             escalation: EscalationConfig::default(),
+            schedules: ScheduleConfig::default(),
             intelligence: IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig::default(),
@@ -1016,6 +1128,81 @@ mod tests {
     }
 
     #[test]
+    fn escalation_step_can_target_on_call_schedule() {
+        let mut config = minimal_valid_config();
+        config.schedules.on_call.insert(
+            "primary".to_string(),
+            OnCallScheduleConfig {
+                entries: vec![OnCallScheduleEntryConfig {
+                    receiver: Some("default".to_string()),
+                    user: None,
+                    team: None,
+                }],
+            },
+        );
+        config.escalation.policies.insert(
+            "page-primary".to_string(),
+            EscalationPolicyConfig {
+                steps: vec![EscalationStepConfig {
+                    receiver: None,
+                    schedule: Some("primary".to_string()),
+                    delay_millis: 1_000,
+                    stop_on_ack: true,
+                    stop_on_resolve: true,
+                }],
+            },
+        );
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_on_call_schedule_reference() {
+        let mut config = minimal_valid_config();
+        config.escalation.policies.insert(
+            "page-primary".to_string(),
+            EscalationPolicyConfig {
+                steps: vec![EscalationStepConfig {
+                    receiver: None,
+                    schedule: Some("missing".to_string()),
+                    delay_millis: 1_000,
+                    stop_on_ack: true,
+                    stop_on_resolve: true,
+                }],
+            },
+        );
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "escalation policy page-primary step 0 references unknown on-call schedule"
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_schedule_entries_without_exactly_one_target() {
+        let mut config = minimal_valid_config();
+        config.schedules.on_call.insert(
+            "primary".to_string(),
+            OnCallScheduleConfig {
+                entries: vec![OnCallScheduleEntryConfig {
+                    receiver: Some("default".to_string()),
+                    user: Some("casey".to_string()),
+                    team: None,
+                }],
+            },
+        );
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.to_string().contains(
+            "on-call schedule primary entry 0 must set exactly one of receiver, user, or team"
+        ));
+    }
+
+    #[test]
     fn exposed_bind_requires_management_auth() {
         let mut config = minimal_valid_config();
         config.server.bind = "0.0.0.0:8080".to_string();
@@ -1084,6 +1271,7 @@ mod tests {
             storage: StorageConfig::default(),
             delivery: DeliveryConfig::default(),
             escalation: EscalationConfig::default(),
+            schedules: ScheduleConfig::default(),
             intelligence: IntelligenceConfig::default(),
             alert_grouping: AlertGroupingConfig::default(),
             debug: DebugConfig::default(),

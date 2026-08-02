@@ -295,10 +295,16 @@ escalation:
   policies:
     primary-on-duty:
       steps:
-        - receiver: "critical-chat"
+        - schedule: "primary"
           delay_millis: 300000
           stop_on_ack: true
           stop_on_resolve: true
+
+schedules:
+  on_call:
+    primary:
+      entries:
+        - receiver: "critical-chat"
 
 routing:
   routes:
@@ -307,8 +313,13 @@ routing:
       escalation_policy: "primary-on-duty"
 ```
 
-External schedule sources such as iCalendar, Google Calendar, CalDAV, GoAlert,
-or static YAML can be represented by generated config or later scheduler inputs.
+Static YAML on-call schedules are the first supported schedule source. Each
+entry names exactly one responder target: a receiver, user, or team. Receiver
+entries are validated against configured receivers; user and team entries are
+accepted as responder targets for the escalation worker/user-notification slices
+that build on this schedule model. External schedule sources such as iCalendar,
+Google Calendar, CalDAV, or GoAlert can be represented by generated config or
+later scheduler inputs.
 
 ## Optional Intelligence
 
