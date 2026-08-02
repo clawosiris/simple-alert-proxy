@@ -354,6 +354,7 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
         login_attempts: LoginAttemptLimiter::new(),
         config: Arc::clone(&config),
     };
+    start_escalation_worker(state.clone());
 
     let health = Router::new().route("/healthz", post(healthz).get(healthz));
     let mut webhooks = Router::new().route("/webhooks/{*integration}", post(handle_webhook));
@@ -427,6 +428,118 @@ fn start_retention_pruner(storage: Storage, retention_days: u64) {
             }
         }
     });
+}
+
+fn start_escalation_worker(state: AppState) {
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(50);
+        loop {
+            match state.storage.claim_due_escalation() {
+                Ok(Some(task)) => {
+                    if let Err(error) = run_escalation_task(&state, task).await {
+                        error!(%error, "failed to run escalation task");
+                    }
+                }
+                Ok(None) => {
+                    tokio::time::sleep(interval).await;
+                }
+                Err(error) => {
+                    error!(%error, "failed to claim due escalation task");
+                    tokio::time::sleep(interval).await;
+                }
+            }
+        }
+    });
+}
+
+async fn run_escalation_task(
+    state: &AppState,
+    task: storage::EscalationTaskRecord,
+) -> anyhow::Result<()> {
+    let Some(policy) = state.config.escalation.policies.get(&task.policy) else {
+        state
+            .storage
+            .fail_escalation_task(task.id, "escalation policy is no longer configured")?;
+        return Ok(());
+    };
+    let Some(step) = policy.steps.get(task.step_index as usize) else {
+        state
+            .storage
+            .fail_escalation_task(task.id, "escalation step is no longer configured")?;
+        return Ok(());
+    };
+
+    let detail = execute_escalation_step(state, &task, step)?;
+    let next_delay = policy
+        .steps
+        .get(task.step_index as usize + 1)
+        .map(|step| step.delay_millis);
+    state.storage.complete_escalation_task(
+        task.id,
+        task.alert_group_id,
+        &task.policy,
+        task.step_index,
+        next_delay,
+        &detail,
+    )?;
+    Ok(())
+}
+
+fn execute_escalation_step(
+    state: &AppState,
+    task: &storage::EscalationTaskRecord,
+    step: &config::EscalationStepConfig,
+) -> anyhow::Result<String> {
+    if let Some(receiver) = &step.receiver {
+        queue_escalation_receiver_delivery(state, task, receiver, "receiver")?;
+        return Ok(format!("receiver:{receiver}"));
+    }
+    if let Some(webhook) = &step.webhook {
+        queue_escalation_receiver_delivery(state, task, webhook, "webhook")?;
+        return Ok(format!("webhook:{webhook}"));
+    }
+    if let Some(schedule_name) = &step.schedule {
+        let mut delivered = Vec::new();
+        let Some(schedule) = state.config.schedules.on_call.get(schedule_name) else {
+            anyhow::bail!("on-call schedule {schedule_name} is no longer configured");
+        };
+        for entry in &schedule.entries {
+            if let Some(receiver) = &entry.receiver {
+                queue_escalation_receiver_delivery(state, task, receiver, "schedule")?;
+                delivered.push(receiver.clone());
+            }
+        }
+        if delivered.is_empty() {
+            return Ok(format!("schedule:{schedule_name}:deferred"));
+        }
+        return Ok(format!("schedule:{schedule_name}:{}", delivered.join(",")));
+    }
+    if let Some(user) = &step.user {
+        return Ok(format!("user:{user}:deferred"));
+    }
+    if let Some(team) = &step.team {
+        return Ok(format!("team:{team}:deferred"));
+    }
+    anyhow::bail!("escalation step has no target")
+}
+
+fn queue_escalation_receiver_delivery(
+    state: &AppState,
+    task: &storage::EscalationTaskRecord,
+    receiver_name: &str,
+    action: &str,
+) -> anyhow::Result<()> {
+    let receiver = state.config.receivers.get(receiver_name).with_context(|| {
+        format!("escalation {action} receiver {receiver_name} is not configured")
+    })?;
+    let delivery = Delivery {
+        route_name: format!("escalation:{}:{}", task.policy, task.step_index),
+        receiver: receiver_name.to_string(),
+        owner_team: receiver.owner_team().map(ToOwned::to_owned),
+        escalation_policy: None,
+    };
+    queue_target_event_delivery(state, &task.event, task.alert_event_id, receiver, delivery)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 async fn handle_overload(_error: BoxError) -> Response {
@@ -3444,6 +3557,9 @@ mod tests {
                     steps: vec![EscalationStepConfig {
                         receiver: Some("critical-chat".to_string()),
                         schedule: None,
+                        webhook: None,
+                        user: None,
+                        team: None,
                         delay_millis: 1_000,
                         stop_on_ack: true,
                         stop_on_resolve: true,
@@ -3487,6 +3603,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn escalation_worker_runs_ordered_receiver_chain() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.escalation = EscalationConfig {
+            policies: BTreeMap::from([(
+                "primary".to_string(),
+                EscalationPolicyConfig {
+                    steps: vec![
+                        EscalationStepConfig {
+                            receiver: Some("critical-chat".to_string()),
+                            schedule: None,
+                            webhook: None,
+                            user: None,
+                            team: None,
+                            delay_millis: 10,
+                            stop_on_ack: true,
+                            stop_on_resolve: true,
+                        },
+                        EscalationStepConfig {
+                            receiver: Some("critical-chat".to_string()),
+                            schedule: None,
+                            webhook: None,
+                            user: None,
+                            team: None,
+                            delay_millis: 10,
+                            stop_on_ack: true,
+                            stop_on_resolve: true,
+                        },
+                    ],
+                },
+            )]),
+        };
+        config.routing.routes[0].escalation_policy = Some("primary".to_string());
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        wait_for_received_count(&received, 3).await;
+
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        let targets = deliveries
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|delivery| delivery["target"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec!["critical-chat", "critical-chat", "critical-chat"]
+        );
     }
 
     #[tokio::test]

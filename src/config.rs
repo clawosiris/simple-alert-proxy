@@ -53,7 +53,7 @@ impl AppConfig {
         self.escalation.validate()?;
         for (policy_name, policy) in &self.escalation.policies {
             for (index, step) in policy.steps.iter().enumerate() {
-                if let Some(receiver) = &step.receiver {
+                if let Some(receiver) = step.receiver_target() {
                     self.require_receiver(receiver).with_context(|| {
                         format!(
                             "escalation policy {policy_name} step {index} references unknown receiver"
@@ -405,22 +405,44 @@ impl EscalationPolicyConfig {
                     "escalation policy {name} step {index} delay_millis must be greater than zero"
                 );
             }
-            match (&step.receiver, &step.schedule) {
-                (Some(receiver), None) if receiver.is_empty() => {
-                    bail!("escalation policy {name} step {index} receiver must not be empty");
-                }
-                (None, Some(schedule)) if schedule.is_empty() => {
-                    bail!("escalation policy {name} step {index} schedule must not be empty");
-                }
-                (Some(_), Some(_)) => {
+            match step.target_count() {
+                0 => {
                     bail!(
-                        "escalation policy {name} step {index} must set either receiver or schedule, not both"
+                        "escalation policy {name} step {index} must set receiver, schedule, webhook, user, or team"
                     );
                 }
-                (None, None) => {
-                    bail!("escalation policy {name} step {index} must set receiver or schedule");
+                1 => {}
+                _ => {
+                    bail!(
+                        "escalation policy {name} step {index} must set exactly one of receiver, schedule, webhook, user, or team"
+                    );
                 }
-                _ => {}
+            }
+
+            if let Some(receiver) = &step.receiver
+                && receiver.is_empty()
+            {
+                bail!("escalation policy {name} step {index} receiver must not be empty");
+            }
+            if let Some(schedule) = &step.schedule
+                && schedule.is_empty()
+            {
+                bail!("escalation policy {name} step {index} schedule must not be empty");
+            }
+            if let Some(webhook) = &step.webhook
+                && webhook.is_empty()
+            {
+                bail!("escalation policy {name} step {index} webhook must not be empty");
+            }
+            if let Some(user) = &step.user
+                && user.is_empty()
+            {
+                bail!("escalation policy {name} step {index} user must not be empty");
+            }
+            if let Some(team) = &step.team
+                && team.is_empty()
+            {
+                bail!("escalation policy {name} step {index} team must not be empty");
             }
         }
 
@@ -432,11 +454,33 @@ impl EscalationPolicyConfig {
 pub struct EscalationStepConfig {
     pub receiver: Option<String>,
     pub schedule: Option<String>,
+    pub webhook: Option<String>,
+    pub user: Option<String>,
+    pub team: Option<String>,
     pub delay_millis: u64,
     #[serde(default = "default_stop_on_ack")]
     pub stop_on_ack: bool,
     #[serde(default = "default_stop_on_resolve")]
     pub stop_on_resolve: bool,
+}
+
+impl EscalationStepConfig {
+    fn target_count(&self) -> usize {
+        [
+            self.receiver.as_ref(),
+            self.schedule.as_ref(),
+            self.webhook.as_ref(),
+            self.user.as_ref(),
+            self.team.as_ref(),
+        ]
+        .into_iter()
+        .filter(|target| target.is_some())
+        .count()
+    }
+
+    fn receiver_target(&self) -> Option<&str> {
+        self.receiver.as_deref().or(self.webhook.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1146,6 +1190,9 @@ mod tests {
                 steps: vec![EscalationStepConfig {
                     receiver: None,
                     schedule: Some("primary".to_string()),
+                    webhook: None,
+                    user: None,
+                    team: None,
                     delay_millis: 1_000,
                     stop_on_ack: true,
                     stop_on_resolve: true,
@@ -1165,6 +1212,9 @@ mod tests {
                 steps: vec![EscalationStepConfig {
                     receiver: None,
                     schedule: Some("missing".to_string()),
+                    webhook: None,
+                    user: None,
+                    team: None,
                     delay_millis: 1_000,
                     stop_on_ack: true,
                     stop_on_resolve: true,
@@ -1179,6 +1229,32 @@ mod tests {
                 "escalation policy page-primary step 0 references unknown on-call schedule"
             )
         );
+    }
+
+    #[test]
+    fn rejects_escalation_steps_with_multiple_targets() {
+        let mut config = minimal_valid_config();
+        config.escalation.policies.insert(
+            "page-primary".to_string(),
+            EscalationPolicyConfig {
+                steps: vec![EscalationStepConfig {
+                    receiver: Some("default".to_string()),
+                    schedule: None,
+                    webhook: None,
+                    user: Some("casey".to_string()),
+                    team: None,
+                    delay_millis: 1_000,
+                    stop_on_ack: true,
+                    stop_on_resolve: true,
+                }],
+            },
+        );
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.to_string().contains(
+            "escalation policy page-primary step 0 must set exactly one of receiver, schedule, webhook, user, or team"
+        ));
     }
 
     #[test]

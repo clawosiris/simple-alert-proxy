@@ -299,10 +299,14 @@ Add delayed routing behavior that reacts to alert lifecycle state.
 
 ### Implementation Notes
 
-- Config supports named escalation policies with ordered delayed steps and
-  stop-on-ack/stop-on-resolve flags.
+- Config supports named escalation policies with ordered delayed steps,
+  stop-on-ack/stop-on-resolve flags, and exactly one target per step:
+  receiver, webhook, schedule, user, or team.
 - Routes can select an `escalation_policy`; accepted active alerts persist a
   scheduled escalation task for the first step.
+- The escalation worker claims due tasks, executes receiver/webhook/schedule
+  receiver steps as delivery records, records deferred user/team steps, and
+  schedules the next step.
 - Acknowledge and resolve actions cancel scheduled escalation tasks.
 - Static YAML on-call schedules are the initial schedule source, with entries
   targeting exactly one receiver, user, or team. External schedule systems are
@@ -312,6 +316,7 @@ Add delayed routing behavior that reacts to alert lifecycle state.
 
 - An unacknowledged alert can escalate after a configured delay.
 - Acknowledging before the delay prevents later escalation steps.
+- Multiple escalation steps execute in order while the alert remains active.
 
 ## Phase 7: Optional Intelligence
 

@@ -282,6 +282,152 @@ impl Storage {
         Ok(())
     }
 
+    pub fn claim_due_escalation(&self) -> anyhow::Result<Option<EscalationTaskRecord>> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        let Some((task_id, alert_group_id, policy, step_index)) = conn
+            .query_row(
+                r#"
+                SELECT escalation_tasks.id, escalation_tasks.alert_group_id,
+                       escalation_tasks.policy, escalation_tasks.step_index
+                FROM escalation_tasks
+                JOIN alert_groups ON alert_groups.id = escalation_tasks.alert_group_id
+                WHERE escalation_tasks.status = 'scheduled'
+                  AND escalation_tasks.due_at <= ?1
+                  AND alert_groups.status != 'resolved'
+                  AND alert_groups.acknowledged_at IS NULL
+                ORDER BY escalation_tasks.due_at ASC, escalation_tasks.id ASC
+                LIMIT 1
+                "#,
+                params![now],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        conn.execute(
+            r#"
+            UPDATE escalation_tasks
+            SET status = 'processing',
+                updated_at = ?2
+            WHERE id = ?1
+              AND status = 'scheduled'
+            "#,
+            params![task_id, now],
+        )?;
+        let (alert_event_id, event) = latest_alert_event_for_group(&conn, alert_group_id)?;
+        Ok(Some(EscalationTaskRecord {
+            id: task_id,
+            alert_group_id,
+            policy,
+            step_index,
+            alert_event_id,
+            event,
+        }))
+    }
+
+    pub fn complete_escalation_task(
+        &self,
+        task_id: i64,
+        alert_group_id: i64,
+        policy: &str,
+        step_index: i64,
+        next_delay_millis: Option<u64>,
+        detail: &str,
+    ) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            UPDATE escalation_tasks
+            SET status = 'completed',
+                updated_at = ?2
+            WHERE id = ?1
+            "#,
+            params![task_id, now],
+        )?;
+        insert_audit(
+            &conn,
+            Some(alert_group_id),
+            None,
+            &AuditActor::default(),
+            "escalation_step",
+            Some(detail),
+            now,
+        )?;
+
+        let Some(next_delay_millis) = next_delay_millis else {
+            return Ok(());
+        };
+        let should_continue: bool = conn.query_row(
+            r#"
+            SELECT status != 'resolved' AND acknowledged_at IS NULL
+            FROM alert_groups
+            WHERE id = ?1
+            "#,
+            params![alert_group_id],
+            |row| row.get(0),
+        )?;
+        if !should_continue {
+            return Ok(());
+        }
+
+        conn.execute(
+            r#"
+            INSERT INTO escalation_tasks (
+                alert_group_id, policy, step_index, status, due_at, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, 'scheduled', ?4, ?5, ?5)
+            "#,
+            params![
+                alert_group_id,
+                policy,
+                step_index + 1,
+                now + next_delay_millis as i64,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_escalation_task(&self, task_id: i64, detail: &str) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        let alert_group_id: i64 = conn.query_row(
+            "SELECT alert_group_id FROM escalation_tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            r#"
+            UPDATE escalation_tasks
+            SET status = 'failed',
+                updated_at = ?2
+            WHERE id = ?1
+            "#,
+            params![task_id, now],
+        )?;
+        insert_audit(
+            &conn,
+            Some(alert_group_id),
+            None,
+            &AuditActor::default(),
+            "escalation_step_failed",
+            Some(detail),
+            now,
+        )?;
+        Ok(())
+    }
+
     pub fn mark_attempt(&self, delivery_id: i64, attempt: u32) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
@@ -1151,6 +1297,16 @@ pub struct DeliveryReplayRecord {
     pub delivery: Delivery,
 }
 
+#[derive(Debug, Clone)]
+pub struct EscalationTaskRecord {
+    pub id: i64,
+    pub alert_group_id: i64,
+    pub policy: String,
+    pub step_index: i64,
+    pub alert_event_id: i64,
+    pub event: AlertEvent,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AdvisoryRecord {
     pub id: i64,
@@ -1480,6 +1636,66 @@ fn delivery_replay_record(
             escalation_policy: None,
         },
     })
+}
+
+fn latest_alert_event_for_group(
+    conn: &Connection,
+    alert_group_id: i64,
+) -> anyhow::Result<(i64, AlertEvent)> {
+    let (id, event_id, integration, source, status, severity, title, fingerprint, raw_payload): (
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = conn.query_row(
+        r#"
+        SELECT id, event_id, integration, source, status, severity, title, fingerprint, raw_payload
+        FROM alert_events
+        WHERE alert_group_id = ?1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+        params![alert_group_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+
+    Ok((
+        id,
+        AlertEvent {
+            event_id,
+            integration,
+            source,
+            received_at: None,
+            status,
+            severity,
+            title,
+            body: None,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            links: Vec::new(),
+            starts_at: None,
+            ends_at: None,
+            fingerprint,
+            raw_payload: serde_json::from_str(&raw_payload).unwrap_or(serde_json::Value::Null),
+        },
+    ))
 }
 
 fn advisory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdvisoryRecord> {

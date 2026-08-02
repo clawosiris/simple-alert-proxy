@@ -327,10 +327,20 @@ escalation:
   policies:
     primary-on-duty:
       steps:
-        - receiver: "critical-chat"
+        - schedule: "primary"
           delay_millis: 300000
           stop_on_ack: true
           stop_on_resolve: true
+        - receiver: "critical-chat"
+          delay_millis: 600000
+          stop_on_ack: true
+          stop_on_resolve: true
+
+schedules:
+  on_call:
+    primary:
+      entries:
+        - receiver: "critical-chat"
 
 routing:
   routes:
@@ -339,6 +349,11 @@ routing:
       owner_team: "platform"
       escalation_policy: "primary-on-duty"
 ```
+
+Each escalation step waits `delay_millis`, then targets exactly one `receiver`,
+`webhook`, `schedule`, `user`, or `team`. Receiver, webhook, and schedule
+receiver entries create delivery records; user and team entries are recorded as
+deferred until personal notification policies are configured.
 
 Routes and receivers can declare `owner_team` to scope alert groups to a team.
 Route ownership wins; receiver ownership is used as the fallback for default or
