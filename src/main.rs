@@ -470,16 +470,16 @@ async fn run_escalation_task(
     };
 
     let detail = execute_escalation_step(state, &task, step)?;
-    let next_delay = policy
+    let next_step = policy
         .steps
         .get(task.step_index as usize + 1)
-        .map(|step| step.delay_millis);
+        .map(|step| (step.delay_millis, step.stop_on_ack, step.stop_on_resolve));
     state.storage.complete_escalation_task(
         task.id,
         task.alert_group_id,
         &task.policy,
         task.step_index,
-        next_delay,
+        next_step,
         &detail,
     )?;
     Ok(())
@@ -1510,10 +1510,13 @@ fn queue_escalation_if_configured(
     let Some(first_step) = policy.steps.first() else {
         return Ok(());
     };
-    let _stop_conditions = (first_step.stop_on_ack, first_step.stop_on_resolve);
-    state
-        .storage
-        .queue_escalation(alert_event_id, policy_name, first_step.delay_millis)?;
+    state.storage.queue_escalation(
+        alert_event_id,
+        policy_name,
+        first_step.delay_millis,
+        first_step.stop_on_ack,
+        first_step.stop_on_resolve,
+    )?;
     Ok(())
 }
 
@@ -3372,7 +3375,7 @@ mod tests {
         };
         let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
         storage
-            .queue_escalation(event_id, "primary", 1_000)
+            .queue_escalation(event_id, "primary", 1_000, true, true)
             .unwrap();
         let group_id = storage.list_alert_groups().unwrap()[0].id;
         assert_eq!(storage.escalation_statuses().unwrap(), vec!["scheduled"]);

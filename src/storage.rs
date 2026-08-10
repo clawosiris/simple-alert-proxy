@@ -117,6 +117,8 @@ impl Storage {
                 alert_group_id INTEGER NOT NULL,
                 policy TEXT NOT NULL,
                 step_index INTEGER NOT NULL,
+                stop_on_ack INTEGER NOT NULL DEFAULT 1,
+                stop_on_resolve INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL,
                 due_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
@@ -180,6 +182,16 @@ impl Storage {
         add_column_if_missing(&conn, "audit_entries", "actor_user_id INTEGER")?;
         add_column_if_missing(&conn, "audit_entries", "actor_display_name TEXT")?;
         add_column_if_missing(&conn, "audit_entries", "actor_team_id INTEGER")?;
+        add_column_if_missing(
+            &conn,
+            "escalation_tasks",
+            "stop_on_ack INTEGER NOT NULL DEFAULT 1",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "escalation_tasks",
+            "stop_on_resolve INTEGER NOT NULL DEFAULT 1",
+        )?;
         Ok(())
     }
 
@@ -251,33 +263,42 @@ impl Storage {
         alert_event_id: i64,
         policy: &str,
         delay_millis: u64,
+        stop_on_ack: bool,
+        stop_on_resolve: bool,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let due_at = now + delay_millis as i64;
         let conn = self.conn.lock().unwrap();
-        let (alert_group_id, group_status): (i64, String) = conn.query_row(
+        let alert_group_id: i64 = conn.query_row(
             r#"
-            SELECT alert_group_id, alert_groups.status
+            SELECT alert_group_id
             FROM alert_events
-            JOIN alert_groups ON alert_groups.id = alert_events.alert_group_id
             WHERE alert_events.id = ?1
             "#,
             params![alert_event_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )?;
 
-        if group_status == "resolved" {
+        if !group_allows_escalation(&conn, alert_group_id, stop_on_ack, stop_on_resolve)? {
             return Ok(());
         }
 
         conn.execute(
             r#"
             INSERT INTO escalation_tasks (
-                alert_group_id, policy, step_index, status, due_at, created_at, updated_at
+                alert_group_id, policy, step_index, stop_on_ack, stop_on_resolve,
+                status, due_at, created_at, updated_at
             )
-            VALUES (?1, ?2, 0, 'scheduled', ?3, ?4, ?4)
+            VALUES (?1, ?2, 0, ?3, ?4, 'scheduled', ?5, ?6, ?6)
             "#,
-            params![alert_group_id, policy, due_at, now],
+            params![
+                alert_group_id,
+                policy,
+                stop_on_ack,
+                stop_on_resolve,
+                due_at,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -294,8 +315,8 @@ impl Storage {
                 JOIN alert_groups ON alert_groups.id = escalation_tasks.alert_group_id
                 WHERE escalation_tasks.status = 'scheduled'
                   AND escalation_tasks.due_at <= ?1
-                  AND alert_groups.status != 'resolved'
-                  AND alert_groups.acknowledged_at IS NULL
+                  AND (escalation_tasks.stop_on_resolve = 0 OR alert_groups.status != 'resolved')
+                  AND (escalation_tasks.stop_on_ack = 0 OR alert_groups.acknowledged_at IS NULL)
                 ORDER BY escalation_tasks.due_at ASC, escalation_tasks.id ASC
                 LIMIT 1
                 "#,
@@ -341,7 +362,7 @@ impl Storage {
         alert_group_id: i64,
         policy: &str,
         step_index: i64,
-        next_delay_millis: Option<u64>,
+        next_step: Option<(u64, bool, bool)>,
         detail: &str,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
@@ -365,33 +386,32 @@ impl Storage {
             now,
         )?;
 
-        let Some(next_delay_millis) = next_delay_millis else {
+        let Some((next_delay_millis, next_stop_on_ack, next_stop_on_resolve)) = next_step else {
             return Ok(());
         };
-        let should_continue: bool = conn.query_row(
-            r#"
-            SELECT status != 'resolved' AND acknowledged_at IS NULL
-            FROM alert_groups
-            WHERE id = ?1
-            "#,
-            params![alert_group_id],
-            |row| row.get(0),
-        )?;
-        if !should_continue {
+        if !group_allows_escalation(
+            &conn,
+            alert_group_id,
+            next_stop_on_ack,
+            next_stop_on_resolve,
+        )? {
             return Ok(());
         }
 
         conn.execute(
             r#"
             INSERT INTO escalation_tasks (
-                alert_group_id, policy, step_index, status, due_at, created_at, updated_at
+                alert_group_id, policy, step_index, stop_on_ack, stop_on_resolve,
+                status, due_at, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, 'scheduled', ?4, ?5, ?5)
+            VALUES (?1, ?2, ?3, ?4, ?5, 'scheduled', ?6, ?7, ?7)
             "#,
             params![
                 alert_group_id,
                 policy,
                 step_index + 1,
+                next_stop_on_ack,
+                next_stop_on_resolve,
                 now + next_delay_millis as i64,
                 now
             ],
@@ -620,7 +640,7 @@ impl Storage {
             "UPDATE alert_groups SET acknowledged_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![alert_group_id, now],
         )?;
-        cancel_escalations(&conn, alert_group_id, now)?;
+        cancel_escalations_stopped_by_ack(&conn, alert_group_id, now)?;
         insert_audit(
             &conn,
             Some(alert_group_id),
@@ -646,7 +666,7 @@ impl Storage {
             "UPDATE alert_groups SET status = 'resolved', updated_at = ?2 WHERE id = ?1",
             params![alert_group_id, now],
         )?;
-        cancel_escalations(&conn, alert_group_id, now)?;
+        cancel_escalations_stopped_by_resolve(&conn, alert_group_id, now)?;
         insert_audit(
             &conn,
             Some(alert_group_id),
@@ -1942,7 +1962,26 @@ fn insert_audit(
     Ok(())
 }
 
-fn cancel_escalations(conn: &Connection, alert_group_id: i64, now: i64) -> anyhow::Result<()> {
+fn group_allows_escalation(
+    conn: &Connection,
+    alert_group_id: i64,
+    stop_on_ack: bool,
+    stop_on_resolve: bool,
+) -> anyhow::Result<bool> {
+    let (status, acknowledged_at): (String, Option<i64>) = conn.query_row(
+        "SELECT status, acknowledged_at FROM alert_groups WHERE id = ?1",
+        params![alert_group_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+
+    Ok((!stop_on_resolve || status != "resolved") && (!stop_on_ack || acknowledged_at.is_none()))
+}
+
+fn cancel_escalations_stopped_by_ack(
+    conn: &Connection,
+    alert_group_id: i64,
+    now: i64,
+) -> anyhow::Result<()> {
     conn.execute(
         r#"
         UPDATE escalation_tasks
@@ -1950,6 +1989,26 @@ fn cancel_escalations(conn: &Connection, alert_group_id: i64, now: i64) -> anyho
             updated_at = ?2
         WHERE alert_group_id = ?1
           AND status = 'scheduled'
+          AND stop_on_ack = 1
+        "#,
+        params![alert_group_id, now],
+    )?;
+    Ok(())
+}
+
+fn cancel_escalations_stopped_by_resolve(
+    conn: &Connection,
+    alert_group_id: i64,
+    now: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        r#"
+        UPDATE escalation_tasks
+        SET status = 'canceled',
+            updated_at = ?2
+        WHERE alert_group_id = ?1
+          AND status = 'scheduled'
+          AND stop_on_resolve = 1
         "#,
         params![alert_group_id, now],
     )?;
@@ -2077,6 +2136,50 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn migration_adds_escalation_stop_conditions_to_existing_database() {
+        let database_path = std::env::temp_dir().join(format!(
+            "simple-alert-proxy-migration-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy = Connection::open(&database_path).unwrap();
+        legacy
+            .execute_batch(
+                r#"
+                CREATE TABLE escalation_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_group_id INTEGER NOT NULL,
+                    policy TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    due_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO escalation_tasks (
+                    alert_group_id, policy, step_index, status, due_at, created_at, updated_at
+                ) VALUES (42, 'legacy', 0, 'scheduled', 100, 50, 50);
+                "#,
+            )
+            .unwrap();
+        drop(legacy);
+
+        let storage = Storage::open(database_path.to_str().unwrap()).unwrap();
+        let conn = storage.conn.lock().unwrap();
+        let stop_conditions: (bool, bool) = conn
+            .query_row(
+                "SELECT stop_on_ack, stop_on_resolve FROM escalation_tasks WHERE policy = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        drop(storage);
+        fs::remove_file(&database_path).unwrap();
+
+        assert_eq!(stop_conditions, (true, true));
+    }
+
+    #[test]
     fn default_retention_keeps_recent_alerts() {
         let storage = Storage::open(":memory:").unwrap();
         seed_alert(&storage, "recent", now_epoch_millis()).unwrap();
@@ -2132,6 +2235,108 @@ mod tests {
         assert_eq!(groups[0].event_count, 1);
         assert_eq!(groups[0].first_event_at, recent);
         assert_eq!(groups[0].last_event_at, recent);
+    }
+
+    #[test]
+    fn acknowledged_groups_keep_escalations_that_do_not_stop_on_ack() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event_id = storage
+            .store_event(&test_event("ack-keeps-escalation", "firing"))
+            .unwrap();
+        storage
+            .queue_escalation(event_id, "primary", 0, false, true)
+            .unwrap();
+        let group_id = storage.list_alert_groups().unwrap()[0].id;
+
+        storage.acknowledge_group(group_id).unwrap();
+
+        assert_eq!(storage.escalation_statuses().unwrap(), vec!["scheduled"]);
+        assert!(storage.claim_due_escalation().unwrap().is_some());
+    }
+
+    #[test]
+    fn resolved_groups_keep_escalations_that_do_not_stop_on_resolve() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event_id = storage
+            .store_event(&test_event("resolve-keeps-escalation", "firing"))
+            .unwrap();
+        storage
+            .queue_escalation(event_id, "primary", 0, true, false)
+            .unwrap();
+        let group_id = storage.list_alert_groups().unwrap()[0].id;
+
+        storage.resolve_group(group_id).unwrap();
+
+        assert_eq!(storage.escalation_statuses().unwrap(), vec!["scheduled"]);
+        assert!(storage.claim_due_escalation().unwrap().is_some());
+    }
+
+    #[test]
+    fn queue_skips_first_escalation_after_matching_stop_condition() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event_id = storage
+            .store_event(&test_event("already-acked", "firing"))
+            .unwrap();
+        let group_id = storage.list_alert_groups().unwrap()[0].id;
+        storage.acknowledge_group(group_id).unwrap();
+
+        storage
+            .queue_escalation(event_id, "primary", 0, true, true)
+            .unwrap();
+
+        assert!(storage.escalation_statuses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolved_groups_can_queue_first_escalation_when_not_stopped_by_resolve() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event_id = storage
+            .store_event(&test_event("resolved-first-step", "resolved"))
+            .unwrap();
+
+        storage
+            .queue_escalation(event_id, "primary", 0, true, false)
+            .unwrap();
+
+        assert_eq!(storage.escalation_statuses().unwrap(), vec!["scheduled"]);
+        assert!(storage.claim_due_escalation().unwrap().is_some());
+    }
+
+    #[test]
+    fn claim_skips_escalations_after_matching_stop_condition() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event_id = storage
+            .store_event(&test_event("ack-cancels-escalation", "firing"))
+            .unwrap();
+        storage
+            .queue_escalation(event_id, "primary", 0, true, true)
+            .unwrap();
+        let group_id = storage.list_alert_groups().unwrap()[0].id;
+
+        storage.acknowledge_group(group_id).unwrap();
+
+        assert_eq!(storage.escalation_statuses().unwrap(), vec!["canceled"]);
+        assert!(storage.claim_due_escalation().unwrap().is_none());
+    }
+
+    fn test_event(fingerprint: &str, status: &str) -> AlertEvent {
+        AlertEvent {
+            event_id: format!("event-{fingerprint}"),
+            integration: "test".to_string(),
+            source: "test".to_string(),
+            received_at: None,
+            status: status.to_string(),
+            severity: "warning".to_string(),
+            title: format!("Alert {fingerprint}"),
+            body: None,
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            links: Vec::<AlertLink>::new(),
+            starts_at: None,
+            ends_at: None,
+            fingerprint: fingerprint.to_string(),
+            raw_payload: serde_json::json!({ "fingerprint": fingerprint }),
+        }
     }
 
     fn seed_alert(storage: &Storage, fingerprint: &str, created_at: i64) -> anyhow::Result<i64> {
