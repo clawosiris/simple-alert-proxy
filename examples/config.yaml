@@ -33,6 +33,13 @@ integrations:
     auth:
       bearer_token: "replace-me"
 
+  grafana:
+    type: "builtin"
+    preset: "grafana"
+    path: "/webhooks/grafana"
+    auth:
+      bearer_token: "replace-me"
+
   openvas-example:
     type: "generic_json"
     preset: "openvas_scan"
