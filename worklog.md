@@ -70,3 +70,4 @@
 2026-08-11
 
 - Started issue #70 on `feat/grafana-integration`: first-class Grafana built-in webhook parser, per-instance canonical events, fixture/tests, and docs/examples.
+- Addressed PR #73 lifecycle review findings: canonicalized Grafana `state` fallbacks, made instance status authoritative, and derived fallback fingerprints only from stable group/instance identity fields rather than status or array position. Verified with fmt, 106 tests, Clippy, and diff checks.

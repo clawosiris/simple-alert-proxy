@@ -54,8 +54,7 @@ impl GrafanaWebhookPayload {
 
         self.alerts
             .iter()
-            .enumerate()
-            .map(|(index, alert)| self.alert_event(integration, raw.clone(), index, alert))
+            .map(|alert| self.alert_event(integration, raw.clone(), alert))
             .collect()
     }
 
@@ -63,10 +62,9 @@ impl GrafanaWebhookPayload {
         &self,
         integration: &str,
         raw: Value,
-        index: usize,
         alert: &GrafanaAlertInstance,
     ) -> AlertEvent {
-        let status = self.canonical_status();
+        let status = self.canonical_status(alert.status.as_deref());
         let labels = self.merged_labels(alert);
         let annotations = self.merged_annotations(alert);
         let title = title_from(&labels, self.title.as_deref());
@@ -74,15 +72,19 @@ impl GrafanaWebhookPayload {
             .get("severity")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        let fingerprint = alert.fingerprint.clone().unwrap_or_else(|| {
-            stable_fingerprint(
-                self.group_key.as_deref(),
-                &title,
-                Some(index),
-                &labels,
-                status.as_str(),
-            )
-        });
+        let fingerprint = alert
+            .fingerprint
+            .as_deref()
+            .filter(|fingerprint| !fingerprint.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                stable_fingerprint(
+                    integration,
+                    "alert",
+                    self.group_key.as_deref(),
+                    &self.identity_labels_for(alert),
+                )
+            });
 
         let mut event = AlertEvent::new(
             integration,
@@ -110,7 +112,7 @@ impl GrafanaWebhookPayload {
     }
 
     fn group_event(&self, integration: &str, raw: Value) -> AlertEvent {
-        let status = self.canonical_status();
+        let status = self.canonical_status(None);
         let mut labels = self.group_labels.clone();
         labels.extend(self.common_labels.clone());
         self.add_group_context(&mut labels);
@@ -120,10 +122,9 @@ impl GrafanaWebhookPayload {
             .get("severity")
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
-        let fingerprint = self
-            .group_key
-            .clone()
-            .unwrap_or_else(|| stable_fingerprint(None, &title, None, &labels, status.as_str()));
+        let fingerprint = self.group_key.clone().unwrap_or_else(|| {
+            stable_fingerprint(integration, "group", None, &self.group_identity_labels())
+        });
 
         let mut event = AlertEvent::new(
             integration,
@@ -141,12 +142,44 @@ impl GrafanaWebhookPayload {
         event
     }
 
-    fn canonical_status(&self) -> String {
-        self.status
-            .as_deref()
-            .or(self.state.as_deref())
-            .unwrap_or("unknown")
-            .to_string()
+    fn canonical_status(&self, instance_status: Option<&str>) -> String {
+        if let Some(status) = instance_status
+            .filter(|status| !status.trim().is_empty())
+            .or_else(|| {
+                self.status
+                    .as_deref()
+                    .filter(|status| !status.trim().is_empty())
+            })
+        {
+            return status.to_string();
+        }
+
+        match self.state.as_deref().map(str::trim) {
+            Some(state) if state.eq_ignore_ascii_case("alerting") => "firing".to_string(),
+            Some(state) if state.eq_ignore_ascii_case("ok") => "resolved".to_string(),
+            Some(state) if !state.is_empty() => state.to_string(),
+            _ => "unknown".to_string(),
+        }
+    }
+
+    fn identity_labels_for(&self, alert: &GrafanaAlertInstance) -> BTreeMap<String, String> {
+        let mut labels = self.group_labels.clone();
+        labels.extend(self.common_labels.clone());
+        labels.extend(alert.labels.clone());
+        labels.remove("grafana_instance_status");
+        labels
+    }
+
+    fn group_identity_labels(&self) -> BTreeMap<String, String> {
+        let mut labels = self.group_labels.clone();
+        labels.extend(self.common_labels.clone());
+        if let Some(receiver) = &self.receiver {
+            labels.insert("grafana_receiver".to_string(), receiver.clone());
+        }
+        if let Some(org_id) = self.org_id {
+            labels.insert("grafana_org_id".to_string(), org_id.to_string());
+        }
+        labels
     }
 
     fn merged_labels(&self, alert: &GrafanaAlertInstance) -> BTreeMap<String, String> {
@@ -267,37 +300,32 @@ fn push_link(links: &mut Vec<AlertLink>, label: &str, url: Option<&str>) {
 }
 
 fn stable_fingerprint(
+    integration: &str,
+    event_kind: &str,
     group_key: Option<&str>,
-    title: &str,
-    index: Option<usize>,
     labels: &BTreeMap<String, String>,
-    status: &str,
 ) -> String {
-    let mut input = String::new();
-    if let Some(group_key) = group_key {
-        input.push_str(group_key);
-    }
-    input.push('|');
-    input.push_str(title);
-    input.push('|');
-    input.push_str(status);
-    if let Some(index) = index {
-        input.push('|');
-        input.push_str(&index.to_string());
-    }
+    let mut digest = Sha256::new();
+    update_fingerprint(&mut digest, "grafana-fallback-v1");
+    update_fingerprint(&mut digest, integration);
+    update_fingerprint(&mut digest, event_kind);
+    update_fingerprint(&mut digest, group_key.unwrap_or_default());
     for (key, value) in labels {
-        input.push('|');
-        input.push_str(key);
-        input.push('=');
-        input.push_str(value);
+        update_fingerprint(&mut digest, key);
+        update_fingerprint(&mut digest, value);
     }
 
-    let digest = Sha256::digest(input.as_bytes());
     let hex = digest
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("grafana:{hex}")
+}
+
+fn update_fingerprint(digest: &mut Sha256, value: &str) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -361,5 +389,131 @@ mod tests {
         assert_eq!(events[0].title, "Grafana test notification");
         assert_eq!(events[0].severity, "warning");
         assert_eq!(events[0].body.as_deref(), Some("test payload"));
+    }
+
+    #[test]
+    fn fallback_fingerprint_survives_resolution() {
+        let integration = GrafanaIntegration::new("grafana");
+        let firing = integration
+            .normalize(serde_json::json!({
+                "status": "firing",
+                "groupKey": "{alertname=\"DiskFull\"}",
+                "alerts": [{
+                    "status": "firing",
+                    "fingerprint": "",
+                    "labels": {
+                        "alertname": "DiskFull",
+                        "instance": "db-1"
+                    }
+                }]
+            }))
+            .unwrap();
+        let resolved = integration
+            .normalize(serde_json::json!({
+                "status": "resolved",
+                "groupKey": "{alertname=\"DiskFull\"}",
+                "alerts": [{
+                    "status": "resolved",
+                    "fingerprint": "",
+                    "labels": {
+                        "alertname": "DiskFull",
+                        "instance": "db-1"
+                    }
+                }]
+            }))
+            .unwrap();
+
+        assert_eq!(firing[0].status, "firing");
+        assert_eq!(resolved[0].status, "resolved");
+        assert_eq!(firing[0].fingerprint, resolved[0].fingerprint);
+    }
+
+    #[test]
+    fn fallback_fingerprints_survive_alert_reordering() {
+        let integration = GrafanaIntegration::new("grafana");
+        let first = integration
+            .normalize(serde_json::json!({
+                "status": "firing",
+                "groupKey": "{alertname=\"DiskFull\"}",
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "labels": { "alertname": "DiskFull", "instance": "db-1" }
+                    },
+                    {
+                        "status": "firing",
+                        "labels": { "alertname": "DiskFull", "instance": "db-2" }
+                    }
+                ]
+            }))
+            .unwrap();
+        let reordered = integration
+            .normalize(serde_json::json!({
+                "status": "firing",
+                "groupKey": "{alertname=\"DiskFull\"}",
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "labels": { "alertname": "DiskFull", "instance": "db-2" }
+                    },
+                    {
+                        "status": "firing",
+                        "labels": { "alertname": "DiskFull", "instance": "db-1" }
+                    }
+                ]
+            }))
+            .unwrap();
+
+        let fingerprints = |events: &[AlertEvent]| {
+            events
+                .iter()
+                .map(|event| (event.labels["instance"].clone(), event.fingerprint.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(fingerprints(&first), fingerprints(&reordered));
+    }
+
+    #[test]
+    fn maps_state_only_lifecycle_statuses_and_keeps_group_identity() {
+        let integration = GrafanaIntegration::new("grafana");
+        let alerting = integration
+            .normalize(serde_json::json!({
+                "state": "alerting",
+                "receiver": "simple-alert-proxy",
+                "orgId": 1,
+                "commonLabels": { "alertname": "StateOnly" },
+                "alerts": []
+            }))
+            .unwrap();
+        let ok = integration
+            .normalize(serde_json::json!({
+                "state": "ok",
+                "receiver": "simple-alert-proxy",
+                "orgId": 1,
+                "commonLabels": { "alertname": "StateOnly" },
+                "alerts": []
+            }))
+            .unwrap();
+
+        assert_eq!(alerting[0].status, "firing");
+        assert_eq!(ok[0].status, "resolved");
+        assert_eq!(alerting[0].fingerprint, ok[0].fingerprint);
+    }
+
+    #[test]
+    fn instance_status_overrides_group_status() {
+        let integration = GrafanaIntegration::new("grafana");
+        let events = integration
+            .normalize(serde_json::json!({
+                "status": "firing",
+                "alerts": [{
+                    "status": "resolved",
+                    "fingerprint": "resolved-instance",
+                    "labels": { "alertname": "MixedStatus" }
+                }]
+            }))
+            .unwrap();
+
+        assert_eq!(events[0].status, "resolved");
     }
 }

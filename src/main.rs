@@ -3310,6 +3310,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_grafana_state_fallback_routes_and_resolves_same_group() {
+        let firing_received = Arc::new(Mutex::new(Vec::new()));
+        let resolved_received = Arc::new(Mutex::new(Vec::new()));
+        let firing_url = spawn_mock_google_chat(Arc::clone(&firing_received)).await;
+        let resolved_url = spawn_mock_google_chat(Arc::clone(&resolved_received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.integrations = BTreeMap::from([(
+            "grafana".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "grafana".to_string(),
+                path: "/webhooks/grafana".to_string(),
+                auth: None,
+            }),
+        )]);
+        config.routing.default_receiver = Some("resolved-target".to_string());
+        config.routing.routes = vec![config::RouteConfig {
+            name: "firing-grafana".to_string(),
+            receiver: "firing-target".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            continue_matching: false,
+            matchers: vec![config::MatcherConfig {
+                field: "status".to_string(),
+                equals: Some("firing".to_string()),
+                regex: None,
+                contains: None,
+            }],
+        }];
+        config.receivers = BTreeMap::from([
+            (
+                "firing-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: firing_url,
+                    owner_team: None,
+                    timeout_secs: 10,
+                }),
+            ),
+            (
+                "resolved-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: resolved_url,
+                    owner_team: None,
+                    timeout_secs: 10,
+                }),
+            ),
+        ]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        let state_payload = |state: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/webhooks/grafana")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "state": state,
+                        "receiver": "simple-alert-proxy",
+                        "orgId": 1,
+                        "commonLabels": { "alertname": "StateOnly" },
+                        "alerts": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let firing_response = app
+            .clone()
+            .oneshot(state_payload("alerting"))
+            .await
+            .unwrap();
+        let resolved_response = app.clone().oneshot(state_payload("ok")).await.unwrap();
+
+        assert_eq!(firing_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(resolved_response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&firing_received, 1).await;
+        wait_for_received_count(&resolved_received, 1).await;
+        wait_for_succeeded_deliveries(app.clone(), 2).await;
+
+        let firing = firing_received.lock().unwrap().clone();
+        let resolved = resolved_received.lock().unwrap().clone();
+        assert_eq!(firing[0]["event"]["status"], "firing");
+        assert_eq!(resolved[0]["event"]["status"], "resolved");
+        assert_eq!(
+            firing[0]["event"]["fingerprint"],
+            resolved[0]["event"]["fingerprint"]
+        );
+
+        let groups = get_api_json(app, "/api/alert-groups").await;
+        assert_eq!(groups.as_array().unwrap().len(), 1);
+        assert_eq!(groups[0]["status"], "resolved");
+        assert_eq!(groups[0]["event_count"], 2);
+    }
+
+    #[tokio::test]
     async fn webhook_accepts_after_persisting_before_delivery_finishes() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let chat_url = spawn_slow_mock_google_chat(Arc::clone(&received)).await;
