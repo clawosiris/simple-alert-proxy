@@ -1,9 +1,9 @@
 # simple-alert-proxy
 
-`simple-alert-proxy` is a compact Rust alert webhook gateway. It accepts SigNoz
-and generic JSON alert webhooks, normalizes them into canonical alert events,
-routes them to chat or webhook targets, persists delivery state in SQLite, and
-serves a small operator UI for inspecting and acting on alerts.
+`simple-alert-proxy` is a compact Rust alert webhook gateway. It accepts SigNoz,
+Grafana, and generic JSON alert webhooks, normalizes them into canonical alert
+events, routes them to chat or webhook targets, persists delivery state in
+SQLite, and serves a small operator UI for inspecting and acting on alerts.
 
 The current mainline implementation keeps the original SigNoz-to-Google-Chat
 behavior as a compatibility path while adding source-agnostic integrations,
@@ -13,6 +13,7 @@ scheduling, and optional advisory intelligence scaffolding.
 ## Feature Set
 
 - SigNoz compatibility endpoint at `POST /webhooks/signoz`
+- First-class Grafana webhook endpoint support through configured integrations
 - Generic JSON integrations at `POST /webhooks/{integration}`
 - Config-only mapping into canonical alert events
 - Routing by status, labels, annotations, or JSON payload fields
@@ -215,6 +216,13 @@ integrations:
     path: "/webhooks/signoz"
     auth:
       bearer_token: "replace-me"
+
+  grafana:
+    type: "builtin"
+    preset: "grafana"
+    path: "/webhooks/grafana"
+    auth:
+      bearer_token: "replace-me"
 ```
 
 The built-in operator UI supports local user login backed by SQLite sessions.
@@ -247,6 +255,7 @@ are:
 
 - `signoz`
 - `alertmanager`
+- `grafana`
 
 Generic JSON integrations use dotted paths or JSON pointers to map payload
 fields. Supported generic JSON presets are:
@@ -373,14 +382,15 @@ intelligence:
 
 `simple-alert-proxy` supports two intake styles:
 
-- Built-in source presets such as SigNoz through `POST /webhooks/signoz`
+- Built-in source presets such as SigNoz and Grafana through configured
+  `POST /webhooks/{integration}` paths
 - Configured generic JSON integrations through `POST /webhooks/{integration}`
 
 Built-in integrations are configured under `integrations` and keep parser logic
-for payload shapes that need source-specific handling. SigNoz and
-Alertmanager-compatible payloads use this path so `alerts[]`, common
-labels/annotations, rule metadata, and grouped Google Chat delivery keep their
-existing behavior.
+for payload shapes that need source-specific handling. SigNoz,
+Alertmanager-compatible, and Grafana payloads use this path so `alerts[]`,
+common labels/annotations, rule metadata, links, and source-specific event
+cardinality keep their documented behavior.
 
 Generic JSON integrations do not require Rust changes for simple payload shapes.
 Each integration maps fields from an incoming JSON document into the canonical
@@ -434,6 +444,36 @@ curl -X POST http://127.0.0.1:8080/webhooks/openvas-example \
 
 Use `POST /debug/webhook` while integrating a new source if you need to inspect
 the redacted inbound payload before committing a mapping.
+
+## Grafana Setup
+
+Grafana unified alerting can send webhook contact-point payloads directly to a
+configured built-in Grafana integration:
+
+```yaml
+integrations:
+  grafana:
+    type: "builtin"
+    preset: "grafana"
+    path: "/webhooks/grafana"
+    auth:
+      bearer_token: "replace-me"
+```
+
+Point the Grafana webhook contact point at:
+
+```text
+https://your-proxy.example.com/webhooks/grafana
+```
+
+The Grafana parser emits one canonical alert event per item in Grafana's
+`alerts[]` array. If Grafana sends an empty test payload, the proxy emits one
+group-level event using `groupKey`, `title`, `message`, and common labels.
+Instance links such as `generatorURL`, `silenceURL`, `dashboardURL`, and
+`panelURL` are exposed as structured event links.
+
+If you need a highly customized Grafana payload transform, the generic JSON
+integration still accepts `preset: "grafana"` with explicit field mappings.
 
 ## SigNoz Setup
 

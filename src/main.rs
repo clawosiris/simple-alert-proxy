@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 mod alert;
 mod config;
 mod google_chat;
+mod grafana;
 mod integration;
 mod redaction;
 mod routing;
@@ -1228,6 +1229,10 @@ fn process_builtin_alerts(
 ) -> Result<(StatusCode, Json<Value>), WebhookError> {
     match preset {
         "signoz" | "alertmanager" => process_signoz_alerts(state, name, payload),
+        "grafana" => {
+            let events = integration::normalize_grafana(name, payload)?;
+            process_generic_events(state, &events)
+        }
         _ => Err(integration::IntegrationError::Unknown(preset.to_string()).into()),
     }
 }
@@ -3205,6 +3210,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_grafana_path_normalizes_instances_and_routes_events() {
+        let critical_received = Arc::new(Mutex::new(Vec::new()));
+        let default_received = Arc::new(Mutex::new(Vec::new()));
+        let critical_url = spawn_mock_google_chat(Arc::clone(&critical_received)).await;
+        let default_url = spawn_mock_google_chat(Arc::clone(&default_received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.integrations = BTreeMap::from([(
+            "grafana".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "grafana".to_string(),
+                path: "/webhooks/grafana".to_string(),
+                auth: None,
+            }),
+        )]);
+        config.routing.default_receiver = Some("default-target".to_string());
+        config.routing.routes = vec![config::RouteConfig {
+            name: "critical-grafana".to_string(),
+            receiver: "critical-target".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            continue_matching: false,
+            matchers: vec![config::MatcherConfig {
+                field: "label.severity".to_string(),
+                equals: Some("critical".to_string()),
+                regex: None,
+                contains: None,
+            }],
+        }];
+        config.receivers = BTreeMap::from([
+            (
+                "critical-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: critical_url,
+                    owner_team: None,
+                    timeout_secs: 10,
+                }),
+            ),
+            (
+                "default-target".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: default_url,
+                    owner_team: None,
+                    timeout_secs: 10,
+                }),
+            ),
+        ]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app.clone().oneshot(grafana_request()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&critical_received, 1).await;
+        wait_for_received_count(&default_received, 1).await;
+        wait_for_succeeded_deliveries(app.clone(), 2).await;
+
+        let critical = critical_received.lock().unwrap().clone();
+        assert_eq!(critical[0]["event"]["integration"], "grafana");
+        assert_eq!(critical[0]["event"]["source"], "grafana");
+        assert_eq!(critical[0]["event"]["fingerprint"], "grafana-latency-1");
+        assert_eq!(critical[0]["event"]["severity"], "critical");
+        assert_eq!(
+            critical[0]["event"]["labels"]["grafana_folder"],
+            "Production"
+        );
+        assert_eq!(
+            critical[0]["event"]["labels"]["grafana_group_key"],
+            "{alertname=\"HighLatency\"}"
+        );
+        assert_eq!(
+            critical[0]["event"]["links"][0]["url"],
+            "https://grafana.example.test/"
+        );
+        assert_eq!(critical[0]["delivery"]["route"], "critical-grafana");
+
+        let default = default_received.lock().unwrap().clone();
+        assert_eq!(default[0]["event"]["fingerprint"], "grafana-latency-2");
+        assert_eq!(default[0]["event"]["severity"], "warning");
+        assert_eq!(default[0]["delivery"]["route"], "default");
+
+        let events = get_api_json(app.clone(), "/api/alert-events").await;
+        assert_eq!(events.as_array().unwrap().len(), 2);
+        assert_eq!(
+            find_record(&events, "fingerprint", "grafana-latency-1")["raw_payload"]["receiver"],
+            "simple-alert-proxy"
+        );
+
+        let groups = get_api_json(app, "/api/alert-groups").await;
+        assert_eq!(
+            find_record(&groups, "fingerprint", "grafana-latency-1")["status"],
+            "active"
+        );
+        assert_eq!(
+            find_record(&groups, "fingerprint", "grafana-latency-2")["severity"],
+            "warning"
+        );
+    }
+
+    #[tokio::test]
     async fn webhook_accepts_after_persisting_before_delivery_finishes() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let chat_url = spawn_slow_mock_google_chat(Arc::clone(&received)).await;
@@ -4752,6 +4857,15 @@ mod tests {
             .uri("/webhooks/openvas")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(payload.to_string()))
+            .unwrap()
+    }
+
+    fn grafana_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/webhooks/grafana")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(include_str!("../examples/grafana-webhook.json")))
             .unwrap()
     }
 
