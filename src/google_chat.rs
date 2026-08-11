@@ -86,7 +86,7 @@ impl GoogleChatClient {
         receiver: &ReceiverConfig,
         event: &AlertEvent,
         delivery: &Delivery,
-        delivery_id: i64,
+        matrix_transaction_id: &str,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
         match receiver {
@@ -110,7 +110,7 @@ impl GoogleChatClient {
                     .await
             }
             ReceiverConfig::Matrix(receiver) => {
-                self.send_matrix(receiver, event, delivery, delivery_id, debug)
+                self.send_matrix(receiver, event, delivery, matrix_transaction_id, debug)
                     .await
             }
         }
@@ -186,7 +186,7 @@ impl GoogleChatClient {
         receiver: &MatrixReceiverConfig,
         event: &AlertEvent,
         delivery: &Delivery,
-        delivery_id: i64,
+        transaction_id: &str,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
         let title = receiver
@@ -206,7 +206,7 @@ impl GoogleChatClient {
         let token = receiver
             .resolved_access_token()
             .map_err(|error| GoogleChatError::Config(error.to_string()))?;
-        let url = matrix_send_url(receiver, delivery_id);
+        let url = matrix_send_url(receiver, transaction_id);
 
         if let Some(debug) = debug {
             log_outgoing_alert(&message, debug);
@@ -255,11 +255,11 @@ impl GoogleChatClient {
     }
 }
 
-fn matrix_send_url(receiver: &MatrixReceiverConfig, delivery_id: i64) -> String {
-    let homeserver = receiver.homeserver_url.trim_end_matches('/');
-    let room_id = percent_encode_path_segment(&receiver.room_id);
-    let txn_id = format!("simple-alert-proxy-{delivery_id}");
-    format!("{homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}")
+fn matrix_send_url(receiver: &MatrixReceiverConfig, transaction_id: &str) -> String {
+    let homeserver = receiver.homeserver_url.trim().trim_end_matches('/');
+    let room_id = percent_encode_path_segment(receiver.room_id.trim());
+    let transaction_id = percent_encode_path_segment(transaction_id);
+    format!("{homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{transaction_id}")
 }
 
 fn matrix_plaintext_body(title: &str, event: &AlertEvent, delivery: &Delivery) -> String {
@@ -317,16 +317,24 @@ fn matrix_html_body(title: &str, event: &AlertEvent, delivery: &Delivery) -> Str
 
     if !event.links.is_empty() {
         lines.push(String::new());
-        lines.extend(event.links.iter().map(|link| {
-            format!(
-                r#"<a href="{}">{}</a>"#,
-                escape_html(&link.url),
-                escape_html(&link.label)
-            )
-        }));
+        lines.extend(event.links.iter().map(matrix_html_link));
     }
 
     lines.join("<br>")
+}
+
+fn matrix_html_link(link: &crate::alert::AlertLink) -> String {
+    let is_safe_link =
+        reqwest::Url::parse(&link.url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+    if is_safe_link {
+        format!(
+            r#"<a href="{}">{}</a>"#,
+            escape_html(&link.url),
+            escape_html(&link.label)
+        )
+    } else {
+        format!("{}: {}", escape_html(&link.label), escape_html(&link.url))
+    }
 }
 
 fn escape_html(value: &str) -> String {
@@ -811,7 +819,7 @@ mod tests {
         };
 
         assert_eq!(
-            matrix_send_url(&receiver, 42),
+            matrix_send_url(&receiver, "simple-alert-proxy-42"),
             "https://matrix.example.test/_matrix/client/v3/rooms/%21room%3Aexample.test/send/m.room.message/simple-alert-proxy-42"
         );
     }
@@ -844,5 +852,33 @@ mod tests {
         assert!(html.contains("CPU &lt;high&gt;"));
         assert!(html.contains("5 &gt; 4 &amp; rising"));
         assert!(html.contains("https://grafana.example.test/a?b=1&amp;c=2"));
+    }
+
+    #[test]
+    fn matrix_message_does_not_link_unsafe_url_schemes() {
+        let mut event = AlertEvent::new(
+            "grafana",
+            "grafana",
+            "firing",
+            "critical",
+            "CPU high",
+            "cpu-1",
+            serde_json::json!({}),
+        );
+        event.links.push(crate::alert::AlertLink {
+            label: "source".to_string(),
+            url: "javascript:alert(1)".to_string(),
+        });
+        let delivery = Delivery {
+            route_name: "critical".to_string(),
+            receiver: "matrix-alerts".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+        };
+
+        let html = matrix_html_body("[firing] CPU high", &event, &delivery);
+
+        assert!(html.contains("source: javascript:alert(1)"));
+        assert!(!html.contains("href="));
     }
 }

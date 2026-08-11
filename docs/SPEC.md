@@ -472,7 +472,9 @@ durable delivery queue, retry, redaction, and replay behavior.
 Matrix receivers send `m.notice` room messages through the Matrix Client-Server
 API. The configured token must belong to a Matrix user or bot already joined to
 the target room with permission to send messages. Operators should prefer
-`access_token_env` so Matrix access tokens are not stored in config files.
+`access_token_env` so Matrix access tokens are not stored in config files. The
+configured `room_id` must be a canonical `!room:server` ID; aliases such as
+`#alerts:server` are not resolved.
 
 Generic JSON integrations can name a source preset for operator clarity and
 validation. Supported presets are `alertmanager`, `grafana`, `openobserve`, and

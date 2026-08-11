@@ -914,11 +914,34 @@ pub struct MatrixReceiverConfig {
 
 impl MatrixReceiverConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.homeserver_url.trim().is_empty() {
+        let homeserver_url = self.homeserver_url.trim();
+        if homeserver_url.is_empty() {
             bail!("homeserver_url must not be empty");
         }
-        if self.room_id.trim().is_empty() {
+        let homeserver = reqwest::Url::parse(homeserver_url)
+            .context("homeserver_url must be a valid absolute URL")?;
+        if !matches!(homeserver.scheme(), "http" | "https") || homeserver.host_str().is_none() {
+            bail!("homeserver_url must use http or https and include a host");
+        }
+        if !homeserver.username().is_empty() || homeserver.password().is_some() {
+            bail!("homeserver_url must not include credentials");
+        }
+        if homeserver.query().is_some() || homeserver.fragment().is_some() {
+            bail!("homeserver_url must not include a query or fragment");
+        }
+
+        let room_id = self.room_id.trim();
+        if room_id.is_empty() {
             bail!("room_id must not be empty");
+        }
+        let Some((localpart, server_name)) = room_id
+            .strip_prefix('!')
+            .and_then(|room_id| room_id.split_once(':'))
+        else {
+            bail!("room_id must use the canonical !room:server form");
+        };
+        if localpart.is_empty() || server_name.is_empty() {
+            bail!("room_id must use the canonical !room:server form");
         }
         if self.timeout_secs == 0 {
             bail!("timeout_secs must be greater than zero");
@@ -945,7 +968,12 @@ impl MatrixReceiverConfig {
             .access_token_env
             .as_deref()
             .context("access_token or access_token_env must be set")?;
-        env::var(env_name).with_context(|| format!("environment variable {env_name} is not set"))
+        let token = env::var(env_name)
+            .with_context(|| format!("environment variable {env_name} is not set"))?;
+        if token.trim().is_empty() {
+            bail!("environment variable {env_name} must not be empty");
+        }
+        Ok(token)
     }
 }
 
@@ -1229,6 +1257,40 @@ mod tests {
                 .to_string()
                 .contains("access_token and access_token_env are mutually exclusive")
         );
+    }
+
+    #[test]
+    fn rejects_matrix_receiver_with_invalid_homeserver_url() {
+        let receiver = MatrixReceiverConfig {
+            homeserver_url: "matrix.example.test?token=secret".to_string(),
+            room_id: "!ops:example.test".to_string(),
+            access_token: Some("inline".to_string()),
+            access_token_env: None,
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+
+        let error = receiver.validate().unwrap_err();
+
+        assert!(error.to_string().contains("valid absolute URL"));
+    }
+
+    #[test]
+    fn rejects_matrix_receiver_with_room_alias() {
+        let receiver = MatrixReceiverConfig {
+            homeserver_url: "https://matrix.example.test".to_string(),
+            room_id: "#ops:example.test".to_string(),
+            access_token: Some("inline".to_string()),
+            access_token_env: None,
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+
+        let error = receiver.validate().unwrap_err();
+
+        assert!(error.to_string().contains("canonical !room:server form"));
     }
 
     #[test]

@@ -70,3 +70,4 @@
 2026-08-11
 
 - Started issue #71 on `feat/matrix-receiver`: native Matrix receiver config and delivery through the Matrix Client-Server API, with env-token support, Matrix transaction IDs, mock-server tests, and docs/examples.
+- Reviewed PR #72 with `openai/gpt-5.6-sol`: fixed Matrix replay transaction-ID reuse, tightened homeserver/room validation, prevented unsafe HTML link schemes, and verified with fmt, 109 tests, Clippy, and diff checks.
