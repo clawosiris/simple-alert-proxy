@@ -162,7 +162,9 @@ common labels/annotations, instance labels/annotations, `groupKey`, timestamps,
 and structured links from `externalURL`, `generatorURL`, `silenceURL`,
 `dashboardURL`, and `panelURL`. If `alerts[]` is empty, the integration emits a
 single group-level event so Grafana contact-point tests still exercise routing
-and delivery.
+and delivery. Per-instance raw payloads retain the top-level Grafana context but
+contain only the current item in `alerts[]`, preventing sibling instances from
+crossing independently routed receiver or team boundaries.
 
 ## SigNoz Integration
 
