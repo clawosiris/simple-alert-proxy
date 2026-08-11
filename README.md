@@ -16,7 +16,7 @@ scheduling, and optional advisory intelligence scaffolding.
 - Generic JSON integrations at `POST /webhooks/{integration}`
 - Config-only mapping into canonical alert events
 - Routing by status, labels, annotations, or JSON payload fields
-- Google Chat, generic webhook, Slack, Mattermost, and Discord receivers
+- Google Chat, generic webhook, Slack, Mattermost, Discord, and Matrix receivers
 - SQLite persistence for alert events, alert groups, deliveries, audit entries,
   escalation tasks, and advisory enrichment
 - Durable delivery queue with bounded retry and dead-letter handling
@@ -318,7 +318,21 @@ receivers:
   discord-alerts:
     type: "discord"
     webhook_url: "https://discord.com/api/webhooks/example"
+
+  matrix-alerts:
+    type: "matrix"
+    homeserver_url: "https://matrix.example.com"
+    room_id: "!roomid:example.com"
+    access_token_env: "SIMPLE_ALERT_PROXY_MATRIX_TOKEN"
+    title_template: "[{{status}}] {{title}}"
 ```
+
+Matrix receivers send `m.notice` messages through the Matrix Client-Server API.
+The access token must belong to a user or bot account that has joined the room
+and can send messages there. Prefer `access_token_env` over inline
+`access_token` so Matrix credentials stay out of config files. `room_id` must
+use the canonical `!room:server` form; room aliases such as `#alerts:server`
+are not resolved.
 
 Escalation policies can be attached to routes:
 
