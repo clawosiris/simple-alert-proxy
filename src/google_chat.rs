@@ -2,7 +2,7 @@ use crate::{
     alert::AlertEvent,
     config::{
         ChatWebhookReceiverConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
-        ReceiverConfig,
+        MatrixReceiverConfig, ReceiverConfig,
     },
     redaction,
     routing::Delivery,
@@ -86,6 +86,7 @@ impl GoogleChatClient {
         receiver: &ReceiverConfig,
         event: &AlertEvent,
         delivery: &Delivery,
+        matrix_transaction_id: &str,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
         match receiver {
@@ -106,6 +107,10 @@ impl GoogleChatClient {
             }
             ReceiverConfig::Discord(receiver) => {
                 self.send_chat_webhook(receiver, event, delivery, debug, ChatTarget::Discord)
+                    .await
+            }
+            ReceiverConfig::Matrix(receiver) => {
+                self.send_matrix(receiver, event, delivery, matrix_transaction_id, debug)
                     .await
             }
         }
@@ -176,6 +181,53 @@ impl GoogleChatClient {
         .await
     }
 
+    async fn send_matrix(
+        &self,
+        receiver: &MatrixReceiverConfig,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        transaction_id: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let title = receiver
+            .title_template
+            .replace("{{status}}", &event.status)
+            .replace("{{alertname}}", &event.title)
+            .replace("{{title}}", &event.title)
+            .replace("{{severity}}", &event.severity);
+        let body = matrix_plaintext_body(&title, event, delivery);
+        let formatted_body = matrix_html_body(&title, event, delivery);
+        let message = json!({
+            "msgtype": "m.notice",
+            "body": body,
+            "format": "org.matrix.custom.html",
+            "formatted_body": formatted_body,
+        });
+        let token = receiver
+            .resolved_access_token()
+            .map_err(|error| GoogleChatError::Config(error.to_string()))?;
+        let url = matrix_send_url(receiver, transaction_id);
+
+        if let Some(debug) = debug {
+            log_outgoing_alert(&message, debug);
+        }
+
+        let response = self
+            .http
+            .put(url)
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(receiver.timeout_secs))
+            .json(&message)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(GoogleChatError::Rejected(response.status()))
+        }
+    }
+
     async fn post_json(
         &self,
         webhook_url: &str,
@@ -201,6 +253,109 @@ impl GoogleChatClient {
             Err(GoogleChatError::Rejected(response.status()))
         }
     }
+}
+
+fn matrix_send_url(receiver: &MatrixReceiverConfig, transaction_id: &str) -> String {
+    let homeserver = receiver.homeserver_url.trim().trim_end_matches('/');
+    let room_id = percent_encode_path_segment(receiver.room_id.trim());
+    let transaction_id = percent_encode_path_segment(transaction_id);
+    format!("{homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{transaction_id}")
+}
+
+fn matrix_plaintext_body(title: &str, event: &AlertEvent, delivery: &Delivery) -> String {
+    let mut lines = vec![
+        title.to_string(),
+        format!("Route: {}", delivery.route_name),
+        format!("Receiver: {}", delivery.receiver),
+        format!("Source: {} / {}", event.integration, event.source),
+        format!("Status: {}", event.status),
+        format!("Severity: {}", event.severity),
+        format!("Fingerprint: {}", event.fingerprint),
+    ];
+
+    if let Some(body) = &event.body
+        && !body.is_empty()
+    {
+        lines.push(String::new());
+        lines.push(body.clone());
+    }
+
+    if !event.links.is_empty() {
+        lines.push(String::new());
+        lines.extend(
+            event
+                .links
+                .iter()
+                .map(|link| format!("{}: {}", link.label, link.url)),
+        );
+    }
+
+    lines.join("\n")
+}
+
+fn matrix_html_body(title: &str, event: &AlertEvent, delivery: &Delivery) -> String {
+    let mut lines = vec![
+        format!("<strong>{}</strong>", escape_html(title)),
+        format!("Route: {}", escape_html(&delivery.route_name)),
+        format!("Receiver: {}", escape_html(&delivery.receiver)),
+        format!(
+            "Source: {} / {}",
+            escape_html(&event.integration),
+            escape_html(&event.source)
+        ),
+        format!("Status: {}", escape_html(&event.status)),
+        format!("Severity: {}", escape_html(&event.severity)),
+        format!("Fingerprint: {}", escape_html(&event.fingerprint)),
+    ];
+
+    if let Some(body) = &event.body
+        && !body.is_empty()
+    {
+        lines.push(String::new());
+        lines.push(escape_html(body));
+    }
+
+    if !event.links.is_empty() {
+        lines.push(String::new());
+        lines.extend(event.links.iter().map(matrix_html_link));
+    }
+
+    lines.join("<br>")
+}
+
+fn matrix_html_link(link: &crate::alert::AlertLink) -> String {
+    let is_safe_link =
+        reqwest::Url::parse(&link.url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+    if is_safe_link {
+        format!(
+            r#"<a href="{}">{}</a>"#,
+            escape_html(&link.url),
+            escape_html(&link.label)
+        )
+    } else {
+        format!("{}: {}", escape_html(&link.label), escape_html(&link.url))
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -477,8 +632,10 @@ fn format_severity_counts(counts: &BTreeMap<String, usize>) -> String {
 pub enum GoogleChatError {
     #[error(transparent)]
     Http(#[from] reqwest::Error),
-    #[error("Google Chat webhook rejected message with status {0}")]
+    #[error("target rejected message with status {0}")]
     Rejected(StatusCode),
+    #[error("target config error: {0}")]
+    Config(String),
 }
 
 #[cfg(test)]
@@ -647,5 +804,81 @@ mod tests {
         assert_eq!(redacted["event"]["authorization"], "[redacted]");
         assert_eq!(redacted["delivery"]["webhook_url"], "[redacted]");
         assert_eq!(redacted["event"]["title"], "Alert");
+    }
+
+    #[test]
+    fn builds_matrix_send_url_with_encoded_room_id() {
+        let receiver = MatrixReceiverConfig {
+            homeserver_url: "https://matrix.example.test/".to_string(),
+            room_id: "!room:example.test".to_string(),
+            access_token: Some("token".to_string()),
+            access_token_env: None,
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+
+        assert_eq!(
+            matrix_send_url(&receiver, "simple-alert-proxy-42"),
+            "https://matrix.example.test/_matrix/client/v3/rooms/%21room%3Aexample.test/send/m.room.message/simple-alert-proxy-42"
+        );
+    }
+
+    #[test]
+    fn matrix_message_escapes_formatted_body() {
+        let mut event = AlertEvent::new(
+            "grafana",
+            "grafana",
+            "firing",
+            "critical",
+            "CPU <high>",
+            "cpu-1",
+            serde_json::json!({}),
+        );
+        event.body = Some("5 > 4 & rising".to_string());
+        event.links.push(crate::alert::AlertLink {
+            label: "source".to_string(),
+            url: "https://grafana.example.test/a?b=1&c=2".to_string(),
+        });
+        let delivery = Delivery {
+            route_name: "critical".to_string(),
+            receiver: "matrix-alerts".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+        };
+
+        let html = matrix_html_body("[firing] CPU <high>", &event, &delivery);
+
+        assert!(html.contains("CPU &lt;high&gt;"));
+        assert!(html.contains("5 &gt; 4 &amp; rising"));
+        assert!(html.contains("https://grafana.example.test/a?b=1&amp;c=2"));
+    }
+
+    #[test]
+    fn matrix_message_does_not_link_unsafe_url_schemes() {
+        let mut event = AlertEvent::new(
+            "grafana",
+            "grafana",
+            "firing",
+            "critical",
+            "CPU high",
+            "cpu-1",
+            serde_json::json!({}),
+        );
+        event.links.push(crate::alert::AlertLink {
+            label: "source".to_string(),
+            url: "javascript:alert(1)".to_string(),
+        });
+        let delivery = Delivery {
+            route_name: "critical".to_string(),
+            receiver: "matrix-alerts".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+        };
+
+        let html = matrix_html_body("[firing] CPU high", &event, &delivery);
+
+        assert!(html.contains("source: javascript:alert(1)"));
+        assert!(!html.contains("href="));
     }
 }

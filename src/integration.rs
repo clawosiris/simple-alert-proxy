@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use crate::{
     alert::{AlertEvent, AlertLink},
     config::{BuiltinIntegrationConfig, GenericJsonIntegrationConfig, IntegrationConfig},
+    grafana::{self, GrafanaIntegration},
     signoz::{self, SigNozAlert},
 };
 
@@ -90,10 +91,16 @@ impl Integration for GenericJsonIntegration<'_> {
 pub enum IntegrationError {
     #[error("unknown integration {0}")]
     Unknown(String),
+    #[error("invalid Grafana payload: {0}")]
+    Grafana(#[from] grafana::GrafanaParseError),
     #[error("invalid SigNoz payload: {0}")]
     SigNoz(#[from] signoz::AlertParseError),
     #[error("missing required field {field} at {path}")]
     MissingRequired { field: &'static str, path: String },
+}
+
+pub fn normalize_grafana(name: &str, raw: Value) -> Result<Vec<AlertEvent>, IntegrationError> {
+    Ok(GrafanaIntegration::new(name).normalize(raw)?)
 }
 
 pub enum ConfiguredIntegration<'a> {
