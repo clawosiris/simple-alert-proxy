@@ -3292,6 +3292,11 @@ mod tests {
         assert_eq!(critical[0]["event"]["source"], "grafana");
         assert_eq!(critical[0]["event"]["fingerprint"], "grafana-latency-1");
         assert_eq!(critical[0]["event"]["severity"], "critical");
+        let critical_raw_alerts = critical[0]["event"]["raw_payload"]["alerts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(critical_raw_alerts.len(), 1);
+        assert_eq!(critical_raw_alerts[0]["fingerprint"], "grafana-latency-1");
         assert_eq!(
             critical[0]["event"]["labels"]["grafana_folder"],
             "Production"
@@ -3309,13 +3314,25 @@ mod tests {
         let default = default_received.lock().unwrap().clone();
         assert_eq!(default[0]["event"]["fingerprint"], "grafana-latency-2");
         assert_eq!(default[0]["event"]["severity"], "warning");
+        let default_raw_alerts = default[0]["event"]["raw_payload"]["alerts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(default_raw_alerts.len(), 1);
+        assert_eq!(default_raw_alerts[0]["fingerprint"], "grafana-latency-2");
         assert_eq!(default[0]["delivery"]["route"], "default");
 
         let events = get_api_json(app.clone(), "/api/alert-events").await;
         assert_eq!(events.as_array().unwrap().len(), 2);
+        let stored_critical = find_record(&events, "fingerprint", "grafana-latency-1");
         assert_eq!(
-            find_record(&events, "fingerprint", "grafana-latency-1")["raw_payload"]["receiver"],
+            stored_critical["raw_payload"]["receiver"],
             "simple-alert-proxy"
+        );
+        let stored_critical_alerts = stored_critical["raw_payload"]["alerts"].as_array().unwrap();
+        assert_eq!(stored_critical_alerts.len(), 1);
+        assert_eq!(
+            stored_critical_alerts[0]["fingerprint"],
+            "grafana-latency-1"
         );
 
         let groups = get_api_json(app, "/api/alert-groups").await;

@@ -484,7 +484,9 @@ The Grafana parser emits one canonical alert event per item in Grafana's
 `alerts[]` array. If Grafana sends an empty test payload, the proxy emits one
 group-level event using `groupKey`, `title`, `message`, and common labels.
 Instance links such as `generatorURL`, `silenceURL`, `dashboardURL`, and
-`panelURL` are exposed as structured event links.
+`panelURL` are exposed as structured event links. Each per-instance event keeps
+the top-level Grafana context but scopes its raw `alerts[]` payload to that
+instance so independently routed receivers do not receive sibling alerts.
 
 If you need a highly customized Grafana payload transform, the generic JSON
 integration still accepts `preset: "grafana"` with explicit field mappings.

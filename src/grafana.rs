@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -17,7 +17,7 @@ impl GrafanaIntegration {
 
     pub fn normalize(&self, raw: Value) -> Result<Vec<AlertEvent>, GrafanaParseError> {
         let payload: GrafanaWebhookPayload = serde_json::from_value(raw.clone())?;
-        Ok(payload.into_events(self.name.as_str(), raw))
+        payload.into_events(self.name.as_str(), raw)
     }
 }
 
@@ -47,15 +47,34 @@ struct GrafanaWebhookPayload {
 }
 
 impl GrafanaWebhookPayload {
-    fn into_events(self, integration: &str, raw: Value) -> Vec<AlertEvent> {
+    fn into_events(
+        self,
+        integration: &str,
+        raw: Value,
+    ) -> Result<Vec<AlertEvent>, GrafanaParseError> {
         if self.alerts.is_empty() {
-            return vec![self.group_event(integration, raw)];
+            return Ok(vec![self.group_event(integration, raw)]);
         }
 
-        self.alerts
+        let (raw_context, raw_alerts) = split_raw_alerts(raw)?;
+        if self.alerts.len() != raw_alerts.len() {
+            return Err(GrafanaParseError::Structure(
+                "normalized and raw alert counts differ",
+            ));
+        }
+
+        Ok(self
+            .alerts
             .iter()
-            .map(|alert| self.alert_event(integration, raw.clone(), alert))
-            .collect()
+            .zip(raw_alerts)
+            .map(|(alert, raw_alert)| {
+                self.alert_event(
+                    integration,
+                    scoped_raw_payload(&raw_context, raw_alert),
+                    alert,
+                )
+            })
+            .collect())
     }
 
     fn alert_event(
@@ -238,6 +257,24 @@ impl GrafanaWebhookPayload {
     }
 }
 
+fn split_raw_alerts(raw: Value) -> Result<(Map<String, Value>, Vec<Value>), GrafanaParseError> {
+    let Value::Object(mut context) = raw else {
+        return Err(GrafanaParseError::Structure("expected a JSON object"));
+    };
+    let Some(Value::Array(alerts)) = context.remove("alerts") else {
+        return Err(GrafanaParseError::Structure(
+            "expected alerts to be an array",
+        ));
+    };
+    Ok((context, alerts))
+}
+
+fn scoped_raw_payload(context: &Map<String, Value>, alert: Value) -> Value {
+    let mut scoped = context.clone();
+    scoped.insert("alerts".to_string(), Value::Array(vec![alert]));
+    Value::Object(scoped)
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -332,6 +369,8 @@ fn update_fingerprint(digest: &mut Sha256, value: &str) {
 pub enum GrafanaParseError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("invalid Grafana payload structure: {0}")]
+    Structure(&'static str),
 }
 
 #[cfg(test)]
@@ -368,6 +407,42 @@ mod tests {
         assert!(events[0].links.iter().any(|link| link.label == "dashboard"));
         assert!(events[0].links.iter().any(|link| link.label == "panel"));
         assert_eq!(events[1].fingerprint, "grafana-latency-2");
+    }
+
+    #[test]
+    fn scopes_raw_payload_to_each_alert_instance() {
+        let integration = GrafanaIntegration::new("grafana");
+        let events = integration
+            .normalize(serde_json::json!({
+                "receiver": "simple-alert-proxy",
+                "commonLabels": { "environment": "production" },
+                "vendorExtension": { "trace": "preserved" },
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "fingerprint": "instance-a",
+                        "labels": { "alertname": "HighLatency", "team": "a" }
+                    },
+                    {
+                        "status": "firing",
+                        "fingerprint": "instance-b",
+                        "labels": { "alertname": "DiskFull", "team": "b" }
+                    }
+                ]
+            }))
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        for (event, expected_fingerprint) in events.iter().zip(["instance-a", "instance-b"]) {
+            let raw_alerts = event.raw_payload["alerts"].as_array().unwrap();
+            assert_eq!(raw_alerts.len(), 1);
+            assert_eq!(raw_alerts[0]["fingerprint"], expected_fingerprint);
+            assert_eq!(
+                event.raw_payload["commonLabels"]["environment"],
+                "production"
+            );
+            assert_eq!(event.raw_payload["vendorExtension"]["trace"], "preserved");
+        }
     }
 
     #[test]

@@ -74,3 +74,4 @@
 - Started issue #71 on `feat/matrix-receiver`: native Matrix receiver config and delivery through the Matrix Client-Server API, with env-token support, Matrix transaction IDs, mock-server tests, and docs/examples.
 - Reviewed PR #72 with `openai/gpt-5.6-sol`: fixed Matrix replay transaction-ID reuse, tightened homeserver/room validation, prevented unsafe HTML link schemes, and verified with fmt, 109 tests, Clippy, and diff checks.
 - Merged current `main` into `feat/grafana-integration` to resolve PR #73 conflicts after Matrix support landed, preserving both feature worklogs and verifying the combined receiver/integration code.
+- Started issue #74 on `fix/issue-74-grafana-payload-isolation`: scope each canonical Grafana event's raw payload to its own alert instance while preserving group/common and unknown top-level context, with parser and end-to-end receiver/storage regressions.
