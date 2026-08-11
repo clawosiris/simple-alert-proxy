@@ -144,6 +144,9 @@ impl AppConfig {
                     bail!("receiver {name} timeout_secs must be greater than zero")
                 }
                 ReceiverConfig::Discord(_) => {}
+                ReceiverConfig::Matrix(receiver) => receiver
+                    .validate()
+                    .with_context(|| format!("receiver {name} matrix config is invalid"))?,
             }
         }
 
@@ -848,6 +851,7 @@ pub enum ReceiverConfig {
     Slack(ChatWebhookReceiverConfig),
     Mattermost(ChatWebhookReceiverConfig),
     Discord(ChatWebhookReceiverConfig),
+    Matrix(MatrixReceiverConfig),
 }
 
 impl ReceiverConfig {
@@ -858,6 +862,7 @@ impl ReceiverConfig {
             Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
                 receiver.owner_team.as_deref()
             }
+            Self::Matrix(receiver) => receiver.owner_team.as_deref(),
         }
     }
 }
@@ -891,6 +896,57 @@ pub struct ChatWebhookReceiverConfig {
     pub title_template: String,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MatrixReceiverConfig {
+    pub homeserver_url: String,
+    pub room_id: String,
+    pub access_token: Option<String>,
+    pub access_token_env: Option<String>,
+    #[serde(default, alias = "team")]
+    pub owner_team: Option<String>,
+    #[serde(default = "default_title_template")]
+    pub title_template: String,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl MatrixReceiverConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.homeserver_url.trim().is_empty() {
+            bail!("homeserver_url must not be empty");
+        }
+        if self.room_id.trim().is_empty() {
+            bail!("room_id must not be empty");
+        }
+        if self.timeout_secs == 0 {
+            bail!("timeout_secs must be greater than zero");
+        }
+        match (&self.access_token, &self.access_token_env) {
+            (Some(_), Some(_)) => bail!("access_token and access_token_env are mutually exclusive"),
+            (Some(token), None) if token.trim().is_empty() => {
+                bail!("access_token must not be empty")
+            }
+            (None, Some(env_name)) if env_name.trim().is_empty() => {
+                bail!("access_token_env must not be empty")
+            }
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            (None, None) => bail!("access_token or access_token_env must be set"),
+        }
+    }
+
+    pub fn resolved_access_token(&self) -> anyhow::Result<String> {
+        if let Some(token) = &self.access_token {
+            return Ok(token.clone());
+        }
+
+        let env_name = self
+            .access_token_env
+            .as_deref()
+            .context("access_token or access_token_env must be set")?;
+        env::var(env_name).with_context(|| format!("environment variable {env_name} is not set"))
+    }
 }
 
 fn default_bind() -> String {
@@ -1115,6 +1171,63 @@ mod tests {
             error
                 .to_string()
                 .contains("integration openvas title field must not be empty")
+        );
+    }
+
+    #[test]
+    fn validates_matrix_receiver_required_fields() {
+        let receiver = MatrixReceiverConfig {
+            homeserver_url: "https://matrix.example.test".to_string(),
+            room_id: "!ops:example.test".to_string(),
+            access_token: None,
+            access_token_env: Some("MATRIX_TOKEN".to_string()),
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+
+        receiver.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_matrix_receiver_without_token_source() {
+        let receiver = MatrixReceiverConfig {
+            homeserver_url: "https://matrix.example.test".to_string(),
+            room_id: "!ops:example.test".to_string(),
+            access_token: None,
+            access_token_env: None,
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+
+        let error = receiver.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("access_token or access_token_env must be set")
+        );
+    }
+
+    #[test]
+    fn rejects_matrix_receiver_ambiguous_token_sources() {
+        let receiver = MatrixReceiverConfig {
+            homeserver_url: "https://matrix.example.test".to_string(),
+            room_id: "!ops:example.test".to_string(),
+            access_token: Some("inline".to_string()),
+            access_token_env: Some("MATRIX_TOKEN".to_string()),
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+
+        let error = receiver.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("access_token and access_token_env are mutually exclusive")
         );
     }
 

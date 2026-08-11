@@ -66,3 +66,7 @@
 
 - Closed issue #30 after PRs #31 and #62 completed the user/team/RBAC ownership scope. Started #4 on `feat/escalation-chain-actions`: escalation worker execution for ordered steps, richer step targets, next-step scheduling, and chain regression coverage.
 - Started release `v0.0.11`: bumped Cargo/README version references after PR #63 static on-call schedules and PR #64 escalation-chain execution landed on `main`.
+
+2026-08-11
+
+- Started issue #71 on `feat/matrix-receiver`: native Matrix receiver config and delivery through the Matrix Client-Server API, with env-token support, Matrix transaction IDs, mock-server tests, and docs/examples.

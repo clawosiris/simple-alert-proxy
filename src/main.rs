@@ -1442,7 +1442,7 @@ fn queue_target_event_delivery(
                         receiver_name: delivery.receiver.as_str(),
                     });
                     target_client
-                        .send_receiver_event(&receiver, &event, &delivery, debug)
+                        .send_receiver_event(&receiver, &event, &delivery, delivery_id, debug)
                         .await
                         .map_err(redacted_delivery_error)
                 }
@@ -1485,7 +1485,7 @@ fn spawn_replayed_delivery(
                         receiver_name: delivery.receiver.as_str(),
                     });
                     target_client
-                        .send_receiver_event(&receiver, &event, &delivery, debug)
+                        .send_receiver_event(&receiver, &event, &delivery, delivery_id, debug)
                         .await
                         .map_err(redacted_delivery_error)
                 }
@@ -1583,6 +1583,7 @@ fn redacted_delivery_error(error: google_chat::GoogleChatError) -> String {
         google_chat::GoogleChatError::Rejected(status) => {
             format!("target rejected delivery with status {status}")
         }
+        google_chat::GoogleChatError::Config(_) => "target configuration failed".to_string(),
         google_chat::GoogleChatError::Http(_) => "target delivery failed".to_string(),
     }
 }
@@ -2114,8 +2115,9 @@ mod tests {
         AlertGroupingConfig, AuthConfig, BuiltinIntegrationConfig, DebugConfig, DeliveryConfig,
         EscalationConfig, EscalationPolicyConfig, EscalationStepConfig,
         GenericJsonIntegrationConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
-        IntegrationConfig, IntelligenceConfig, ManagementConfig, ReceiverConfig, RoutingConfig,
-        ScheduleConfig, ServerConfig, ServerLimitsConfig, StorageConfig,
+        IntegrationConfig, IntelligenceConfig, ManagementConfig, MatrixReceiverConfig,
+        ReceiverConfig, RoutingConfig, ScheduleConfig, ServerConfig, ServerLimitsConfig,
+        StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -3805,6 +3807,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_receiver_sends_authenticated_room_message() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let homeserver_url = spawn_mock_matrix(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.routing.default_receiver = Some("matrix-target".to_string());
+        config.routing.routes.clear();
+        config.integrations = generic_test_integrations();
+        config.receivers.insert(
+            "matrix-target".to_string(),
+            ReceiverConfig::Matrix(MatrixReceiverConfig {
+                homeserver_url,
+                room_id: "!ops:example.test".to_string(),
+                access_token: Some("matrix-token".to_string()),
+                access_token_env: None,
+                owner_team: None,
+                title_template: "[{{status}}] {{title}}".to_string(),
+                timeout_secs: 10,
+            }),
+        );
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "risk": { "level": "critical" },
+                "finding": {
+                    "id": "matrix-1",
+                    "title": "Matrix target alert",
+                    "description": "send this to Matrix",
+                    "plugin": "test",
+                    "url": "https://alerts.example.test/matrix-1"
+                }
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        let received = received.lock().unwrap();
+        assert_eq!(
+            received[0]["path"],
+            "/_matrix/client/v3/rooms/%21ops%3Aexample.test/send/m.room.message/simple-alert-proxy-1"
+        );
+        assert_eq!(received[0]["authorization"], "Bearer matrix-token");
+        assert_eq!(received[0]["payload"]["msgtype"], "m.notice");
+        assert_eq!(
+            received[0]["payload"]["body"],
+            "[firing] Matrix target alert\nRoute: default\nReceiver: matrix-target\nSource: openvas / openvas\nStatus: firing\nSeverity: critical\nFingerprint: matrix-1\n\nsend this to Matrix\n\nsource: https://alerts.example.test/matrix-1"
+        );
+        assert_eq!(
+            received[0]["payload"]["formatted_body"],
+            "<strong>[firing] Matrix target alert</strong><br>Route: default<br>Receiver: matrix-target<br>Source: openvas / openvas<br>Status: firing<br>Severity: critical<br>Fingerprint: matrix-1<br><br>send this to Matrix<br><br><a href=\"https://alerts.example.test/matrix-1\">source</a>"
+        );
+    }
+
+    #[tokio::test]
     async fn end_to_end_synthetic_webhooks_route_deliver_and_dedupe_alert_groups() {
         let critical_received = Arc::new(Mutex::new(Vec::new()));
         let warning_received = Arc::new(Mutex::new(Vec::new()));
@@ -4618,6 +4677,38 @@ mod tests {
         format!("http://{addr}/chat")
     }
 
+    async fn spawn_mock_matrix(received: Arc<Mutex<Vec<Value>>>) -> String {
+        let app = Router::new()
+            .route(
+                "/_matrix/client/v3/rooms/{*path}",
+                put(
+                    |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                     OriginalUri(uri): OriginalUri,
+                     headers: HeaderMap,
+                     Json(payload): Json<Value>| async move {
+                        let authorization = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        received.lock().unwrap().push(serde_json::json!({
+                            "path": uri.path(),
+                            "authorization": authorization,
+                            "payload": payload,
+                        }));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(received);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     async fn spawn_slow_mock_google_chat(received: Arc<Mutex<Vec<Value>>>) -> String {
         let app =
             Router::new()
@@ -4818,7 +4909,7 @@ mod tests {
                 ends_at: None,
                 labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
                 annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
-                links: BTreeMap::new(),
+                links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
             })),
         )])
     }
