@@ -112,12 +112,20 @@ If bearer authentication is enabled, missing or invalid credentials return `401`
 
 ### `POST /webhooks/{integration}`
 
-Generic JSON integrations can be configured under `integrations`. Each
-integration maps fields from an arbitrary JSON payload into the canonical alert
-event model with config only.
+Configured integrations live under `integrations`. Built-in integrations use
+source-specific parsers for payload shapes that need stable behavior. Generic
+JSON integrations map fields from arbitrary JSON payloads into the canonical
+alert event model with config only.
 
 ```yaml
 integrations:
+  grafana:
+    type: builtin
+    preset: grafana
+    path: "/webhooks/grafana"
+    auth:
+      bearer_token: "replace-me"
+
   openvas-example:
     type: generic_json
     path: "/webhooks/openvas-example"
@@ -147,6 +155,16 @@ payload missing a required mapped field returns `400`.
 Integration-specific bearer auth overrides the server-level bearer token for
 that integration. If no integration auth is configured, the server auth setting
 applies.
+
+The built-in Grafana preset accepts unified-alerting webhook payloads. It emits
+one canonical alert event per Grafana `alerts[]` item, preserving group status,
+common labels/annotations, instance labels/annotations, `groupKey`, timestamps,
+and structured links from `externalURL`, `generatorURL`, `silenceURL`,
+`dashboardURL`, and `panelURL`. If `alerts[]` is empty, the integration emits a
+single group-level event so Grafana contact-point tests still exercise routing
+and delivery. Per-instance raw payloads retain the top-level Grafana context but
+contain only the current item in `alerts[]`, preventing sibling instances from
+crossing independently routed receiver or team boundaries.
 
 ## SigNoz Integration
 
@@ -422,7 +440,7 @@ team `operator`/`owner` role.
 ## Receivers
 
 Receiver support includes Google Chat incoming webhooks, generic outbound
-webhooks, Slack, Mattermost, and Discord.
+webhooks, Slack, Mattermost, Discord, and Matrix.
 
 ```yaml
 receivers:
@@ -455,15 +473,32 @@ receivers:
     webhook_url: "https://discord.com/api/webhooks/..."
     title_template: "[{{status}}] {{title}}"
     timeout_secs: 10
+
+  matrix-alerts:
+    type: matrix
+    homeserver_url: "https://matrix.example.com"
+    room_id: "!roomid:example.com"
+    access_token_env: "SIMPLE_ALERT_PROXY_MATRIX_TOKEN"
+    title_template: "[{{status}}] {{title}}"
+    timeout_secs: 10
 ```
 
 The current Google Chat adapter keeps the SigNoz grouped card behavior. Generic
 and chat-style targets receive canonical alert-event payloads through the same
 durable delivery queue, retry, redaction, and replay behavior.
 
+Matrix receivers send `m.notice` room messages through the Matrix Client-Server
+API. The configured token must belong to a Matrix user or bot already joined to
+the target room with permission to send messages. Operators should prefer
+`access_token_env` so Matrix access tokens are not stored in config files. The
+configured `room_id` must be a canonical `!room:server` ID; aliases such as
+`#alerts:server` are not resolved.
+
 Generic JSON integrations can name a source preset for operator clarity and
-validation. Supported presets are `alertmanager`, `grafana`, `openobserve`, and
-`openvas_scan`.
+validation. Supported generic presets are `alertmanager`, `grafana`,
+`openobserve`, and `openvas_scan`; use generic `preset: grafana` only when a
+deployment needs custom Grafana field mappings instead of the built-in Grafana
+parser.
 
 ## Security
 

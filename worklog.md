@@ -66,3 +66,12 @@
 
 - Closed issue #30 after PRs #31 and #62 completed the user/team/RBAC ownership scope. Started #4 on `feat/escalation-chain-actions`: escalation worker execution for ordered steps, richer step targets, next-step scheduling, and chain regression coverage.
 - Started release `v0.0.11`: bumped Cargo/README version references after PR #63 static on-call schedules and PR #64 escalation-chain execution landed on `main`.
+
+2026-08-11
+
+- Started issue #70 on `feat/grafana-integration`: first-class Grafana built-in webhook parser, per-instance canonical events, fixture/tests, and docs/examples.
+- Addressed PR #73 lifecycle review findings: canonicalized Grafana `state` fallbacks, made instance status authoritative, and derived fallback fingerprints only from stable group/instance identity fields rather than status or array position. Verified with fmt, 106 tests, Clippy, and diff checks.
+- Started issue #71 on `feat/matrix-receiver`: native Matrix receiver config and delivery through the Matrix Client-Server API, with env-token support, Matrix transaction IDs, mock-server tests, and docs/examples.
+- Reviewed PR #72 with `openai/gpt-5.6-sol`: fixed Matrix replay transaction-ID reuse, tightened homeserver/room validation, prevented unsafe HTML link schemes, and verified with fmt, 109 tests, Clippy, and diff checks.
+- Merged current `main` into `feat/grafana-integration` to resolve PR #73 conflicts after Matrix support landed, preserving both feature worklogs and verifying the combined receiver/integration code.
+- Started issue #74 on `fix/issue-74-grafana-payload-isolation`: scope each canonical Grafana event's raw payload to its own alert instance while preserving group/common and unknown top-level context, with parser and end-to-end receiver/storage regressions.

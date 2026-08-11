@@ -33,6 +33,13 @@ integrations:
     auth:
       bearer_token: "replace-me"
 
+  grafana:
+    type: "builtin"
+    preset: "grafana"
+    path: "/webhooks/grafana"
+    auth:
+      bearer_token: "replace-me"
+
   openvas-example:
     type: "generic_json"
     preset: "openvas_scan"
@@ -151,5 +158,13 @@ receivers:
   discord-alerts:
     type: "discord"
     webhook_url: "https://discord.com/api/webhooks/example"
+    title_template: "[{{status}}] {{title}}"
+    timeout_secs: 10
+
+  matrix-alerts:
+    type: "matrix"
+    homeserver_url: "https://matrix.example.com"
+    room_id: "!roomid:example.com"
+    access_token_env: "SIMPLE_ALERT_PROXY_MATRIX_TOKEN"
     title_template: "[{{status}}] {{title}}"
     timeout_secs: 10
