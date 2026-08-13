@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-use crate::alert::{AlertEvent, AlertLink};
+use crate::alert::{AlertEvent, AlertLink, integration_group_namespace};
 
 #[derive(Debug, Clone)]
 pub struct GrafanaIntegration {
@@ -114,6 +114,7 @@ impl GrafanaWebhookPayload {
             fingerprint,
             raw,
         );
+        event.group_namespace = grafana_group_namespace(integration, self.org_id);
         event.body = body_from(&annotations, self.message.as_deref());
         event.labels = labels;
         event.annotations = annotations;
@@ -154,6 +155,7 @@ impl GrafanaWebhookPayload {
             fingerprint,
             raw,
         );
+        event.group_namespace = grafana_group_namespace(integration, self.org_id);
         event.body = body_from(&annotations, self.message.as_deref());
         event.labels = labels;
         event.annotations = annotations;
@@ -360,6 +362,13 @@ fn stable_fingerprint(
     format!("grafana:{hex}")
 }
 
+fn grafana_group_namespace(integration: &str, org_id: Option<i64>) -> String {
+    let integration_namespace = integration_group_namespace(integration);
+    org_id.map_or(integration_namespace.clone(), |org_id| {
+        format!("{integration_namespace}/grafana-org/{org_id}")
+    })
+}
+
 fn update_fingerprint(digest: &mut Sha256, value: &str) {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value.as_bytes());
@@ -394,6 +403,10 @@ mod tests {
         assert_eq!(events[0].title, "HighLatency");
         assert_eq!(events[0].body.as_deref(), Some("Checkout latency is high"));
         assert_eq!(events[0].fingerprint, "grafana-latency-1");
+        assert_eq!(
+            events[0].group_namespace,
+            "integration/grafana/grafana-org/1"
+        );
         assert_eq!(events[0].labels["grafana_folder"], "Production");
         assert_eq!(
             events[0].labels["grafana_group_key"],
@@ -407,6 +420,52 @@ mod tests {
         assert!(events[0].links.iter().any(|link| link.label == "dashboard"));
         assert!(events[0].links.iter().any(|link| link.label == "panel"));
         assert_eq!(events[1].fingerprint, "grafana-latency-2");
+    }
+
+    #[test]
+    fn namespaces_source_identifiers_by_integration_and_organization() {
+        let payload = |org_id| {
+            serde_json::json!({
+                "status": "firing",
+                "orgId": org_id,
+                "receiver": "shared-contact-point",
+                "groupKey": "shared-group",
+                "alerts": [{
+                    "status": "firing",
+                    "fingerprint": "shared-fingerprint",
+                    "labels": { "alertname": "Shared" }
+                }]
+            })
+        };
+
+        let integration_a_org_1 = GrafanaIntegration::new("grafana-a")
+            .normalize(payload(1))
+            .unwrap()
+            .remove(0);
+        let integration_b_org_1 = GrafanaIntegration::new("grafana-b")
+            .normalize(payload(1))
+            .unwrap()
+            .remove(0);
+        let integration_a_org_2 = GrafanaIntegration::new("grafana-a")
+            .normalize(payload(2))
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(integration_a_org_1.fingerprint, "shared-fingerprint");
+        assert_eq!(integration_b_org_1.fingerprint, "shared-fingerprint");
+        assert_eq!(integration_a_org_2.fingerprint, "shared-fingerprint");
+        assert_eq!(
+            integration_a_org_1.group_namespace,
+            "integration/grafana-a/grafana-org/1"
+        );
+        assert_eq!(
+            integration_b_org_1.group_namespace,
+            "integration/grafana-b/grafana-org/1"
+        );
+        assert_eq!(
+            integration_a_org_2.group_namespace,
+            "integration/grafana-a/grafana-org/2"
+        );
     }
 
     #[test]
@@ -464,6 +523,27 @@ mod tests {
         assert_eq!(events[0].title, "Grafana test notification");
         assert_eq!(events[0].severity, "warning");
         assert_eq!(events[0].body.as_deref(), Some("test payload"));
+    }
+
+    #[test]
+    fn namespaces_group_keys_without_rewriting_source_metadata() {
+        let event = GrafanaIntegration::new("grafana-prod")
+            .normalize(serde_json::json!({
+                "status": "firing",
+                "orgId": 42,
+                "receiver": "primary-contact-point",
+                "groupKey": "shared-group-key",
+                "alerts": []
+            }))
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(event.fingerprint, "shared-group-key");
+        assert_eq!(event.labels["grafana_group_key"], "shared-group-key");
+        assert_eq!(
+            event.group_namespace,
+            "integration/grafana-prod/grafana-org/42"
+        );
     }
 
     #[test]

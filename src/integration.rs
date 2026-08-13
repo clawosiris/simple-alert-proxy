@@ -215,6 +215,7 @@ mod tests {
 
         let event = &events[0];
         assert_eq!(event.integration, "openvas");
+        assert_eq!(event.group_namespace, "integration/openvas");
         assert_eq!(event.source, "openvas");
         assert_eq!(event.status, "firing");
         assert_eq!(event.severity, "high");

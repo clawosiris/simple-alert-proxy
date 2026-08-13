@@ -297,9 +297,13 @@ retry with bounded exponential backoff and move to `dead_letter` after retry
 exhaustion. Request summaries store route and receiver names, not receiver
 webhook URLs.
 
-Alert groups are keyed by normalized event fingerprint. Repeated active events
-increment `event_count` and update `last_event_at`; resolved events mark the
-group `resolved`.
+Alert groups are keyed by canonical group namespace and normalized event
+fingerprint. The default namespace is the configured integration identity.
+Grafana namespaces additionally include `orgId` when present; its `receiver`
+contact-point identity is preserved as metadata but is not an isolation
+boundary. Repeated active events inside the same namespace increment
+`event_count` and update `last_event_at`; resolved events mark only that group
+`resolved`.
 
 ## Escalation
 

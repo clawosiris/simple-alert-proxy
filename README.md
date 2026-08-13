@@ -21,7 +21,7 @@ scheduling, and optional advisory intelligence scaffolding.
 - SQLite persistence for alert events, alert groups, deliveries, audit entries,
   escalation tasks, and advisory enrichment
 - Durable delivery queue with bounded retry and dead-letter handling
-- Alert groups keyed by normalized fingerprint
+- Alert groups keyed by integration/tenant namespace plus normalized fingerprint
 - Operator APIs for alert groups, events, deliveries, integrations, and routes
 - Lifecycle actions for acknowledge, resolve, silence, and delivery replay
 - Static operator UI at `/` and `/ui`
@@ -487,6 +487,11 @@ Instance links such as `generatorURL`, `silenceURL`, `dashboardURL`, and
 `panelURL` are exposed as structured event links. Each per-instance event keeps
 the top-level Grafana context but scopes its raw `alerts[]` payload to that
 instance so independently routed receivers do not receive sibling alerts.
+Grafana group identity preserves the source `fingerprint` or `groupKey` while
+namespacing lifecycle state by the configured integration and `orgId` when
+present. The contact-point `receiver` is routing metadata, not an isolation
+boundary, so duplicate notifications from contact points in the same Grafana
+organization still converge on one group.
 
 If you need a highly customized Grafana payload transform, the generic JSON
 integration still accepts `preset: "grafana"` with explicit field mappings.
@@ -546,9 +551,11 @@ alert_grouping:
   debounce_millis: 1000
 ```
 
-The gateway also persists normalized alert groups keyed by fingerprint. Repeated
-active events increment the group count and update timestamps; resolved events
-mark the group resolved.
+The gateway also persists normalized alert groups keyed by a canonical group
+namespace plus source fingerprint. Every configured integration has its own
+namespace; Grafana further scopes it by `orgId` when present. Repeated active
+events inside the same namespace increment the group count and update
+timestamps; resolved events mark only that namespaced group resolved.
 
 ## Debug Logging
 

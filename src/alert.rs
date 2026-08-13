@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 pub struct AlertEvent {
     pub event_id: String,
     pub integration: String,
+    pub group_namespace: String,
     pub source: String,
     pub received_at: Option<String>,
     pub status: String,
@@ -44,10 +45,12 @@ impl AlertEvent {
         let title = title.into();
         let fingerprint = fingerprint.into();
         let event_id = format!("{integration}:{fingerprint}");
+        let group_namespace = integration_group_namespace(&integration);
 
         Self {
             event_id,
             integration,
+            group_namespace,
             source,
             received_at: None,
             status,
@@ -63,4 +66,8 @@ impl AlertEvent {
             raw_payload,
         }
     }
+}
+
+pub fn integration_group_namespace(integration: &str) -> String {
+    format!("integration/{integration}")
 }

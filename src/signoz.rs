@@ -591,6 +591,7 @@ mod tests {
         let event = alert.to_alert_event("signoz-prod");
 
         assert_eq!(event.integration, "signoz-prod");
+        assert_eq!(event.group_namespace, "integration/signoz-prod");
         assert_eq!(event.source, "signoz");
         assert_eq!(event.status, "firing");
         assert_eq!(event.severity, "warning");
