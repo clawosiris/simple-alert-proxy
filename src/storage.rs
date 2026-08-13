@@ -58,6 +58,7 @@ impl Storage {
                 alert_group_id INTEGER,
                 event_id TEXT NOT NULL,
                 integration TEXT NOT NULL,
+                group_namespace TEXT NOT NULL,
                 source TEXT NOT NULL,
                 status TEXT NOT NULL,
                 severity TEXT NOT NULL,
@@ -70,7 +71,8 @@ impl Storage {
 
             CREATE TABLE IF NOT EXISTS alert_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fingerprint TEXT NOT NULL UNIQUE,
+                group_namespace TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
                 team_id INTEGER,
                 integration TEXT NOT NULL,
                 source TEXT NOT NULL,
@@ -83,6 +85,7 @@ impl Storage {
                 first_event_at INTEGER NOT NULL,
                 last_event_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
+                UNIQUE(group_namespace, fingerprint),
                 FOREIGN KEY(team_id) REFERENCES teams(id)
             );
 
@@ -179,6 +182,8 @@ impl Storage {
         )?;
         add_column_if_missing(&conn, "alert_events", "alert_group_id INTEGER")?;
         add_column_if_missing(&conn, "alert_groups", "team_id INTEGER")?;
+        add_column_if_missing(&conn, "alert_events", "group_namespace TEXT")?;
+        migrate_alert_group_namespaces(&conn)?;
         add_column_if_missing(&conn, "audit_entries", "actor_user_id INTEGER")?;
         add_column_if_missing(&conn, "audit_entries", "actor_display_name TEXT")?;
         add_column_if_missing(&conn, "audit_entries", "actor_team_id INTEGER")?;
@@ -216,15 +221,16 @@ impl Storage {
         conn.execute(
             r#"
             INSERT INTO alert_events (
-                alert_group_id, event_id, integration, source, status, severity, title,
-                fingerprint, raw_payload, created_at
+                alert_group_id, event_id, integration, group_namespace, source, status,
+                severity, title, fingerprint, raw_payload, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             "#,
             params![
                 alert_group_id,
                 event.event_id,
                 event.integration,
+                event.group_namespace,
                 event.source,
                 event.status,
                 event.severity,
@@ -526,7 +532,7 @@ impl Storage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
-            SELECT alert_groups.id, fingerprint, team_id, teams.name,
+            SELECT alert_groups.id, group_namespace, fingerprint, team_id, teams.name,
                    integration, source, status, severity, title,
                    event_count, acknowledged_at, silenced_until,
                    first_event_at, last_event_at, alert_groups.updated_at
@@ -560,7 +566,7 @@ impl Storage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, alert_group_id, event_id, integration, source, status,
+            SELECT id, alert_group_id, event_id, integration, group_namespace, source, status,
                    severity, title, fingerprint, raw_payload, created_at
             FROM alert_events
             ORDER BY created_at DESC, id DESC
@@ -1264,6 +1270,7 @@ pub fn now_epoch_millis() -> i64 {
 #[derive(Debug, Clone, Serialize)]
 pub struct AlertGroupRecord {
     pub id: i64,
+    pub group_namespace: String,
     pub fingerprint: String,
     pub team_id: Option<i64>,
     pub team_name: Option<String>,
@@ -1286,6 +1293,7 @@ pub struct AlertEventRecord {
     pub alert_group_id: Option<i64>,
     pub event_id: String,
     pub integration: String,
+    pub group_namespace: String,
     pub source: String,
     pub status: String,
     pub severity: String,
@@ -1437,8 +1445,8 @@ fn upsert_alert_group(
 ) -> anyhow::Result<i64> {
     let existing = conn
         .query_row(
-            "SELECT id, status FROM alert_groups WHERE fingerprint = ?1",
-            params![event.fingerprint],
+            "SELECT id, status FROM alert_groups WHERE group_namespace = ?1 AND fingerprint = ?2",
+            params![event.group_namespace, event.fingerprint],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .ok();
@@ -1489,13 +1497,14 @@ fn upsert_alert_group(
     conn.execute(
         r#"
         INSERT INTO alert_groups (
-            fingerprint, team_id, integration, source, status, severity, title,
+            group_namespace, fingerprint, team_id, integration, source, status, severity, title,
             event_count, acknowledged_at, silenced_until,
             first_event_at, last_event_at, updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, NULL, NULL, ?8, ?8, ?8)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, NULL, NULL, ?9, ?9, ?9)
         "#,
         params![
+            event.group_namespace,
             event.fingerprint,
             team_id,
             event.integration,
@@ -1512,25 +1521,26 @@ fn upsert_alert_group(
 fn alert_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertGroupRecord> {
     Ok(AlertGroupRecord {
         id: row.get(0)?,
-        fingerprint: row.get(1)?,
-        team_id: row.get(2)?,
-        team_name: row.get(3)?,
-        integration: row.get(4)?,
-        source: row.get(5)?,
-        status: row.get(6)?,
-        severity: row.get(7)?,
-        title: row.get(8)?,
-        event_count: row.get(9)?,
-        acknowledged_at: row.get(10)?,
-        silenced_until: row.get(11)?,
-        first_event_at: row.get(12)?,
-        last_event_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        group_namespace: row.get(1)?,
+        fingerprint: row.get(2)?,
+        team_id: row.get(3)?,
+        team_name: row.get(4)?,
+        integration: row.get(5)?,
+        source: row.get(6)?,
+        status: row.get(7)?,
+        severity: row.get(8)?,
+        title: row.get(9)?,
+        event_count: row.get(10)?,
+        acknowledged_at: row.get(11)?,
+        silenced_until: row.get(12)?,
+        first_event_at: row.get(13)?,
+        last_event_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
 fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventRecord> {
-    let raw_payload = serde_json::from_str(&row.get::<_, String>(9)?)
+    let raw_payload = serde_json::from_str(&row.get::<_, String>(10)?)
         .map(|payload| redaction::redact_json_value(&payload))
         .unwrap_or(serde_json::Value::Null);
 
@@ -1539,13 +1549,14 @@ fn alert_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AlertEventR
         alert_group_id: row.get(1)?,
         event_id: row.get(2)?,
         integration: row.get(3)?,
-        source: row.get(4)?,
-        status: row.get(5)?,
-        severity: row.get(6)?,
-        title: row.get(7)?,
-        fingerprint: row.get(8)?,
+        group_namespace: row.get(4)?,
+        source: row.get(5)?,
+        status: row.get(6)?,
+        severity: row.get(7)?,
+        title: row.get(8)?,
+        fingerprint: row.get(9)?,
         raw_payload,
-        created_at: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -1573,6 +1584,7 @@ fn delivery_replay_record(
     let (
         event_id,
         integration,
+        group_namespace,
         source,
         status,
         severity,
@@ -1592,10 +1604,11 @@ fn delivery_replay_record(
         String,
         String,
         String,
+        String,
     ) = conn.query_row(
         r#"
-        SELECT alert_events.event_id, alert_events.integration, alert_events.source,
-               alert_events.status, alert_events.severity, alert_events.title,
+        SELECT alert_events.event_id, alert_events.integration, alert_events.group_namespace,
+               alert_events.source, alert_events.status, alert_events.severity, alert_events.title,
                alert_events.fingerprint, alert_events.raw_payload,
                delivery_records.target, delivery_records.request_summary
         FROM delivery_records
@@ -1615,6 +1628,7 @@ fn delivery_replay_record(
                 row.get(7)?,
                 row.get(8)?,
                 row.get(9)?,
+                row.get(10)?,
             ))
         },
     )?;
@@ -1635,6 +1649,7 @@ fn delivery_replay_record(
         event: AlertEvent {
             event_id,
             integration,
+            group_namespace,
             source,
             received_at: None,
             status,
@@ -1662,8 +1677,20 @@ fn latest_alert_event_for_group(
     conn: &Connection,
     alert_group_id: i64,
 ) -> anyhow::Result<(i64, AlertEvent)> {
-    let (id, event_id, integration, source, status, severity, title, fingerprint, raw_payload): (
+    let (
+        id,
+        event_id,
+        integration,
+        group_namespace,
+        source,
+        status,
+        severity,
+        title,
+        fingerprint,
+        raw_payload,
+    ): (
         i64,
+        String,
         String,
         String,
         String,
@@ -1674,7 +1701,8 @@ fn latest_alert_event_for_group(
         String,
     ) = conn.query_row(
         r#"
-        SELECT id, event_id, integration, source, status, severity, title, fingerprint, raw_payload
+        SELECT id, event_id, integration, group_namespace, source, status, severity, title,
+               fingerprint, raw_payload
         FROM alert_events
         WHERE alert_group_id = ?1
         ORDER BY created_at DESC, id DESC
@@ -1692,6 +1720,7 @@ fn latest_alert_event_for_group(
                 row.get(6)?,
                 row.get(7)?,
                 row.get(8)?,
+                row.get(9)?,
             ))
         },
     )?;
@@ -1701,6 +1730,7 @@ fn latest_alert_event_for_group(
         AlertEvent {
             event_id,
             integration,
+            group_namespace,
             source,
             received_at: None,
             status,
@@ -1831,16 +1861,130 @@ fn team_membership_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMem
     })
 }
 
-fn add_column_if_missing(conn: &Connection, table: &str, column_sql: &str) -> anyhow::Result<()> {
-    let column_name = column_sql.split_whitespace().next().unwrap_or_default();
+fn migrate_alert_group_namespaces(conn: &Connection) -> anyhow::Result<()> {
+    if column_exists(conn, "alert_groups", "group_namespace")? {
+        backfill_event_group_namespaces(conn)?;
+        return Ok(());
+    }
+
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+
+    let migration = conn.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE alert_groups_namespaced (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_namespace TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            team_id INTEGER,
+            integration TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            title TEXT NOT NULL,
+            event_count INTEGER NOT NULL,
+            acknowledged_at INTEGER,
+            silenced_until INTEGER,
+            first_event_at INTEGER NOT NULL,
+            last_event_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(group_namespace, fingerprint),
+            FOREIGN KEY(team_id) REFERENCES teams(id)
+        );
+
+        INSERT INTO alert_groups_namespaced (
+            id, group_namespace, fingerprint, team_id, integration, source, status,
+            severity, title, event_count, acknowledged_at, silenced_until,
+            first_event_at, last_event_at, updated_at
+        )
+        SELECT id,
+               'integration/' || integration ||
+                   CASE
+                       WHEN source = 'grafana'
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM alert_events
+                                WHERE alert_events.alert_group_id = alert_groups.id
+                                  AND CASE
+                                      WHEN json_valid(alert_events.raw_payload)
+                                      THEN json_extract(alert_events.raw_payload, '$.orgId')
+                                  END IS NULL
+                            )
+                            AND 1 = (
+                                SELECT COUNT(DISTINCT json_extract(alert_events.raw_payload, '$.orgId'))
+                                FROM alert_events
+                                WHERE alert_events.alert_group_id = alert_groups.id
+                                  AND json_valid(alert_events.raw_payload)
+                            )
+                       THEN COALESCE(
+                           (
+                               SELECT '/grafana-org/' ||
+                                      CAST(json_extract(alert_events.raw_payload, '$.orgId') AS TEXT)
+                               FROM alert_events
+                               WHERE alert_events.alert_group_id = alert_groups.id
+                                 AND json_valid(alert_events.raw_payload)
+                                 AND json_extract(alert_events.raw_payload, '$.orgId') IS NOT NULL
+                               ORDER BY alert_events.created_at ASC, alert_events.id ASC
+                               LIMIT 1
+                           ),
+                           ''
+                       )
+                       ELSE ''
+                   END,
+               fingerprint, team_id, integration, source, status, severity, title,
+               event_count, acknowledged_at, silenced_until,
+               first_event_at, last_event_at, updated_at
+        FROM alert_groups;
+
+        DROP TABLE alert_groups;
+        ALTER TABLE alert_groups_namespaced RENAME TO alert_groups;
+
+        COMMIT;
+        "#,
+    );
+
+    if migration.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    conn.pragma_update(None, "foreign_keys", foreign_keys_enabled)?;
+    migration?;
+    backfill_event_group_namespaces(conn)
+}
+
+fn backfill_event_group_namespaces(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        r#"
+        UPDATE alert_events
+        SET group_namespace = COALESCE(
+            (
+                SELECT alert_groups.group_namespace
+                FROM alert_groups
+                WHERE alert_groups.id = alert_events.alert_group_id
+            ),
+            'integration/' || integration
+        )
+        WHERE group_namespace IS NULL OR group_namespace = ''
+        "#,
+        [],
+    )?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let exists = stmt
+    Ok(stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .any(|name| name == column_name);
+        .any(|name| name == column))
+}
 
-    if !exists {
+fn add_column_if_missing(conn: &Connection, table: &str, column_sql: &str) -> anyhow::Result<()> {
+    let column_name = column_sql.split_whitespace().next().unwrap_or_default();
+    if !column_exists(conn, table, column_name)? {
         conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column_sql}"), [])?;
     }
 
@@ -2136,6 +2280,249 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn group_namespaces_isolate_lifecycle_ownership_and_actions() {
+        let storage = Storage::open(":memory:").unwrap();
+        let team_a = storage.create_team("grafana-a", "").unwrap();
+        let team_b = storage.create_team("grafana-b", "").unwrap();
+        let mut org_a = test_event("shared", "firing");
+        org_a.integration = "grafana".to_string();
+        org_a.source = "grafana".to_string();
+        org_a.group_namespace = "integration/grafana/grafana-org/1".to_string();
+        let mut org_b = org_a.clone();
+        org_b.event_id = "event-shared-org-b".to_string();
+        org_b.group_namespace = "integration/grafana/grafana-org/2".to_string();
+
+        let org_a_event_id = storage
+            .store_event_with_team(&org_a, Some("grafana-a"))
+            .unwrap();
+        let org_b_event_id = storage
+            .store_event_with_team(&org_b, Some("grafana-b"))
+            .unwrap();
+        storage
+            .queue_escalation(org_a_event_id, "primary", 60_000, true, true)
+            .unwrap();
+        storage
+            .queue_escalation(org_b_event_id, "primary", 60_000, true, true)
+            .unwrap();
+
+        let groups = storage.list_alert_groups().unwrap();
+        assert_eq!(groups.len(), 2);
+        let org_a_group = groups
+            .iter()
+            .find(|group| group.group_namespace.ends_with("/1"))
+            .unwrap();
+        let org_b_group = groups
+            .iter()
+            .find(|group| group.group_namespace.ends_with("/2"))
+            .unwrap();
+        assert_eq!(org_a_group.team_name.as_deref(), Some("grafana-a"));
+        assert_eq!(org_b_group.team_name.as_deref(), Some("grafana-b"));
+
+        storage.acknowledge_group(org_a_group.id).unwrap();
+        storage.silence_group(org_a_group.id).unwrap();
+        assert_eq!(
+            storage.escalation_statuses().unwrap(),
+            vec!["canceled", "scheduled"]
+        );
+
+        org_b.status = "resolved".to_string();
+        org_b.event_id = "event-shared-org-b-resolved".to_string();
+        storage
+            .store_event_with_team(&org_b, Some("grafana-b"))
+            .unwrap();
+
+        let groups = storage.list_alert_groups().unwrap();
+        let org_a_group = groups
+            .iter()
+            .find(|group| group.group_namespace.ends_with("/1"))
+            .unwrap();
+        let org_b_group = groups
+            .iter()
+            .find(|group| group.group_namespace.ends_with("/2"))
+            .unwrap();
+        assert_eq!(org_a_group.status, "active");
+        assert!(org_a_group.acknowledged_at.is_some());
+        assert!(org_a_group.silenced_until.is_some());
+        assert_eq!(org_a_group.event_count, 1);
+        assert_eq!(org_b_group.status, "resolved");
+        assert!(org_b_group.acknowledged_at.is_none());
+        assert!(org_b_group.silenced_until.is_none());
+        assert_eq!(org_b_group.event_count, 2);
+
+        let team_a_groups = storage.list_alert_groups_for_teams(&[team_a.id]).unwrap();
+        assert_eq!(team_a_groups.len(), 1);
+        assert_eq!(
+            team_a_groups[0].group_namespace,
+            org_a_group.group_namespace
+        );
+        let team_b_groups = storage.list_alert_groups_for_teams(&[team_b.id]).unwrap();
+        assert_eq!(team_b_groups.len(), 1);
+        assert_eq!(
+            team_b_groups[0].group_namespace,
+            org_b_group.group_namespace
+        );
+    }
+
+    #[test]
+    fn migration_preserves_existing_groups_and_relations() {
+        let database_path = std::env::temp_dir().join(format!(
+            "simple-alert-proxy-group-namespace-migration-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy = Connection::open(&database_path).unwrap();
+        legacy
+            .execute_batch(
+                r#"
+                CREATE TABLE teams (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE alert_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    team_id INTEGER,
+                    integration TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    event_count INTEGER NOT NULL,
+                    acknowledged_at INTEGER,
+                    silenced_until INTEGER,
+                    first_event_at INTEGER NOT NULL,
+                    last_event_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(team_id) REFERENCES teams(id)
+                );
+                CREATE TABLE alert_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_group_id INTEGER,
+                    event_id TEXT NOT NULL,
+                    integration TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    raw_payload TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
+                );
+                CREATE TABLE delivery_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_event_id INTEGER NOT NULL,
+                    target TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at INTEGER,
+                    last_error TEXT,
+                    request_summary TEXT NOT NULL,
+                    response_summary TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(alert_event_id) REFERENCES alert_events(id)
+                );
+                CREATE TABLE audit_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_group_id INTEGER,
+                    delivery_record_id INTEGER,
+                    action TEXT NOT NULL,
+                    detail TEXT,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id),
+                    FOREIGN KEY(delivery_record_id) REFERENCES delivery_records(id)
+                );
+                CREATE TABLE escalation_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_group_id INTEGER NOT NULL,
+                    policy TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    due_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
+                );
+                CREATE TABLE advisory_enrichments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_group_id INTEGER,
+                    provider TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
+                );
+
+                INSERT INTO teams VALUES (3, 'legacy-team', '', 1, 1);
+                INSERT INTO alert_groups VALUES (
+                    7, 'shared', 3, 'grafana-prod', 'grafana', 'active', 'critical',
+                    'Legacy alert', 1, 10, 20, 1, 2, 3
+                );
+                INSERT INTO alert_events VALUES (
+                    11, 7, 'legacy-event', 'grafana-prod', 'grafana', 'firing',
+                    'critical', 'Legacy alert', 'shared', '{"orgId":42}', 1
+                );
+                INSERT INTO delivery_records VALUES (
+                    13, 11, 'chat', 'queued', 0, NULL, NULL, '{}', NULL, 1, 1
+                );
+                INSERT INTO audit_entries VALUES (17, 7, 13, 'legacy', NULL, 1);
+                INSERT INTO escalation_tasks VALUES (19, 7, 'primary', 0, 'scheduled', 2, 1, 1);
+                INSERT INTO advisory_enrichments VALUES (23, 7, 'test', 'note', 'legacy', 1);
+                "#,
+            )
+            .unwrap();
+        drop(legacy);
+
+        let storage = Storage::open(database_path.to_str().unwrap()).unwrap();
+        let groups = storage.list_alert_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, 7);
+        assert_eq!(groups[0].fingerprint, "shared");
+        assert_eq!(
+            groups[0].group_namespace,
+            "integration/grafana-prod/grafana-org/42"
+        );
+        assert_eq!(groups[0].team_name.as_deref(), Some("legacy-team"));
+        let events = storage.list_alert_events().unwrap();
+        assert_eq!(events[0].alert_group_id, Some(7));
+        assert_eq!(events[0].group_namespace, groups[0].group_namespace);
+
+        let conn = storage.conn.lock().unwrap();
+        for (table, expected_id) in [
+            ("delivery_records", 13_i64),
+            ("audit_entries", 17),
+            ("escalation_tasks", 19),
+            ("advisory_enrichments", 23),
+        ] {
+            let id: i64 = conn
+                .query_row(&format!("SELECT id FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(id, expected_id);
+        }
+        let foreign_key_errors = conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |_| Ok(()))
+            .unwrap()
+            .count();
+        assert_eq!(foreign_key_errors, 0);
+        drop(conn);
+
+        let mut other_org = test_event("shared", "firing");
+        other_org.integration = "grafana-prod".to_string();
+        other_org.source = "grafana".to_string();
+        other_org.group_namespace = "integration/grafana-prod/grafana-org/43".to_string();
+        storage.store_event(&other_org).unwrap();
+        assert_eq!(storage.alert_group_count().unwrap(), 2);
+
+        drop(storage);
+        fs::remove_file(&database_path).unwrap();
+    }
+
+    #[test]
     fn migration_adds_escalation_stop_conditions_to_existing_database() {
         let database_path = std::env::temp_dir().join(format!(
             "simple-alert-proxy-migration-{}.db",
@@ -2323,6 +2710,7 @@ mod tests {
         AlertEvent {
             event_id: format!("event-{fingerprint}"),
             integration: "test".to_string(),
+            group_namespace: "integration/test".to_string(),
             source: "test".to_string(),
             received_at: None,
             status: status.to_string(),
@@ -2343,6 +2731,7 @@ mod tests {
         let event = AlertEvent {
             event_id: format!("event-{fingerprint}-{created_at}"),
             integration: "test".to_string(),
+            group_namespace: "integration/test".to_string(),
             source: "test".to_string(),
             received_at: None,
             status: "firing".to_string(),

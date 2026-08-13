@@ -3446,6 +3446,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grafana_group_lifecycle_isolated_by_configured_integration_and_org() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.alert_grouping.enabled = false;
+        config.integrations = BTreeMap::from([
+            (
+                "grafana-a".to_string(),
+                IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                    preset: "grafana".to_string(),
+                    path: "/webhooks/grafana-a".to_string(),
+                    auth: None,
+                }),
+            ),
+            (
+                "grafana-b".to_string(),
+                IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                    preset: "grafana".to_string(),
+                    path: "/webhooks/grafana-b".to_string(),
+                    auth: None,
+                }),
+            ),
+        ]);
+        config.routing.routes.clear();
+        config.routing.default_receiver = Some("target".to_string());
+        config.receivers = BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        let request = |path: &str, org_id: i64, status: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "status": status,
+                        "orgId": org_id,
+                        "receiver": "shared-contact-point",
+                        "groupKey": "shared-group",
+                        "alerts": [{
+                            "status": status,
+                            "fingerprint": "shared-fingerprint",
+                            "labels": { "alertname": "Shared" }
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        for (path, org_id, status) in [
+            ("/webhooks/grafana-a", 1, "firing"),
+            ("/webhooks/grafana-b", 1, "resolved"),
+            ("/webhooks/grafana-a", 2, "resolved"),
+            ("/webhooks/grafana-a", 1, "resolved"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(path, org_id, status))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        wait_for_received_count(&received, 4).await;
+        wait_for_succeeded_deliveries(app.clone(), 4).await;
+        let groups = get_api_json(app, "/api/alert-groups").await;
+        assert_eq!(groups.as_array().unwrap().len(), 3);
+
+        let grafana_a_org_1 = find_record(
+            &groups,
+            "group_namespace",
+            "integration/grafana-a/grafana-org/1",
+        );
+        assert_eq!(grafana_a_org_1["fingerprint"], "shared-fingerprint");
+        assert_eq!(grafana_a_org_1["status"], "resolved");
+        assert_eq!(grafana_a_org_1["event_count"], 2);
+
+        for namespace in [
+            "integration/grafana-a/grafana-org/2",
+            "integration/grafana-b/grafana-org/1",
+        ] {
+            let group = find_record(&groups, "group_namespace", namespace);
+            assert_eq!(group["fingerprint"], "shared-fingerprint");
+            assert_eq!(group["status"], "resolved");
+            assert_eq!(group["event_count"], 1);
+        }
+    }
+
+    #[tokio::test]
     async fn webhook_accepts_after_persisting_before_delivery_finishes() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let chat_url = spawn_slow_mock_google_chat(Arc::clone(&received)).await;
@@ -5335,6 +5432,7 @@ mod tests {
         AlertEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             integration: "test".to_string(),
+            group_namespace: "integration/test".to_string(),
             source: "unit".to_string(),
             received_at: None,
             status: "firing".to_string(),

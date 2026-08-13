@@ -183,8 +183,8 @@ Promote deduplicated alert groups to the primary operator-facing object.
 
 ### Implementation Notes
 
-- SQLite storage maintains `alert_groups` keyed by fingerprint and links stored
-  alert events to their group.
+- SQLite storage maintains `alert_groups` keyed by canonical group namespace
+  plus fingerprint and links stored alert events to their group.
 - Repeated events increment group counts and update timestamps; resolved events
   mark the group resolved.
 - Read APIs expose groups, events, deliveries, integrations, and routes.
