@@ -19,8 +19,8 @@ pub struct AppConfig {
     pub schedules: ScheduleConfig,
     #[serde(default)]
     pub intelligence: IntelligenceConfig,
-    #[serde(default)]
-    pub alert_grouping: AlertGroupingConfig,
+    #[serde(default, alias = "alert_grouping")]
+    pub notification_batching: NotificationBatchingConfig,
     #[serde(default)]
     pub debug: DebugConfig,
     #[serde(default)]
@@ -97,8 +97,14 @@ impl AppConfig {
         }
         self.validate_integration_paths()?;
 
-        if self.alert_grouping.enabled && self.alert_grouping.debounce_millis == 0 {
-            bail!("alert_grouping.debounce_millis must be greater than zero when enabled");
+        if self.notification_batching.enabled && self.notification_batching.group_wait_millis == 0 {
+            bail!("notification_batching.group_wait_millis must be greater than zero when enabled");
+        }
+        if self.notification_batching.enabled && self.notification_batching.max_events == 0 {
+            bail!("notification_batching.max_events must be greater than zero when enabled");
+        }
+        if self.notification_batching.enabled && self.notification_batching.max_payload_bytes == 0 {
+            bail!("notification_batching.max_payload_bytes must be greater than zero when enabled");
         }
 
         if let Some(default_receiver) = &self.routing.default_receiver {
@@ -107,6 +113,14 @@ impl AppConfig {
 
         for route in &self.routing.routes {
             self.require_receiver(&route.receiver)?;
+            for selector in &route.group_by {
+                if !crate::notification::validate_group_by_selector(selector) {
+                    bail!(
+                        "route {} has invalid notification group_by selector {selector}",
+                        route.name
+                    );
+                }
+            }
             if let Some(policy) = &route.escalation_policy {
                 self.require_escalation_policy(policy)?;
             }
@@ -657,6 +671,7 @@ pub struct GenericJsonIntegrationConfig {
     pub title: String,
     pub body: Option<String>,
     pub fingerprint: String,
+    pub notification_group_key: Option<String>,
     pub starts_at: Option<String>,
     pub ends_at: Option<String>,
     #[serde(default)]
@@ -708,18 +723,27 @@ impl GenericJsonIntegrationConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AlertGroupingConfig {
-    #[serde(default = "default_alert_grouping_enabled")]
+pub struct NotificationBatchingConfig {
+    #[serde(default = "default_notification_batching_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_alert_grouping_debounce_millis")]
-    pub debounce_millis: u64,
+    #[serde(
+        default = "default_notification_batch_group_wait_millis",
+        alias = "debounce_millis"
+    )]
+    pub group_wait_millis: u64,
+    #[serde(default = "default_notification_batch_max_events")]
+    pub max_events: usize,
+    #[serde(default = "default_notification_batch_max_payload_bytes")]
+    pub max_payload_bytes: usize,
 }
 
-impl Default for AlertGroupingConfig {
+impl Default for NotificationBatchingConfig {
     fn default() -> Self {
         Self {
-            enabled: default_alert_grouping_enabled(),
-            debounce_millis: default_alert_grouping_debounce_millis(),
+            enabled: default_notification_batching_enabled(),
+            group_wait_millis: default_notification_batch_group_wait_millis(),
+            max_events: default_notification_batch_max_events(),
+            max_payload_bytes: default_notification_batch_max_payload_bytes(),
         }
     }
 }
@@ -831,6 +855,8 @@ pub struct RouteConfig {
     pub escalation_policy: Option<String>,
     #[serde(default)]
     pub continue_matching: bool,
+    #[serde(default)]
+    pub group_by: Vec<String>,
     #[serde(default)]
     pub matchers: Vec<MatcherConfig>,
 }
@@ -1041,12 +1067,20 @@ fn default_stop_on_resolve() -> bool {
     true
 }
 
-fn default_alert_grouping_enabled() -> bool {
+fn default_notification_batching_enabled() -> bool {
     true
 }
 
-fn default_alert_grouping_debounce_millis() -> u64 {
+fn default_notification_batch_group_wait_millis() -> u64 {
     1_000
+}
+
+fn default_notification_batch_max_events() -> usize {
+    100
+}
+
+fn default_notification_batch_max_payload_bytes() -> usize {
+    256 * 1024
 }
 
 fn default_title_template() -> String {
@@ -1163,6 +1197,7 @@ mod tests {
                     title: "".to_string(),
                     body: None,
                     fingerprint: "id".to_string(),
+                    notification_group_key: None,
                     starts_at: None,
                     ends_at: None,
                     labels: BTreeMap::new(),
@@ -1179,7 +1214,7 @@ mod tests {
             escalation: EscalationConfig::default(),
             schedules: ScheduleConfig::default(),
             intelligence: IntelligenceConfig::default(),
-            alert_grouping: AlertGroupingConfig::default(),
+            notification_batching: NotificationBatchingConfig::default(),
             debug: DebugConfig::default(),
             routing: RoutingConfig::default(),
             receivers: BTreeMap::from([(
@@ -1498,6 +1533,78 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_notification_batching_names() {
+        let current = include_str!("../examples/config.yaml");
+        let legacy = current
+            .replace("notification_batching:", "alert_grouping:")
+            .replace("group_wait_millis:", "debounce_millis:");
+
+        let config: AppConfig = serde_yaml::from_str(&legacy).unwrap();
+
+        assert!(config.notification_batching.enabled);
+        assert_eq!(config.notification_batching.group_wait_millis, 1_000);
+    }
+
+    #[test]
+    fn rejects_invalid_notification_group_selector() {
+        let mut config = minimal_valid_config();
+        config.routing.routes.push(RouteConfig {
+            name: "invalid-grouping".to_string(),
+            receiver: "default".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            continue_matching: false,
+            group_by: vec!["raw_payload.secret".to_string()],
+            matchers: Vec::new(),
+        });
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid notification group_by selector")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_notification_batching_bounds_when_enabled() {
+        for (batching, expected) in [
+            (
+                NotificationBatchingConfig {
+                    enabled: true,
+                    group_wait_millis: 0,
+                    ..NotificationBatchingConfig::default()
+                },
+                "notification_batching.group_wait_millis",
+            ),
+            (
+                NotificationBatchingConfig {
+                    enabled: true,
+                    max_events: 0,
+                    ..NotificationBatchingConfig::default()
+                },
+                "notification_batching.max_events",
+            ),
+            (
+                NotificationBatchingConfig {
+                    enabled: true,
+                    max_payload_bytes: 0,
+                    ..NotificationBatchingConfig::default()
+                },
+                "notification_batching.max_payload_bytes",
+            ),
+        ] {
+            let mut config = minimal_valid_config();
+            config.notification_batching = batching;
+
+            let error = config.validate().unwrap_err();
+
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
     fn loopback_bind_allows_local_management_without_auth() {
         let mut config = minimal_valid_config();
         config.server.auth = None;
@@ -1524,7 +1631,7 @@ mod tests {
             escalation: EscalationConfig::default(),
             schedules: ScheduleConfig::default(),
             intelligence: IntelligenceConfig::default(),
-            alert_grouping: AlertGroupingConfig::default(),
+            notification_batching: NotificationBatchingConfig::default(),
             debug: DebugConfig::default(),
             routing: RoutingConfig {
                 default_receiver: Some("default".to_string()),
