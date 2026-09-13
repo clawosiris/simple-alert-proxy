@@ -4,9 +4,9 @@ use crate::{
         ChatWebhookReceiverConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
         MatrixReceiverConfig, ReceiverConfig,
     },
+    notification::NotificationBatch,
     redaction,
     routing::Delivery,
-    signoz::SigNozAlert,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -25,34 +25,6 @@ impl GoogleChatClient {
         }
     }
 
-    pub async fn send(
-        &self,
-        receiver: &GoogleChatReceiverConfig,
-        alert: &SigNozAlert,
-        delivery: &Delivery,
-        debug: Option<DebugDeliveryLog<'_>>,
-    ) -> Result<(), GoogleChatError> {
-        let message = build_message(receiver, alert, delivery);
-
-        if let Some(debug) = debug {
-            log_outgoing_alert(&message, debug);
-        }
-
-        let response = self
-            .http
-            .post(&receiver.webhook_url)
-            .timeout(Duration::from_secs(receiver.timeout_secs))
-            .json(&message)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(GoogleChatError::Rejected(response.status()))
-        }
-    }
-
     pub async fn send_event(
         &self,
         receiver: &GoogleChatReceiverConfig,
@@ -60,7 +32,18 @@ impl GoogleChatClient {
         delivery: &Delivery,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
-        let message = build_event_message(receiver, event, delivery);
+        let message = if event.instances.is_empty() {
+            build_event_message(receiver, event, delivery)
+        } else {
+            build_batch_message(
+                receiver,
+                &NotificationBatch::new(
+                    event.notification_group_key.clone().unwrap_or_default(),
+                    vec![event.clone()],
+                ),
+                delivery,
+            )
+        };
 
         if let Some(debug) = debug {
             log_outgoing_alert(&message, debug);
@@ -111,6 +94,59 @@ impl GoogleChatClient {
             }
             ReceiverConfig::Matrix(receiver) => {
                 self.send_matrix(receiver, event, delivery, matrix_transaction_id, debug)
+                    .await
+            }
+        }
+    }
+
+    pub async fn send_receiver_batch(
+        &self,
+        receiver: &ReceiverConfig,
+        batch: &NotificationBatch,
+        delivery: &Delivery,
+        matrix_transaction_id: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        match receiver {
+            ReceiverConfig::GoogleChat(receiver) => {
+                let message = build_batch_message(receiver, batch, delivery);
+                self.post_json(
+                    &receiver.webhook_url,
+                    receiver.timeout_secs,
+                    &message,
+                    debug,
+                )
+                .await
+            }
+            ReceiverConfig::GenericWebhook(receiver) => {
+                if batch.events.len() == 1 {
+                    return self
+                        .send_generic_webhook(receiver, batch.primary(), delivery, debug)
+                        .await;
+                }
+                let message = build_generic_batch_message(batch, delivery);
+                self.post_json(
+                    &receiver.webhook_url,
+                    receiver.timeout_secs,
+                    &message,
+                    debug,
+                )
+                .await
+            }
+            ReceiverConfig::Slack(receiver) => {
+                self.send_chat_batch(receiver, batch, delivery, debug, ChatTarget::Slack)
+                    .await
+            }
+            ReceiverConfig::Mattermost(receiver) => {
+                self.send_chat_batch(receiver, batch, delivery, debug, ChatTarget::Mattermost)
+                    .await
+            }
+            ReceiverConfig::Discord(receiver) => {
+                self.send_chat_batch(receiver, batch, delivery, debug, ChatTarget::Discord)
+                    .await
+            }
+            ReceiverConfig::Matrix(receiver) => {
+                self.send_matrix_batch(receiver, batch, delivery, matrix_transaction_id, debug)
                     .await
             }
         }
@@ -181,6 +217,24 @@ impl GoogleChatClient {
         .await
     }
 
+    async fn send_chat_batch(
+        &self,
+        receiver: &ChatWebhookReceiverConfig,
+        batch: &NotificationBatch,
+        delivery: &Delivery,
+        debug: Option<DebugDeliveryLog<'_>>,
+        target: ChatTarget,
+    ) -> Result<(), GoogleChatError> {
+        let message = build_chat_batch_message(receiver, batch, delivery, target);
+        self.post_json(
+            &receiver.webhook_url,
+            receiver.timeout_secs,
+            &message,
+            debug,
+        )
+        .await
+    }
+
     async fn send_matrix(
         &self,
         receiver: &MatrixReceiverConfig,
@@ -203,6 +257,40 @@ impl GoogleChatClient {
             "format": "org.matrix.custom.html",
             "formatted_body": formatted_body,
         });
+        let token = receiver
+            .resolved_access_token()
+            .map_err(|error| GoogleChatError::Config(error.to_string()))?;
+        let url = matrix_send_url(receiver, transaction_id);
+
+        if let Some(debug) = debug {
+            log_outgoing_alert(&message, debug);
+        }
+
+        let response = self
+            .http
+            .put(url)
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(receiver.timeout_secs))
+            .json(&message)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(GoogleChatError::Rejected(response.status()))
+        }
+    }
+
+    async fn send_matrix_batch(
+        &self,
+        receiver: &MatrixReceiverConfig,
+        batch: &NotificationBatch,
+        delivery: &Delivery,
+        transaction_id: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let message = build_matrix_batch_message(receiver, batch, delivery);
         let token = receiver
             .resolved_access_token()
             .map_err(|error| GoogleChatError::Config(error.to_string()))?;
@@ -386,27 +474,6 @@ fn log_outgoing_alert(message: &serde_json::Value, debug: DebugDeliveryLog<'_>) 
     }
 }
 
-fn build_message(
-    receiver: &GoogleChatReceiverConfig,
-    alert: &SigNozAlert,
-    delivery: &Delivery,
-) -> serde_json::Value {
-    let title = format_title(receiver, alert, delivery);
-
-    json!({
-        "cardsV2": [{
-            "cardId": "signoz-alert",
-            "card": {
-                "header": {
-                    "title": title,
-                    "subtitle": format_subtitle(alert),
-                },
-                "sections": build_sections(alert),
-            }
-        }],
-    })
-}
-
 fn build_event_message(
     receiver: &GoogleChatReceiverConfig,
     event: &AlertEvent,
@@ -426,6 +493,221 @@ fn build_event_message(
             }
         }],
     })
+}
+
+fn build_batch_message(
+    receiver: &GoogleChatReceiverConfig,
+    batch: &NotificationBatch,
+    delivery: &Delivery,
+) -> serde_json::Value {
+    let event = batch.primary();
+    let title = format_event_title(receiver, event, delivery);
+    let mut summary_widgets = vec![
+        json!({
+            "decoratedText": {
+                "text": format!("Status: {}", event.status),
+            }
+        }),
+        json!({
+            "decoratedText": {
+                "text": format!(
+                    "Severity counts: {}",
+                    format_severity_counts(&batch.severity_counts())
+                ),
+            }
+        }),
+    ];
+
+    if let Some(source) = event.links.iter().find(|link| link.label == "source") {
+        summary_widgets.push(json!({
+            "textParagraph": {
+                "text": format!(
+                    "Source: <a href=\"{}\">SOURCE</a>",
+                    escape_chat_html(&source.url)
+                ),
+            }
+        }));
+    }
+
+    let instance_widgets = batch_instance_lines(batch)
+        .into_iter()
+        .map(|line| json!({ "textParagraph": { "text": line } }))
+        .collect::<Vec<_>>();
+    let mut sections = vec![json!({ "widgets": summary_widgets })];
+    if !instance_widgets.is_empty() {
+        sections.push(json!({
+            "header": "Instances",
+            "widgets": instance_widgets,
+        }));
+    }
+
+    json!({
+        "cardsV2": [{
+            "cardId": "notification-batch",
+            "card": {
+                "header": {
+                    "title": title,
+                    "subtitle": format!(
+                        "{} instance{} | {}",
+                        batch.instance_count(),
+                        if batch.instance_count() == 1 { "" } else { "s" },
+                        format_severity_counts(&batch.severity_counts())
+                    ),
+                },
+                "sections": sections,
+            }
+        }],
+    })
+}
+
+fn build_generic_batch_message(
+    batch: &NotificationBatch,
+    delivery: &Delivery,
+) -> serde_json::Value {
+    json!({
+        "batch": {
+            "group_key": batch.group_key,
+            "count": batch.instance_count(),
+            "severity_counts": batch.severity_counts(),
+        },
+        "events": batch.events,
+        "delivery": {
+            "route": delivery.route_name,
+            "receiver": delivery.receiver,
+        }
+    })
+}
+
+fn build_chat_batch_message(
+    receiver: &ChatWebhookReceiverConfig,
+    batch: &NotificationBatch,
+    delivery: &Delivery,
+    target: ChatTarget,
+) -> serde_json::Value {
+    let event = batch.primary();
+    let title = format_template_title(&receiver.title_template, event);
+    let summary = format!(
+        "{title} via {} | {} instances | {}",
+        delivery.route_name,
+        batch.instance_count(),
+        format_severity_counts(&batch.severity_counts())
+    );
+    let lines = batch_instance_lines(batch);
+    let text = std::iter::once(summary.clone())
+        .chain(lines.iter().map(|line| format!("- {line}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    match target {
+        ChatTarget::Slack | ChatTarget::Mattermost => json!({ "text": text }),
+        ChatTarget::Discord => json!({
+            "content": summary,
+            "embeds": [{
+                "title": event.title,
+                "description": truncate_chars(&lines.join("\n"), 3500),
+                "fields": [
+                    { "name": "Status", "value": event.status, "inline": true },
+                    { "name": "Instances", "value": batch.instance_count().to_string(), "inline": true },
+                    { "name": "Source", "value": event.source, "inline": true }
+                ]
+            }]
+        }),
+    }
+}
+
+fn build_matrix_batch_message(
+    receiver: &MatrixReceiverConfig,
+    batch: &NotificationBatch,
+    delivery: &Delivery,
+) -> serde_json::Value {
+    let event = batch.primary();
+    let title = format_template_title(&receiver.title_template, event);
+    let mut lines = vec![
+        title,
+        format!("Route: {}", delivery.route_name),
+        format!("Receiver: {}", delivery.receiver),
+        format!("Source: {} / {}", event.integration, event.source),
+        format!("Status: {}", event.status),
+        format!("Instances: {}", batch.instance_count()),
+        format!(
+            "Severities: {}",
+            format_severity_counts(&batch.severity_counts())
+        ),
+        String::new(),
+    ];
+    lines.extend(batch_instance_lines(batch));
+    let body = lines.join("\n");
+    let formatted_body = lines
+        .iter()
+        .map(|line| escape_html(line))
+        .collect::<Vec<_>>()
+        .join("<br>");
+    json!({
+        "msgtype": "m.notice",
+        "body": body,
+        "format": "org.matrix.custom.html",
+        "formatted_body": formatted_body,
+    })
+}
+
+fn format_template_title(template: &str, event: &AlertEvent) -> String {
+    template
+        .replace("{{status}}", &event.status)
+        .replace("{{alertname}}", &event.title)
+        .replace("{{title}}", &event.title)
+        .replace("{{severity}}", &event.severity)
+}
+
+fn batch_instance_lines(batch: &NotificationBatch) -> Vec<String> {
+    batch
+        .flattened_instances()
+        .iter()
+        .map(|instance| {
+            let host = map_first(
+                &instance.labels,
+                &[
+                    "host.name",
+                    "host",
+                    "instance",
+                    "node",
+                    "service.instance.id",
+                    "pod",
+                    "container",
+                ],
+            )
+            .unwrap_or(instance.title.as_str());
+            let resource = map_first(
+                &instance.labels,
+                &[
+                    "mountpoint",
+                    "resource.name",
+                    "resource",
+                    "service",
+                    "job",
+                    "namespace",
+                    "device",
+                ],
+            )
+            .or(instance.fingerprint.as_deref())
+            .unwrap_or("general");
+            format!("{host} | {} | {resource}", instance.severity)
+        })
+        .collect()
+}
+
+fn map_first<'a>(values: &'a BTreeMap<String, String>, names: &[&str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|name| values.get(*name).map(String::as_str))
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 fn format_event_title(
@@ -519,98 +801,6 @@ fn map_lines(values: &BTreeMap<String, String>) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn format_title(
-    receiver: &GoogleChatReceiverConfig,
-    alert: &SigNozAlert,
-    delivery: &Delivery,
-) -> String {
-    let status = alert.enrichment.overall_status.as_str();
-    let mut title = receiver
-        .title_template
-        .replace("{{status}}", status)
-        .replace("{{alertname}}", &alert.alert_name());
-
-    if !delivery.route_name.is_empty() {
-        title.push_str(&format!(" via {}", delivery.route_name));
-    }
-
-    title
-}
-
-fn format_subtitle(alert: &SigNozAlert) -> String {
-    format!(
-        "{} instance{} | {}",
-        alert.alerts.len(),
-        if alert.alerts.len() == 1 { "" } else { "s" },
-        format_severity_counts(&alert.enrichment.severity_counts)
-    )
-}
-
-fn build_sections(alert: &SigNozAlert) -> Vec<serde_json::Value> {
-    let mut sections = Vec::new();
-    let mut summary_widgets = vec![
-        json!({
-            "decoratedText": {
-                "text": format!("Status: {}", alert.enrichment.overall_status),
-            }
-        }),
-        json!({
-            "decoratedText": {
-                "text": format!(
-                    "Severity counts: {}",
-                    format_severity_counts(&alert.enrichment.severity_counts)
-                ),
-            }
-        }),
-    ];
-
-    if let Some(source_url) = &alert.enrichment.source_url {
-        summary_widgets.push(json!({
-            "textParagraph": {
-                "text": format!("Source: <a href=\"{}\">SOURCE</a>", escape_chat_html(source_url)),
-            }
-        }));
-    }
-
-    sections.push(json!({
-        "widgets": summary_widgets,
-    }));
-
-    let instance_widgets = grouped_instance_lines(alert)
-        .into_iter()
-        .map(|line| {
-            json!({
-                "textParagraph": {
-                    "text": line,
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-
-    if !instance_widgets.is_empty() {
-        sections.push(json!({
-            "header": "Instances",
-            "widgets": instance_widgets,
-        }));
-    }
-
-    sections
-}
-
-fn grouped_instance_lines(alert: &SigNozAlert) -> Vec<String> {
-    alert
-        .enrichment
-        .instances
-        .iter()
-        .map(|instance| {
-            format!(
-                "{} | {} | {}",
-                instance.host, instance.severity, instance.resource
-            )
-        })
-        .collect()
-}
-
 fn escape_chat_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -661,9 +851,11 @@ mod tests {
             receiver: "ops-chat".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         };
 
-        let payload = build_message(&receiver, &alert, &delivery);
+        let batch = NotificationBatch::new("batch-1", vec![alert.to_alert_event("signoz")]);
+        let payload = build_batch_message(&receiver, &batch, &delivery);
         let summary_widgets = payload["cardsV2"][0]["card"]["sections"][0]["widgets"]
             .as_array()
             .unwrap();
@@ -727,9 +919,11 @@ mod tests {
             receiver: "ops-chat".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         };
 
-        let payload = build_message(&receiver, &alert, &delivery);
+        let batch = NotificationBatch::new("batch-1", vec![alert.to_alert_event("signoz")]);
+        let payload = build_batch_message(&receiver, &batch, &delivery);
         let instances = payload["cardsV2"][0]["card"]["sections"][1]["widgets"]
             .as_array()
             .unwrap();
@@ -742,6 +936,81 @@ mod tests {
         assert_eq!(
             instances[1]["textParagraph"]["text"].as_str(),
             Some("host-a | critical | /")
+        );
+    }
+
+    #[test]
+    fn builds_batch_payloads_for_every_receiver_family() {
+        let mut first = AlertEvent::new(
+            "grafana",
+            "grafana",
+            "firing",
+            "critical",
+            "<HighLatency>",
+            "instance-1",
+            serde_json::json!({}),
+        );
+        first
+            .labels
+            .insert("instance".to_string(), "api-1".to_string());
+        let mut second = first.clone();
+        second.fingerprint = "instance-2".to_string();
+        second.severity = "warning".to_string();
+        second
+            .labels
+            .insert("instance".to_string(), "api-2".to_string());
+        let batch = NotificationBatch::new("batch-1", vec![first, second]);
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "target".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        let chat = ChatWebhookReceiverConfig {
+            webhook_url: "https://hooks.example.test".to_string(),
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+        let matrix = MatrixReceiverConfig {
+            homeserver_url: "https://matrix.example.test".to_string(),
+            room_id: "!ops:example.test".to_string(),
+            access_token: Some("secret".to_string()),
+            access_token_env: None,
+            owner_team: None,
+            title_template: "[{{status}}] {{title}}".to_string(),
+            timeout_secs: 10,
+        };
+
+        let generic = build_generic_batch_message(&batch, &delivery);
+        assert_eq!(generic["batch"]["count"], 2);
+        assert_eq!(generic["events"].as_array().unwrap().len(), 2);
+
+        for target in [ChatTarget::Slack, ChatTarget::Mattermost] {
+            let payload = build_chat_batch_message(&chat, &batch, &delivery, target);
+            let text = payload["text"].as_str().unwrap();
+            assert!(text.contains("2 instances"));
+            assert!(text.contains("api-1 | critical"));
+            assert!(text.contains("api-2 | warning"));
+        }
+
+        let discord = build_chat_batch_message(&chat, &batch, &delivery, ChatTarget::Discord);
+        assert_eq!(discord["embeds"][0]["fields"][1]["value"], "2");
+        assert!(
+            discord["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("api-2 | warning")
+        );
+
+        let matrix = build_matrix_batch_message(&matrix, &batch, &delivery);
+        assert!(matrix["body"].as_str().unwrap().contains("Instances: 2"));
+        assert!(
+            matrix["formatted_body"]
+                .as_str()
+                .unwrap()
+                .contains("&lt;HighLatency&gt;")
         );
     }
 
@@ -771,6 +1040,7 @@ mod tests {
             receiver: "ops-chat".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         };
 
         let payload = build_event_message(&receiver, &event, &delivery);
@@ -845,6 +1115,7 @@ mod tests {
             receiver: "matrix-alerts".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         };
 
         let html = matrix_html_body("[firing] CPU <high>", &event, &delivery);
@@ -874,6 +1145,7 @@ mod tests {
             receiver: "matrix-alerts".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         };
 
         let html = matrix_html_body("[firing] CPU high", &event, &delivery);
