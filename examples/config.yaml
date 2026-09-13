@@ -52,6 +52,8 @@ integrations:
     title: "finding.title"
     body: "finding.description"
     fingerprint: "finding.id"
+    # Optional source-provided notification batch hint:
+    notification_group_key: "group.id"
     starts_at: "observed_at"
     labels:
       asset: "asset.host"
@@ -94,9 +96,11 @@ intelligence:
   # provider: "openai"
   allow_lifecycle_mutation: false
 
-alert_grouping:
+notification_batching:
   enabled: true
-  debounce_millis: 1000
+  group_wait_millis: 1000
+  max_events: 100
+  max_payload_bytes: 262144
 
 routing:
   default_receiver: "default-chat"
@@ -105,6 +109,8 @@ routing:
       receiver: "critical-chat"
       owner_team: "platform"
       escalation_policy: "primary-on-duty"
+      # Optional override of the integration's source group hint:
+      # group_by: ["integration", "label.alertname", "label.environment"]
       matchers:
         - field: "label.severity"
           equals: "critical"

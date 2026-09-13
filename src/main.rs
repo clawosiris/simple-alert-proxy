@@ -27,7 +27,6 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{error, info, warn};
@@ -38,6 +37,7 @@ mod config;
 mod google_chat;
 mod grafana;
 mod integration;
+mod notification;
 mod redaction;
 mod routing;
 mod signoz;
@@ -47,14 +47,14 @@ mod ui;
 
 use crate::{
     alert::AlertEvent,
-    config::{AppConfig, GoogleChatReceiverConfig, ReceiverConfig},
+    config::{AppConfig, ReceiverConfig},
     google_chat::{DebugDeliveryLog, GoogleChatClient},
     integration::{GenericJsonIntegration, Integration, SigNozIntegration},
+    notification::{NotificationBatch, batch_key},
     routing::{Delivery, RouteEngine},
-    signoz::SigNozAlert,
     storage::{
-        AuditActor, DisableUserOutcome, SessionUserRecord, Storage, TeamMembershipRecord,
-        UserRecord,
+        AuditActor, ClaimedNotificationBatch, DisableUserOutcome, NotificationBatchLimits,
+        SessionUserRecord, Storage, TeamMembershipRecord, UserRecord,
     },
 };
 
@@ -79,7 +79,7 @@ struct Args {
 struct AppState {
     config: Arc<AppConfig>,
     router: Arc<RouteEngine>,
-    aggregator: AlertAggregator,
+    target_client: GoogleChatClient,
     storage: Storage,
     login_attempts: LoginAttemptLimiter,
 }
@@ -144,138 +144,6 @@ fn login_attempt_key(username: &str) -> String {
     username.trim().to_string()
 }
 
-#[derive(Clone)]
-struct AlertAggregator {
-    enabled: bool,
-    debounce: Duration,
-    google_chat: GoogleChatClient,
-    pending: Arc<AsyncMutex<BTreeMap<AggregationKey, PendingAggregation>>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct AggregationKey {
-    receiver: String,
-    route_name: String,
-    status: String,
-    rule_id: String,
-}
-
-struct PendingAggregation {
-    receiver: GoogleChatReceiverConfig,
-    delivery: Delivery,
-    alerts: Vec<SigNozAlert>,
-    debug_enabled: bool,
-    completions: Vec<oneshot::Sender<Result<(), String>>>,
-}
-
-impl AlertAggregator {
-    fn new(config: &AppConfig, google_chat: GoogleChatClient) -> Self {
-        Self {
-            enabled: config.alert_grouping.enabled,
-            debounce: Duration::from_millis(config.alert_grouping.debounce_millis),
-            google_chat,
-            pending: Arc::new(AsyncMutex::new(BTreeMap::new())),
-        }
-    }
-
-    async fn enqueue_google_chat(
-        &self,
-        receiver: &GoogleChatReceiverConfig,
-        alert: SigNozAlert,
-        delivery: Delivery,
-        debug_enabled: bool,
-    ) -> Result<(), String> {
-        let Some(rule_id) = alert
-            .rule_id()
-            .filter(|rule_id| self.enabled && !rule_id.is_empty())
-        else {
-            let debug = debug_enabled.then_some(DebugDeliveryLog {
-                route_name: delivery.route_name.as_str(),
-                receiver_name: delivery.receiver.as_str(),
-            });
-            self.google_chat
-                .send(receiver, &alert, &delivery, debug)
-                .await
-                .map_err(redacted_delivery_error)?;
-            return Ok(());
-        };
-
-        let key = AggregationKey {
-            receiver: delivery.receiver.clone(),
-            route_name: delivery.route_name.clone(),
-            status: alert.enrichment.overall_status.clone(),
-            rule_id,
-        };
-        let mut should_spawn = false;
-        let (completion, delivered) = oneshot::channel();
-
-        {
-            use std::collections::btree_map::Entry;
-
-            let mut pending = self.pending.lock().await;
-            match pending.entry(key.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(PendingAggregation {
-                        receiver: receiver.clone(),
-                        delivery,
-                        alerts: vec![alert],
-                        debug_enabled,
-                        completions: vec![completion],
-                    });
-                    should_spawn = true;
-                }
-                Entry::Occupied(mut entry) => {
-                    let bucket = entry.get_mut();
-                    bucket.alerts.push(alert);
-                    bucket.completions.push(completion);
-                    bucket.debug_enabled |= debug_enabled;
-                }
-            }
-        }
-
-        if should_spawn {
-            let aggregator = self.clone();
-            tokio::spawn(async move {
-                aggregator.flush_after(key).await;
-            });
-        }
-
-        delivered
-            .await
-            .unwrap_or_else(|_| Err("grouped alert delivery canceled".to_string()))
-    }
-
-    async fn flush_after(&self, key: AggregationKey) {
-        tokio::time::sleep(self.debounce).await;
-
-        let Some(bucket) = self.pending.lock().await.remove(&key) else {
-            return;
-        };
-
-        let result = self.flush_bucket(&bucket).await;
-        if let Err(error) = &result {
-            error!(%error, "grouped alert delivery failed");
-        }
-        for completion in bucket.completions {
-            let _ = completion.send(result.clone());
-        }
-    }
-
-    async fn flush_bucket(&self, bucket: &PendingAggregation) -> Result<(), String> {
-        let alert =
-            SigNozAlert::merged_for_delivery(&bucket.alerts).map_err(|error| error.to_string())?;
-        let debug = bucket.debug_enabled.then_some(DebugDeliveryLog {
-            route_name: bucket.delivery.route_name.as_str(),
-            receiver_name: bucket.delivery.receiver.as_str(),
-        });
-
-        self.google_chat
-            .send(&bucket.receiver, &alert, &bucket.delivery, debug)
-            .await
-            .map_err(redacted_delivery_error)
-    }
-}
-
 fn init_crypto_provider() -> anyhow::Result<()> {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
         return Ok(());
@@ -338,6 +206,13 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     let management_concurrency = config.server.limits.management_concurrency;
     let google_chat = GoogleChatClient::new();
     let storage = Storage::open(&config.storage.path)?;
+    let recovered_batches = storage.recover_notification_batches()?;
+    if recovered_batches > 0 {
+        info!(
+            recovered_batches,
+            "recovered interrupted notification batches"
+        );
+    }
     let pruned_alerts = storage.prune_alerts_older_than_days(config.storage.retention_days)?;
     if pruned_alerts > 0 {
         info!(
@@ -351,11 +226,12 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     start_retention_pruner(storage.clone(), config.storage.retention_days);
     let state = AppState {
         router: Arc::new(RouteEngine::new(config.as_ref().clone())?),
-        aggregator: AlertAggregator::new(&config, google_chat),
+        target_client: google_chat,
         storage,
         login_attempts: LoginAttemptLimiter::new(),
         config: Arc::clone(&config),
     };
+    start_notification_batch_worker(state.clone());
     start_escalation_worker(state.clone());
 
     let health = Router::new().route("/healthz", post(healthz).get(healthz));
@@ -454,6 +330,96 @@ fn start_escalation_worker(state: AppState) {
     });
 }
 
+fn start_notification_batch_worker(state: AppState) {
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(25);
+        loop {
+            match state.storage.claim_due_notification_batch() {
+                Ok(Some(batch)) => run_notification_batch(&state, batch).await,
+                Ok(None) => tokio::time::sleep(interval).await,
+                Err(error) => {
+                    error!(%error, "failed to claim due notification batch");
+                    tokio::time::sleep(interval).await;
+                }
+            }
+        }
+    });
+}
+
+async fn run_notification_batch(state: &AppState, claimed: ClaimedNotificationBatch) {
+    let result = send_notification_batch(state, &claimed).await;
+    match result {
+        Ok(()) => {
+            if let Err(error) = state.storage.mark_notification_batch_succeeded(claimed.id) {
+                error!(%error, batch_id = claimed.id, "failed to mark notification batch success");
+            }
+        }
+        Err(error) if claimed.attempt >= state.config.delivery.max_attempts => {
+            if let Err(store_error) = state
+                .storage
+                .mark_notification_batch_dead_letter(claimed.id, &error)
+            {
+                error!(%store_error, batch_id = claimed.id, "failed to mark notification batch dead-letter");
+            }
+            error!(batch_id = claimed.id, %error, "notification batch exhausted retries");
+        }
+        Err(error) => {
+            let exponent = claimed.attempt.saturating_sub(1).min(31);
+            let backoff = state
+                .config
+                .delivery
+                .initial_backoff_millis
+                .saturating_mul(1_u64 << exponent)
+                .min(state.config.delivery.max_backoff_millis);
+            let retry_at = storage::now_epoch_millis().saturating_add(backoff as i64);
+            if let Err(store_error) = state
+                .storage
+                .mark_notification_batch_retrying(claimed.id, retry_at, &error)
+            {
+                error!(%store_error, batch_id = claimed.id, "failed to mark notification batch retry");
+            }
+        }
+    }
+}
+
+async fn send_notification_batch(
+    state: &AppState,
+    claimed: &ClaimedNotificationBatch,
+) -> Result<(), String> {
+    let receiver = state
+        .config
+        .receivers
+        .get(&claimed.delivery.receiver)
+        .ok_or_else(|| "target configuration failed".to_string())?;
+    if claimed.members.is_empty() {
+        return Err("notification batch has no members".to_string());
+    }
+    let batch = NotificationBatch::new(
+        claimed.batch_key.clone(),
+        claimed
+            .members
+            .iter()
+            .map(|member| member.event.clone())
+            .collect(),
+    );
+    let matrix_transaction_id = format!("simple-alert-proxy-batch-{}", claimed.id);
+    let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
+        route_name: claimed.delivery.route_name.as_str(),
+        receiver_name: claimed.delivery.receiver.as_str(),
+    });
+    state
+        .target_client
+        .send_receiver_batch(
+            receiver,
+            &batch,
+            &claimed.delivery,
+            &matrix_transaction_id,
+            debug,
+        )
+        .await
+        .map_err(redacted_delivery_error)
+}
+
 async fn run_escalation_task(
     state: &AppState,
     task: storage::EscalationTaskRecord,
@@ -539,8 +505,9 @@ fn queue_escalation_receiver_delivery(
         receiver: receiver_name.to_string(),
         owner_team: receiver.owner_team().map(ToOwned::to_owned),
         escalation_policy: None,
+        group_by: Vec::new(),
     };
-    queue_target_event_delivery(state, &task.event, task.alert_event_id, receiver, delivery)
+    queue_event_delivery(state, &task.event, task.alert_event_id, receiver, delivery)
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
@@ -1053,6 +1020,7 @@ async fn list_routes(
                 "receiver": route.receiver,
                 "owner_team": route.owner_team,
                 "continue_matching": route.continue_matching,
+                "group_by": route.group_by,
                 "matcher_count": route.matchers.len(),
             })
         })
@@ -1244,68 +1212,8 @@ fn process_signoz_alerts(
     payload: Value,
 ) -> Result<(StatusCode, Json<Value>), WebhookError> {
     let signoz = SigNozIntegration::new(name);
-    let alerts = signoz.parse_alerts(payload)?;
-    let mut delivered_receivers = Vec::new();
-
-    for alert in &alerts {
-        let event = alert.to_alert_event(name);
-        let plan = state.router.plan(&event);
-        let deliveries = deliveries_with_receiver_ownership(state, plan.deliveries);
-        let owner_team = first_owner_team(&deliveries);
-        let mut alert_event_id = None;
-
-        for delivery in &deliveries {
-            let Some(receiver) = state.config.receivers.get(&delivery.receiver) else {
-                error!(receiver = %delivery.receiver, "route selected missing receiver");
-                continue;
-            };
-            let event_id = match alert_event_id {
-                Some(event_id) => event_id,
-                None => {
-                    let event_id = state
-                        .storage
-                        .store_event_with_team(&event, owner_team.as_deref())?;
-                    alert_event_id = Some(event_id);
-                    event_id
-                }
-            };
-
-            match receiver {
-                config::ReceiverConfig::GoogleChat(receiver) => {
-                    queue_signoz_google_chat_delivery(
-                        state,
-                        event_id,
-                        receiver,
-                        alert.clone(),
-                        delivery.clone(),
-                    )?;
-                    delivered_receivers.push(delivery.receiver.clone());
-                }
-                receiver => {
-                    queue_target_event_delivery(
-                        state,
-                        &event,
-                        event_id,
-                        receiver,
-                        delivery.clone(),
-                    )?;
-                    delivered_receivers.push(delivery.receiver.clone());
-                }
-            }
-        }
-    }
-
-    if delivered_receivers.is_empty() {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "delivered": 0 })),
-        ));
-    }
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(delivery_summary(&delivered_receivers)),
-    ))
+    let events = signoz.normalize(payload)?;
+    process_generic_events(state, &events)
 }
 
 fn process_generic_events(
@@ -1336,7 +1244,7 @@ fn process_generic_events(
                 }
             };
 
-            queue_target_event_delivery(state, event, event_id, receiver, delivery.clone())?;
+            queue_event_delivery(state, event, event_id, receiver, delivery.clone())?;
             delivered_receivers.push(delivery.receiver.clone());
         }
     }
@@ -1381,40 +1289,32 @@ fn first_owner_team(deliveries: &[Delivery]) -> Option<String> {
         .cloned()
 }
 
-fn queue_signoz_google_chat_delivery(
+fn queue_event_delivery(
     state: &AppState,
+    event: &AlertEvent,
     alert_event_id: i64,
-    receiver: &GoogleChatReceiverConfig,
-    alert: SigNozAlert,
+    receiver: &ReceiverConfig,
     delivery: Delivery,
 ) -> Result<(), WebhookError> {
-    let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
-    queue_escalation_if_configured(state, alert_event_id, &delivery)?;
-    let worker = DeliveryWorker::new(
-        state.storage.clone(),
-        state.config.delivery.clone(),
-        state.config.debug.log_alerts,
-    );
-    let aggregator = state.aggregator.clone();
-    let receiver = receiver.clone();
+    if state.config.notification_batching.enabled
+        && let Some(batch_key) = batch_key(event, &delivery)
+    {
+        state.storage.queue_notification_batch(
+            alert_event_id,
+            event,
+            &delivery,
+            &batch_key,
+            NotificationBatchLimits {
+                group_wait_millis: state.config.notification_batching.group_wait_millis,
+                max_events: state.config.notification_batching.max_events,
+                max_payload_bytes: state.config.notification_batching.max_payload_bytes,
+            },
+        )?;
+        queue_escalation_if_configured(state, alert_event_id, &delivery)?;
+        return Ok(());
+    }
 
-    tokio::spawn(async move {
-        worker
-            .run(delivery_id, move |debug_enabled| {
-                let aggregator = aggregator.clone();
-                let receiver = receiver.clone();
-                let alert = alert.clone();
-                let delivery = delivery.clone();
-                async move {
-                    aggregator
-                        .enqueue_google_chat(&receiver, alert, delivery, debug_enabled)
-                        .await
-                }
-            })
-            .await;
-    });
-
-    Ok(())
+    queue_target_event_delivery(state, event, alert_event_id, receiver, delivery)
 }
 
 fn queue_target_event_delivery(
@@ -1431,7 +1331,7 @@ fn queue_target_event_delivery(
         state.config.delivery.clone(),
         state.config.debug.log_alerts,
     );
-    let target_client = state.aggregator.google_chat.clone();
+    let target_client = state.target_client.clone();
     let receiver = receiver.clone();
     let event = event.clone();
     let matrix_transaction_id = format!("simple-alert-proxy-{delivery_id}");
@@ -1484,7 +1384,7 @@ fn spawn_replayed_delivery(
         state.config.delivery.clone(),
         state.config.debug.log_alerts,
     );
-    let target_client = state.aggregator.google_chat.clone();
+    let target_client = state.target_client.clone();
     let matrix_transaction_id =
         format!("simple-alert-proxy-{delivery_id}-replay-{}", Uuid::new_v4());
 
@@ -2138,10 +2038,10 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, AuthConfig, BuiltinIntegrationConfig, DebugConfig, DeliveryConfig,
-        EscalationConfig, EscalationPolicyConfig, EscalationStepConfig,
-        GenericJsonIntegrationConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
-        IntegrationConfig, IntelligenceConfig, ManagementConfig, MatrixReceiverConfig,
+        AuthConfig, BuiltinIntegrationConfig, DebugConfig, DeliveryConfig, EscalationConfig,
+        EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
+        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
+        IntelligenceConfig, ManagementConfig, MatrixReceiverConfig, NotificationBatchingConfig,
         ReceiverConfig, RoutingConfig, ScheduleConfig, ServerConfig, ServerLimitsConfig,
         StorageConfig,
     };
@@ -2761,7 +2661,7 @@ mod tests {
         let state = AppState {
             config: config.clone(),
             router: Arc::new(RouteEngine::new(config.as_ref().clone()).unwrap()),
-            aggregator: AlertAggregator::new(config.as_ref(), GoogleChatClient::new()),
+            target_client: GoogleChatClient::new(),
             storage,
             login_attempts: LoginAttemptLimiter::new(),
         };
@@ -2997,7 +2897,7 @@ mod tests {
         assert_eq!(config.server.webhook_path, "/webhooks/signoz");
         assert_eq!(config.server.max_body_bytes, 1024 * 1024);
         assert!(config.server.auth.is_some());
-        assert!(config.alert_grouping.enabled);
+        assert!(config.notification_batching.enabled);
         assert!(matches!(
             config.integrations.get("openvas-example"),
             Some(IntegrationConfig::GenericJson(_))
@@ -3041,6 +2941,7 @@ mod tests {
                     title: "title".to_string(),
                     body: None,
                     fingerprint: "id".to_string(),
+                    notification_group_key: None,
                     starts_at: None,
                     ends_at: None,
                     labels: BTreeMap::new(),
@@ -3196,6 +3097,7 @@ mod tests {
                 title: "finding.title".to_string(),
                 body: Some("finding.description".to_string()),
                 fingerprint: "finding.id".to_string(),
+                notification_group_key: None,
                 starts_at: Some("observed_at".to_string()),
                 ends_at: None,
                 labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
@@ -3240,7 +3142,7 @@ mod tests {
         let default_url = spawn_mock_google_chat(Arc::clone(&default_received)).await;
         let mut config = test_config("http://127.0.0.1:1");
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.integrations = BTreeMap::from([(
             "grafana".to_string(),
             IntegrationConfig::Builtin(BuiltinIntegrationConfig {
@@ -3255,6 +3157,7 @@ mod tests {
             receiver: "critical-target".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
             continue_matching: false,
             matchers: vec![config::MatcherConfig {
                 field: "label.severity".to_string(),
@@ -3350,6 +3253,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grafana_group_key_batches_normalized_events() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.group_wait_millis = 1;
+        config.integrations = BTreeMap::from([(
+            "grafana".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "grafana".to_string(),
+                path: "/webhooks/grafana".to_string(),
+                auth: None,
+            }),
+        )]);
+        config.routing.routes.clear();
+        config.routing.default_receiver = Some("target".to_string());
+        config.receivers = BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app.clone().oneshot(grafana_request()).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        wait_for_succeeded_deliveries(app, 2).await;
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["batch"]["count"], 2);
+        assert_eq!(received[0]["events"].as_array().unwrap().len(), 2);
+        assert_eq!(received[0]["events"][0]["source"], "grafana");
+    }
+
+    #[tokio::test]
+    async fn generic_json_group_key_batches_separate_webhooks() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.group_wait_millis = 10;
+        config.integrations = generic_test_integrations();
+        let IntegrationConfig::GenericJson(integration) =
+            config.integrations.get_mut("openvas").unwrap()
+        else {
+            panic!("expected generic integration")
+        };
+        integration.notification_group_key = Some("group.id".to_string());
+        config.routing.routes.clear();
+        config.routing.default_receiver = Some("target".to_string());
+        config.receivers = BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        for fingerprint in ["finding-1", "finding-2"] {
+            let response = app
+                .clone()
+                .oneshot(generic_request(serde_json::json!({
+                    "state": "firing",
+                    "group": { "id": "edge-certs" },
+                    "risk": { "level": "high" },
+                    "finding": {
+                        "id": fingerprint,
+                        "title": "TLS certificate expired",
+                        "description": "Certificate expired",
+                        "plugin": "ssl-cert-check",
+                        "url": "https://scanner.example.test/findings/1"
+                    }
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        wait_for_received_count(&received, 1).await;
+        wait_for_succeeded_deliveries(app, 2).await;
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["batch"]["count"], 2);
+        assert_eq!(received[0]["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn generic_webhook_keeps_single_event_schema_for_one_member_batch() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.group_wait_millis = 1;
+        config.integrations = generic_test_integrations();
+        let IntegrationConfig::GenericJson(integration) =
+            config.integrations.get_mut("openvas").unwrap()
+        else {
+            panic!("expected generic integration")
+        };
+        integration.notification_group_key = Some("group.id".to_string());
+        config.routing.routes.clear();
+        config.routing.default_receiver = Some("target".to_string());
+        config.receivers = BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "group": { "id": "edge-certs" },
+                "risk": { "level": "high" },
+                "finding": {
+                    "id": "finding-1",
+                    "title": "TLS certificate expired",
+                    "description": "Certificate expired",
+                    "plugin": "ssl-cert-check",
+                    "url": "https://scanner.example.test/findings/1"
+                }
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        wait_for_succeeded_deliveries(app, 1).await;
+        let received = received.lock().unwrap();
+        assert_eq!(received[0]["event"]["fingerprint"], "finding-1");
+        assert!(received[0].get("batch").is_none());
+        assert!(received[0].get("events").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_group_by_overrides_generic_source_group_key() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.group_wait_millis = 10;
+        config.integrations = generic_test_integrations();
+        let IntegrationConfig::GenericJson(integration) =
+            config.integrations.get_mut("openvas").unwrap()
+        else {
+            panic!("expected generic integration")
+        };
+        integration.notification_group_key = Some("group.id".to_string());
+        config.routing.default_receiver = None;
+        config.routing.routes = vec![config::RouteConfig {
+            name: "plugin-batch".to_string(),
+            receiver: "target".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            continue_matching: false,
+            group_by: vec!["annotation.plugin".to_string()],
+            matchers: Vec::new(),
+        }];
+        config.receivers = BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        for (fingerprint, source_group) in [("finding-1", "source-a"), ("finding-2", "source-b")] {
+            let response = app
+                .clone()
+                .oneshot(generic_request(serde_json::json!({
+                    "state": "firing",
+                    "group": { "id": source_group },
+                    "risk": { "level": "high" },
+                    "finding": {
+                        "id": fingerprint,
+                        "title": "TLS certificate expired",
+                        "description": "Certificate expired",
+                        "plugin": "ssl-cert-check",
+                        "url": "https://scanner.example.test/findings/1"
+                    }
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        wait_for_received_count(&received, 1).await;
+        wait_for_succeeded_deliveries(app, 2).await;
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn builtin_grafana_state_fallback_routes_and_resolves_same_group() {
         let firing_received = Arc::new(Mutex::new(Vec::new()));
         let resolved_received = Arc::new(Mutex::new(Vec::new()));
@@ -3357,7 +3466,7 @@ mod tests {
         let resolved_url = spawn_mock_google_chat(Arc::clone(&resolved_received)).await;
         let mut config = test_config("http://127.0.0.1:1");
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.integrations = BTreeMap::from([(
             "grafana".to_string(),
             IntegrationConfig::Builtin(BuiltinIntegrationConfig {
@@ -3372,6 +3481,7 @@ mod tests {
             receiver: "firing-target".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
             continue_matching: false,
             matchers: vec![config::MatcherConfig {
                 field: "status".to_string(),
@@ -3451,7 +3561,7 @@ mod tests {
         let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
         let mut config = test_config("http://127.0.0.1:1");
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.integrations = BTreeMap::from([
             (
                 "grafana-a".to_string(),
@@ -3548,7 +3658,7 @@ mod tests {
         let chat_url = spawn_slow_mock_google_chat(Arc::clone(&received)).await;
         let mut config = test_config(&chat_url);
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
 
         let response = app
@@ -3579,6 +3689,7 @@ mod tests {
             receiver: "dead-target".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         };
         let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
         let worker = DeliveryWorker::new(
@@ -3609,8 +3720,8 @@ mod tests {
         let mut config = test_config(&chat_url);
         config.server.auth = None;
         config.management.allow_unauthenticated = true;
-        config.alert_grouping.enabled = true;
-        config.alert_grouping.debounce_millis = 1;
+        config.notification_batching.enabled = true;
+        config.notification_batching.group_wait_millis = 1;
         config.delivery = DeliveryConfig {
             max_attempts: 1,
             initial_backoff_millis: 1,
@@ -3642,7 +3753,7 @@ mod tests {
         let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
         let mut config = test_config(&chat_url);
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.routing.routes[0].matchers = vec![config::MatcherConfig {
             field: "fingerprint".to_string(),
             equals: Some("group-1".to_string()),
@@ -3707,6 +3818,7 @@ mod tests {
             receiver: "target".to_string(),
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         };
         let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
         storage
@@ -3887,7 +3999,7 @@ mod tests {
         let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
         let mut config = test_config(&chat_url);
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.escalation = EscalationConfig {
             policies: BTreeMap::from([(
                 "primary".to_string(),
@@ -3949,7 +4061,7 @@ mod tests {
         let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
         let mut config = test_config(&chat_url);
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.escalation = EscalationConfig {
             policies: BTreeMap::from([(
                 "primary".to_string(),
@@ -4010,7 +4122,7 @@ mod tests {
         let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
         let mut config = test_config(&chat_url);
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.integrations = generic_test_integrations();
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
 
@@ -4060,7 +4172,7 @@ mod tests {
         let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
         let mut config = test_config(&chat_url);
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.integrations = generic_test_integrations();
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
 
@@ -4320,7 +4432,7 @@ mod tests {
         let default_url = spawn_mock_google_chat(Arc::clone(&default_received)).await;
         let mut config = test_config("http://127.0.0.1:1");
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.integrations = synthetic_test_integrations();
         config.routing.default_receiver = Some("default-target".to_string());
         config.routing.routes = vec![
@@ -4329,6 +4441,7 @@ mod tests {
                 receiver: "critical-target".to_string(),
                 owner_team: None,
                 escalation_policy: None,
+                group_by: Vec::new(),
                 continue_matching: false,
                 matchers: vec![config::MatcherConfig {
                     field: "severity".to_string(),
@@ -4342,6 +4455,7 @@ mod tests {
                 receiver: "warning-target".to_string(),
                 owner_team: None,
                 escalation_policy: None,
+                group_by: Vec::new(),
                 continue_matching: false,
                 matchers: vec![config::MatcherConfig {
                     field: "severity".to_string(),
@@ -4508,7 +4622,7 @@ mod tests {
         let secondary_url = spawn_mock_google_chat(Arc::clone(&secondary_received)).await;
         let mut config = test_config("http://127.0.0.1:1");
         config.server.auth = None;
-        config.alert_grouping.enabled = false;
+        config.notification_batching.enabled = false;
         config.integrations = synthetic_test_integrations();
         config.routing.default_receiver = None;
         config.routing.routes = vec![
@@ -4517,6 +4631,7 @@ mod tests {
                 receiver: "primary-target".to_string(),
                 owner_team: None,
                 escalation_policy: None,
+                group_by: Vec::new(),
                 continue_matching: true,
                 matchers: vec![config::MatcherConfig {
                     field: "severity".to_string(),
@@ -4530,6 +4645,7 @@ mod tests {
                 receiver: "secondary-target".to_string(),
                 owner_team: None,
                 escalation_policy: None,
+                group_by: Vec::new(),
                 continue_matching: false,
                 matchers: vec![config::MatcherConfig {
                     field: "label.service".to_string(),
@@ -5390,6 +5506,7 @@ mod tests {
                 title: "finding.title".to_string(),
                 body: Some("finding.description".to_string()),
                 fingerprint: "finding.id".to_string(),
+                notification_group_key: None,
                 starts_at: None,
                 ends_at: None,
                 labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
@@ -5412,6 +5529,7 @@ mod tests {
                 title: "finding.title".to_string(),
                 body: Some("finding.description".to_string()),
                 fingerprint: "finding.id".to_string(),
+                notification_group_key: None,
                 starts_at: Some("observed_at".to_string()),
                 ends_at: None,
                 labels: BTreeMap::from([
@@ -5445,6 +5563,8 @@ mod tests {
             starts_at: None,
             ends_at: None,
             fingerprint: fingerprint.to_string(),
+            notification_group_key: None,
+            instances: Vec::new(),
             raw_payload: serde_json::json!({ "fingerprint": fingerprint }),
         }
     }
@@ -5509,9 +5629,11 @@ mod tests {
             escalation: EscalationConfig::default(),
             schedules: ScheduleConfig::default(),
             intelligence: IntelligenceConfig::default(),
-            alert_grouping: AlertGroupingConfig {
+            notification_batching: NotificationBatchingConfig {
                 enabled: true,
-                debounce_millis: 10,
+                group_wait_millis: 10,
+                max_events: 100,
+                max_payload_bytes: 256 * 1024,
             },
             debug: DebugConfig {
                 log_alerts: false,
@@ -5524,6 +5646,7 @@ mod tests {
                     receiver: "critical-chat".to_string(),
                     owner_team: None,
                     escalation_policy: None,
+                    group_by: Vec::new(),
                     continue_matching: false,
                     matchers: vec![config::MatcherConfig {
                         field: "label.severity".to_string(),

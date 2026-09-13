@@ -15,6 +15,7 @@ pub struct Delivery {
     pub receiver: String,
     pub owner_team: Option<String>,
     pub escalation_policy: Option<String>,
+    pub group_by: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -46,6 +47,7 @@ impl RouteEngine {
                     receiver: route.receiver.clone(),
                     owner_team: route.owner_team.clone(),
                     escalation_policy: route.escalation_policy.clone(),
+                    group_by: route.group_by.clone(),
                 });
 
                 if !route.continue_matching {
@@ -62,6 +64,7 @@ impl RouteEngine {
                 receiver: receiver.clone(),
                 owner_team: None,
                 escalation_policy: None,
+                group_by: Vec::new(),
             });
         }
 
@@ -75,6 +78,7 @@ struct CompiledRoute {
     receiver: String,
     owner_team: Option<String>,
     escalation_policy: Option<String>,
+    group_by: Vec<String>,
     continue_matching: bool,
     matchers: Vec<CompiledMatcher>,
 }
@@ -91,6 +95,7 @@ impl CompiledRoute {
             receiver: route.receiver,
             owner_team: route.owner_team,
             escalation_policy: route.escalation_policy,
+            group_by: route.group_by,
             continue_matching: route.continue_matching,
             matchers,
         })
@@ -185,9 +190,9 @@ fn field_value(event: &AlertEvent, field: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        AlertGroupingConfig, DebugConfig, DeliveryConfig, GoogleChatReceiverConfig,
-        ManagementConfig, ReceiverConfig, RoutingConfig, ScheduleConfig, ServerLimitsConfig,
-        StorageConfig,
+        DebugConfig, DeliveryConfig, GoogleChatReceiverConfig, ManagementConfig,
+        NotificationBatchingConfig, ReceiverConfig, RoutingConfig, ScheduleConfig,
+        ServerLimitsConfig, StorageConfig,
     };
     use std::collections::BTreeMap;
 
@@ -213,7 +218,7 @@ mod tests {
             escalation: crate::config::EscalationConfig::default(),
             schedules: ScheduleConfig::default(),
             intelligence: crate::config::IntelligenceConfig::default(),
-            alert_grouping: AlertGroupingConfig::default(),
+            notification_batching: NotificationBatchingConfig::default(),
             debug: DebugConfig {
                 log_alerts: false,
                 log_full_payloads: false,
@@ -225,6 +230,7 @@ mod tests {
                     receiver: "prod".to_string(),
                     owner_team: None,
                     escalation_policy: None,
+                    group_by: Vec::new(),
                     continue_matching: false,
                     matchers: vec![MatcherConfig {
                         field: "label.severity".to_string(),
