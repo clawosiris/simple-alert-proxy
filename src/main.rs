@@ -1,7 +1,7 @@
 use anyhow::Context;
 use argon2::{
     Argon2,
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
 use axum::{
     BoxError, Json, Router,
@@ -14,7 +14,6 @@ use axum::{
     routing::{get, post, put},
 };
 use clap::Parser;
-use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1902,9 +1901,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
     validate_password(password)?;
-    let salt = SaltString::generate(&mut OsRng);
     Ok(Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|error| anyhow::anyhow!("failed to hash password: {error}"))?
         .to_string())
 }
@@ -2055,6 +2053,26 @@ mod tests {
         init_crypto_provider().unwrap();
 
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn password_hash_round_trip_uses_unique_salts() {
+        let password = "correct horse battery";
+        let first = hash_password(password).unwrap();
+        let second = hash_password(password).unwrap();
+
+        assert_ne!(first, second);
+        assert!(verify_password(&first, password));
+        assert!(verify_password(&second, password));
+        assert!(!verify_password(&first, "incorrect password"));
+    }
+
+    #[test]
+    fn password_verification_accepts_existing_phc_hashes() {
+        const EXISTING_HASH: &str = "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc";
+
+        assert!(verify_password(EXISTING_HASH, "password"));
+        assert!(!verify_password(EXISTING_HASH, "sassword"));
     }
 
     #[tokio::test]
