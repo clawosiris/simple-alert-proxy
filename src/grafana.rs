@@ -115,6 +115,7 @@ impl GrafanaWebhookPayload {
             raw,
         );
         event.group_namespace = grafana_group_namespace(integration, self.org_id);
+        event.notification_group_key = self.group_key.clone();
         event.body = body_from(&annotations, self.message.as_deref());
         event.labels = labels;
         event.annotations = annotations;
@@ -156,6 +157,7 @@ impl GrafanaWebhookPayload {
             raw,
         );
         event.group_namespace = grafana_group_namespace(integration, self.org_id);
+        event.notification_group_key = self.group_key.clone();
         event.body = body_from(&annotations, self.message.as_deref());
         event.labels = labels;
         event.annotations = annotations;
@@ -403,6 +405,10 @@ mod tests {
         assert_eq!(events[0].title, "HighLatency");
         assert_eq!(events[0].body.as_deref(), Some("Checkout latency is high"));
         assert_eq!(events[0].fingerprint, "grafana-latency-1");
+        assert_eq!(
+            events[0].notification_group_key.as_deref(),
+            Some("{alertname=\"HighLatency\"}")
+        );
         assert_eq!(
             events[0].group_namespace,
             "integration/grafana/grafana-org/1"
