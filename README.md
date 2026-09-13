@@ -344,6 +344,77 @@ and can send messages there. Prefer `access_token_env` over inline
 use the canonical `!room:server` form; room aliases such as `#alerts:server`
 are not resolved.
 
+### Notification templates
+
+All receivers support guarded MiniJinja 2.x templates. Google Chat, Slack,
+Mattermost, Discord, and Matrix accept a standard `template.title` /
+`template.body` mode. Generic webhooks accept `template.payload`; every other
+receiver can also use payload mode when its complete platform JSON body must be
+controlled.
+
+```yaml
+receivers:
+  platform-slack:
+    type: slack
+    webhook_url: "https://hooks.slack.com/services/example"
+    template:
+      title: "[{{ alert.severity | upper }}] {{ alert.title }}"
+      body: |-
+        {% if alert.body %}{{ alert.body }}{% endif %}
+        {% for name, value in alert.labels | items %}
+        {{ name }}={{ value }}
+        {% endfor %}
+
+  custom-webhook:
+    type: generic_webhook
+    webhook_url: "https://alerts.example.test/webhook"
+    template:
+      payload: |-
+        {
+          "summary": {{ alert.title | tojson }},
+          "severity": {{ alert.severity | tojson }},
+          "route": {{ delivery.route | tojson }}
+        }
+```
+
+The allow-listed context is:
+
+- `alert`: `integration`, `source`, `status`, `severity`, `title`, `body`,
+  `fingerprint`, `starts_at`, `ends_at`, `labels`, `annotations`, and `links`.
+- `delivery`: `route`, `receiver`, and optional `owner_team`.
+- `group`: `count`, `status`, `severity_counts`, and `instances` for batched
+  delivery. Each instance contains canonical alert fields but no raw payload.
+- Legacy aliases: `status`, `severity`, `title`, and `alertname`.
+
+Undefined variables are errors. Optional values should be checked with `{% if
+... %}` or handled with MiniJinja's `default` filter. Maps can be iterated with
+`{% for name, value in alert.labels | items %}` and JSON string values should
+use `| tojson` in payload templates. The context deliberately excludes
+`raw_payload`, receiver URLs, tokens, server/management config, environment
+variables, and all credentials.
+
+The `template` block is mutually exclusive with legacy `title_template`.
+Without `template`, existing receiver payloads and the legacy automatic Google
+Chat ` via <route>` title suffix remain unchanged. Replays use the currently
+configured template.
+
+Templates are compiled once at startup with strict undefined values, a 64 KiB
+source limit, a fixed recursion limit, and a per-render instruction budget.
+Rendered titles are limited to 4 KiB. Final payload limits are 32 KiB for
+Google Chat, 40 KiB for Slack/Mattermost, 16 KiB for Discord, 64 KiB for
+Matrix, and 256 KiB for generic webhooks. Standard Google Chat and Matrix modes
+escape alert-controlled text before placing it in HTML-bearing fields.
+
+Payload templates must render a JSON object. Minimal target-shape validation
+requires `text` or `cardsV2` for Google Chat, `text` or `blocks` for
+Slack/Mattermost, `content` or `embeds` for Discord, and string `msgtype` plus
+`body` for Matrix. Templates cannot change the destination URL, method,
+headers, authentication, timeout, routing, lifecycle, or retry policy. Syntax
+and configuration errors stop startup. Data-dependent rendering, fuel,
+recursion, size, JSON, and shape errors make the delivery a permanent
+single-attempt dead letter without issuing an HTTP request; stored errors only
+contain the receiver, template field, error class, and safe line information.
+
 Escalation policies can be attached to routes:
 
 ```yaml

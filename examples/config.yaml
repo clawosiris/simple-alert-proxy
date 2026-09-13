@@ -152,7 +152,13 @@ receivers:
   slack-alerts:
     type: "slack"
     webhook_url: "https://hooks.slack.com/services/example"
-    title_template: "[{{status}}] {{title}}"
+    template:
+      title: "[{{ alert.severity | upper }}] {{ alert.title }}"
+      body: |-
+        {% if alert.body %}{{ alert.body }}{% endif %}
+        {% for name, value in alert.labels | items %}
+        {{ name }}={{ value }}
+        {% endfor %}
     timeout_secs: 10
 
   mattermost-alerts:

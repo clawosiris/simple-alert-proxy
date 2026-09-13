@@ -41,6 +41,7 @@ mod redaction;
 mod routing;
 mod signoz;
 mod storage;
+mod template;
 mod tls;
 mod ui;
 
@@ -203,7 +204,7 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     let max_body_bytes = config.server.max_body_bytes;
     let webhook_concurrency = config.server.limits.webhook_concurrency;
     let management_concurrency = config.server.limits.management_concurrency;
-    let google_chat = GoogleChatClient::new();
+    let google_chat = GoogleChatClient::new(&config.receivers)?;
     let storage = Storage::open(&config.storage.path)?;
     let recovered_batches = storage.recover_notification_batches()?;
     if recovered_batches > 0 {
@@ -353,14 +354,14 @@ async fn run_notification_batch(state: &AppState, claimed: ClaimedNotificationBa
                 error!(%error, batch_id = claimed.id, "failed to mark notification batch success");
             }
         }
-        Err(error) if claimed.attempt >= state.config.delivery.max_attempts => {
+        Err(error) if error.permanent || claimed.attempt >= state.config.delivery.max_attempts => {
             if let Err(store_error) = state
                 .storage
-                .mark_notification_batch_dead_letter(claimed.id, &error)
+                .mark_notification_batch_dead_letter(claimed.id, &error.message)
             {
                 error!(%store_error, batch_id = claimed.id, "failed to mark notification batch dead-letter");
             }
-            error!(batch_id = claimed.id, %error, "notification batch exhausted retries");
+            error!(batch_id = claimed.id, error = %error.message, permanent = error.permanent, "notification batch dead-lettered");
         }
         Err(error) => {
             let exponent = claimed.attempt.saturating_sub(1).min(31);
@@ -371,9 +372,10 @@ async fn run_notification_batch(state: &AppState, claimed: ClaimedNotificationBa
                 .saturating_mul(1_u64 << exponent)
                 .min(state.config.delivery.max_backoff_millis);
             let retry_at = storage::now_epoch_millis().saturating_add(backoff as i64);
-            if let Err(store_error) = state
-                .storage
-                .mark_notification_batch_retrying(claimed.id, retry_at, &error)
+            if let Err(store_error) =
+                state
+                    .storage
+                    .mark_notification_batch_retrying(claimed.id, retry_at, &error.message)
             {
                 error!(%store_error, batch_id = claimed.id, "failed to mark notification batch retry");
             }
@@ -384,14 +386,16 @@ async fn run_notification_batch(state: &AppState, claimed: ClaimedNotificationBa
 async fn send_notification_batch(
     state: &AppState,
     claimed: &ClaimedNotificationBatch,
-) -> Result<(), String> {
+) -> Result<(), DeliveryFailure> {
     let receiver = state
         .config
         .receivers
         .get(&claimed.delivery.receiver)
-        .ok_or_else(|| "target configuration failed".to_string())?;
+        .ok_or_else(|| DeliveryFailure::permanent("target configuration failed"))?;
     if claimed.members.is_empty() {
-        return Err("notification batch has no members".to_string());
+        return Err(DeliveryFailure::permanent(
+            "notification batch has no members",
+        ));
     }
     let batch = NotificationBatch::new(
         claimed.batch_key.clone(),
@@ -1461,7 +1465,7 @@ impl DeliveryWorker {
     async fn run<F, Fut>(&self, delivery_id: i64, mut send: F)
     where
         F: FnMut(bool) -> Fut,
-        Fut: std::future::Future<Output = Result<(), String>>,
+        Fut: std::future::Future<Output = Result<(), DeliveryFailure>>,
     {
         let mut backoff = Duration::from_millis(self.config.initial_backoff_millis);
 
@@ -1477,18 +1481,20 @@ impl DeliveryWorker {
                     }
                     return;
                 }
-                Err(error) if attempt >= self.config.max_attempts => {
-                    if let Err(store_error) = self.storage.mark_dead_letter(delivery_id, &error) {
+                Err(error) if error.permanent || attempt >= self.config.max_attempts => {
+                    if let Err(store_error) =
+                        self.storage.mark_dead_letter(delivery_id, &error.message)
+                    {
                         error!(%store_error, delivery_id, "failed to mark delivery dead-letter");
                     }
-                    error!(delivery_id, %error, "delivery exhausted retries");
+                    error!(delivery_id, error = %error.message, permanent = error.permanent, "delivery dead-lettered");
                     return;
                 }
                 Err(error) => {
                     let next_retry_at = storage::now_epoch_millis() + backoff.as_millis() as i64;
                     if let Err(store_error) =
                         self.storage
-                            .mark_retrying(delivery_id, next_retry_at, &error)
+                            .mark_retrying(delivery_id, next_retry_at, &error.message)
                     {
                         error!(%store_error, delivery_id, "failed to mark delivery retry");
                     }
@@ -1503,13 +1509,42 @@ impl DeliveryWorker {
     }
 }
 
-fn redacted_delivery_error(error: google_chat::GoogleChatError) -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryFailure {
+    message: String,
+    permanent: bool,
+}
+
+impl DeliveryFailure {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            permanent: false,
+        }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            permanent: true,
+        }
+    }
+}
+
+fn redacted_delivery_error(error: google_chat::GoogleChatError) -> DeliveryFailure {
     match error {
         google_chat::GoogleChatError::Rejected(status) => {
-            format!("target rejected delivery with status {status}")
+            DeliveryFailure::retryable(format!("target rejected delivery with status {status}"))
         }
-        google_chat::GoogleChatError::Config(_) => "target configuration failed".to_string(),
-        google_chat::GoogleChatError::Http(_) => "target delivery failed".to_string(),
+        google_chat::GoogleChatError::Config(_) => {
+            DeliveryFailure::permanent("target configuration failed")
+        }
+        google_chat::GoogleChatError::Template(error) => {
+            DeliveryFailure::permanent(error.to_string())
+        }
+        google_chat::GoogleChatError::Http(_) => {
+            DeliveryFailure::retryable("target delivery failed")
+        }
     }
 }
 
@@ -2036,12 +2071,12 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AuthConfig, BuiltinIntegrationConfig, DebugConfig, DeliveryConfig, EscalationConfig,
-        EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
-        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
-        IntelligenceConfig, ManagementConfig, MatrixReceiverConfig, NotificationBatchingConfig,
-        ReceiverConfig, RoutingConfig, ScheduleConfig, ServerConfig, ServerLimitsConfig,
-        StorageConfig,
+        AuthConfig, BuiltinIntegrationConfig, ChatWebhookReceiverConfig, DebugConfig,
+        DeliveryConfig, EscalationConfig, EscalationPolicyConfig, EscalationStepConfig,
+        GenericJsonIntegrationConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
+        IntegrationConfig, IntelligenceConfig, ManagementConfig, MatrixReceiverConfig,
+        NotificationBatchingConfig, NotificationTemplateConfig, ReceiverConfig, RoutingConfig,
+        ScheduleConfig, ServerConfig, ServerLimitsConfig, StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -2690,7 +2725,7 @@ mod tests {
         let state = AppState {
             config: config.clone(),
             router: Arc::new(RouteEngine::new(config.as_ref().clone()).unwrap()),
-            target_client: GoogleChatClient::new(),
+            target_client: GoogleChatClient::new(&config.receivers).unwrap(),
             storage,
             login_attempts: LoginAttemptLimiter::new(),
         };
@@ -2923,6 +2958,7 @@ mod tests {
         let config = AppConfig::load("examples/config.yaml").unwrap();
 
         config.validate().unwrap();
+        GoogleChatClient::new(&config.receivers).unwrap();
         assert_eq!(config.server.webhook_path, "/webhooks/signoz");
         assert_eq!(config.server.max_body_bytes, 1024 * 1024);
         assert!(config.server.auth.is_some());
@@ -3202,6 +3238,7 @@ mod tests {
                     webhook_url: critical_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
             (
@@ -3210,6 +3247,7 @@ mod tests {
                     webhook_url: default_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
         ]);
@@ -3304,6 +3342,7 @@ mod tests {
                 webhook_url,
                 owner_team: None,
                 timeout_secs: 10,
+                template: None,
             }),
         )]);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -3342,6 +3381,7 @@ mod tests {
                 webhook_url,
                 owner_team: None,
                 timeout_secs: 10,
+                template: None,
             }),
         )]);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -3396,6 +3436,7 @@ mod tests {
                 webhook_url,
                 owner_team: None,
                 timeout_secs: 10,
+                template: None,
             }),
         )]);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -3456,6 +3497,7 @@ mod tests {
                 webhook_url,
                 owner_team: None,
                 timeout_secs: 10,
+                template: None,
             }),
         )]);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -3526,6 +3568,7 @@ mod tests {
                     webhook_url: firing_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
             (
@@ -3534,6 +3577,7 @@ mod tests {
                     webhook_url: resolved_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
         ]);
@@ -3617,6 +3661,7 @@ mod tests {
                 webhook_url,
                 owner_team: None,
                 timeout_secs: 10,
+                template: None,
             }),
         )]);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -3700,6 +3745,209 @@ mod tests {
         wait_for_received_count(&received, 1).await;
     }
 
+    #[test]
+    fn invalid_template_syntax_fails_application_startup() {
+        let mut config = test_config("http://127.0.0.1:1");
+        let ReceiverConfig::GoogleChat(receiver) = config
+            .receivers
+            .get_mut("critical-chat")
+            .expect("critical receiver exists")
+        else {
+            panic!("critical receiver should be Google Chat");
+        };
+        receiver.title_template = None;
+        receiver.template = Some(NotificationTemplateConfig {
+            title: Some("{% if alert.title %}".to_string()),
+            ..Default::default()
+        });
+
+        config.validate().unwrap();
+        let error = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("template.title has invalid syntax")
+        );
+    }
+
+    #[tokio::test]
+    async fn template_render_failure_dead_letters_once_without_network_request() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let chat_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config(&chat_url);
+        config.server.auth = None;
+        let ReceiverConfig::GoogleChat(receiver) = config
+            .receivers
+            .get_mut("critical-chat")
+            .expect("critical receiver exists")
+        else {
+            panic!("critical receiver should be Google Chat");
+        };
+        receiver.title_template = None;
+        receiver.template = Some(NotificationTemplateConfig {
+            title: Some("{{ unavailable.value }}".to_string()),
+            ..Default::default()
+        });
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_delivery_status(app.clone(), "dead_letter", 1).await;
+
+        assert!(received.lock().unwrap().is_empty());
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        assert_eq!(deliveries[0]["attempt_count"], 1);
+        let error = deliveries[0]["last_error"].as_str().unwrap();
+        assert!(error.contains("receiver critical-chat template.title failed"));
+        assert!(error.contains("undefined value"));
+    }
+
+    #[tokio::test]
+    async fn templates_render_end_to_end_for_every_receiver_family() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let matrix_url = spawn_mock_matrix(Arc::clone(&received)).await;
+        let standard = |prefix: &str| NotificationTemplateConfig {
+            title: Some(format!("{prefix}: {{{{ alert.title }}}}")),
+            body: Some("body <unsafe> {{ alert.severity }}".to_string()),
+            payload: None,
+        };
+        let chat_receiver = |prefix: &str| ChatWebhookReceiverConfig {
+            webhook_url: webhook_url.clone(),
+            owner_team: Some("platform".to_string()),
+            title_template: None,
+            template: Some(standard(prefix)),
+            timeout_secs: 10,
+        };
+        let mut config = test_config(&webhook_url);
+        config.server.auth = None;
+        config.notification_batching.enabled = false;
+        config.routing.default_receiver = None;
+        config.routing.routes = [
+            "google",
+            "generic",
+            "slack",
+            "mattermost",
+            "discord",
+            "matrix",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, receiver)| config::RouteConfig {
+            name: format!("route-{receiver}"),
+            receiver: receiver.to_string(),
+            owner_team: Some("platform".to_string()),
+            escalation_policy: None,
+            continue_matching: index < 5,
+            group_by: Vec::new(),
+            matchers: Vec::new(),
+        })
+        .collect();
+        config.receivers = BTreeMap::from([
+            (
+                "google".to_string(),
+                ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
+                    webhook_url: webhook_url.clone(),
+                    owner_team: Some("platform".to_string()),
+                    title_template: None,
+                    template: Some(standard("google")),
+                    timeout_secs: 10,
+                }),
+            ),
+            (
+                "generic".to_string(),
+                ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                    webhook_url: webhook_url.clone(),
+                    owner_team: Some("platform".to_string()),
+                    timeout_secs: 10,
+                    template: Some(NotificationTemplateConfig {
+                        payload: Some(
+                            r#"{"target":"generic","title":{{ alert.title | tojson }},"route":{{ delivery.route | tojson }}}"#
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    }),
+                }),
+            ),
+            (
+                "slack".to_string(),
+                ReceiverConfig::Slack(chat_receiver("slack")),
+            ),
+            (
+                "mattermost".to_string(),
+                ReceiverConfig::Mattermost(chat_receiver("mattermost")),
+            ),
+            (
+                "discord".to_string(),
+                ReceiverConfig::Discord(chat_receiver("discord")),
+            ),
+            (
+                "matrix".to_string(),
+                ReceiverConfig::Matrix(MatrixReceiverConfig {
+                    homeserver_url: matrix_url,
+                    room_id: "!ops:example.test".to_string(),
+                    access_token: Some("matrix-token".to_string()),
+                    access_token_env: None,
+                    owner_team: Some("platform".to_string()),
+                    title_template: None,
+                    template: Some(standard("matrix")),
+                    timeout_secs: 10,
+                }),
+            ),
+        ]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(signoz_request(fixture_payload()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_succeeded_deliveries(app, 6).await;
+        wait_for_received_count(&received, 6).await;
+
+        let payloads = received.lock().unwrap();
+        assert!(payloads.iter().any(|payload| {
+            payload["cardsV2"][0]["card"]["header"]["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("google:"))
+                && payload["cardsV2"][0]["card"]["sections"][1]["widgets"][0]
+                    ["textParagraph"]["text"]
+                    == "body &lt;unsafe&gt; critical"
+        }), "{payloads:#?}");
+        assert!(
+            payloads
+                .iter()
+                .any(|payload| payload["target"] == "generic")
+        );
+        for target in ["slack", "mattermost"] {
+            assert!(payloads.iter().any(|payload| {
+                payload["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with(&format!("{target}:")))
+            }));
+        }
+        assert!(payloads.iter().any(|payload| {
+            payload["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("discord:"))
+                && payload["embeds"][0]["description"] == "body <unsafe> critical"
+        }));
+        assert!(payloads.iter().any(|payload| {
+            payload["payload"]["body"]
+                .as_str()
+                .is_some_and(|body| body.starts_with("matrix:"))
+                && payload["payload"]["formatted_body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("&lt;unsafe&gt;"))
+        }));
+    }
+
     #[tokio::test]
     async fn delivery_worker_dead_letters_after_retry_exhaustion() {
         let storage = Storage::open(":memory:").unwrap();
@@ -3733,13 +3981,46 @@ mod tests {
 
         worker
             .run(delivery_id, |_| async {
-                Err::<(), String>("target delivery failed".to_string())
+                Err::<(), DeliveryFailure>(DeliveryFailure::retryable("target delivery failed"))
             })
             .await;
 
         assert_eq!(storage.event_count().unwrap(), 1);
         assert_eq!(storage.delivery_statuses().unwrap(), vec!["dead_letter"]);
         assert_eq!(storage.delivery_attempts().unwrap(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn delivery_worker_dead_letters_permanent_failures_after_one_attempt() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = test_alert_event("permanent-failure");
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "default".to_string(),
+            receiver: "dead-target".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
+        let worker = DeliveryWorker::new(
+            storage.clone(),
+            DeliveryConfig {
+                max_attempts: 3,
+                initial_backoff_millis: 1,
+                max_backoff_millis: 1,
+            },
+            false,
+        );
+
+        worker
+            .run(delivery_id, |_| async {
+                Err::<(), DeliveryFailure>(DeliveryFailure::permanent("template rendering failed"))
+            })
+            .await;
+
+        assert_eq!(storage.delivery_statuses().unwrap(), vec!["dead_letter"]);
+        assert_eq!(storage.delivery_attempts().unwrap(), vec![1]);
     }
 
     #[tokio::test]
@@ -3881,6 +4162,18 @@ mod tests {
         config.management.allow_unauthenticated = true;
         config.routing.routes = Vec::new();
         config.routing.default_receiver = Some("critical-chat".to_string());
+        let ReceiverConfig::GoogleChat(receiver) = config
+            .receivers
+            .get_mut("critical-chat")
+            .expect("critical receiver exists")
+        else {
+            panic!("critical receiver should be Google Chat");
+        };
+        receiver.title_template = None;
+        receiver.template = Some(NotificationTemplateConfig {
+            title: Some("replay-template: {{ alert.title }}".to_string()),
+            ..Default::default()
+        });
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
 
         let response = app
@@ -3913,6 +4206,11 @@ mod tests {
 
         assert_eq!(replay.status(), StatusCode::ACCEPTED);
         wait_for_received_count(&received, 2).await;
+        assert!(received.lock().unwrap().iter().all(|payload| {
+            payload["cardsV2"][0]["card"]["header"]["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("replay-template:"))
+        }));
     }
 
     #[test]
@@ -4258,6 +4556,7 @@ mod tests {
                 webhook_url,
                 owner_team: None,
                 timeout_secs: 10,
+                template: None,
             }),
         );
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -4300,7 +4599,8 @@ mod tests {
                 access_token: Some("matrix-token".to_string()),
                 access_token_env: None,
                 owner_team: None,
-                title_template: "[{{status}}] {{title}}".to_string(),
+                title_template: Some("[{{status}}] {{title}}".to_string()),
+                template: None,
                 timeout_secs: 10,
             }),
         );
@@ -4362,7 +4662,8 @@ mod tests {
                 access_token: Some("matrix-token".to_string()),
                 access_token_env: None,
                 owner_team: None,
-                title_template: "[{{status}}] {{title}}".to_string(),
+                title_template: Some("[{{status}}] {{title}}".to_string()),
+                template: None,
                 timeout_secs: 10,
             }),
         );
@@ -4407,7 +4708,8 @@ mod tests {
                 access_token: Some("matrix-token".to_string()),
                 access_token_env: None,
                 owner_team: None,
-                title_template: "[{{status}}] {{title}}".to_string(),
+                title_template: Some("[{{status}}] {{title}}".to_string()),
+                template: None,
                 timeout_secs: 10,
             }),
         );
@@ -4501,6 +4803,7 @@ mod tests {
                     webhook_url: critical_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
             (
@@ -4509,6 +4812,7 @@ mod tests {
                     webhook_url: warning_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
             (
@@ -4517,6 +4821,7 @@ mod tests {
                     webhook_url: default_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
         ]);
@@ -4691,6 +4996,7 @@ mod tests {
                     webhook_url: primary_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
             (
@@ -4699,6 +5005,7 @@ mod tests {
                     webhook_url: secondary_url,
                     owner_team: None,
                     timeout_secs: 10,
+                    template: None,
                 }),
             ),
         ]);
@@ -5691,7 +5998,8 @@ mod tests {
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "http://127.0.0.1:1".to_string(),
                         owner_team: None,
-                        title_template: "[{{status}}] {{alertname}}".to_string(),
+                        title_template: Some("[{{status}}] {{alertname}}".to_string()),
+                        template: None,
                         timeout_secs: 10,
                     }),
                 ),
@@ -5700,7 +6008,8 @@ mod tests {
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: webhook_url.to_string(),
                         owner_team: None,
-                        title_template: "[{{status}}] {{alertname}}".to_string(),
+                        title_template: Some("[{{status}}] {{alertname}}".to_string()),
+                        template: None,
                         timeout_secs: 10,
                     }),
                 ),

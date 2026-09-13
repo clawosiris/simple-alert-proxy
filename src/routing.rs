@@ -246,7 +246,8 @@ mod tests {
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "https://chat.googleapis.test/prod".to_string(),
                         owner_team: None,
-                        title_template: "[{{status}}] {{alertname}}".to_string(),
+                        title_template: Some("[{{status}}] {{alertname}}".to_string()),
+                        template: None,
                         timeout_secs: 10,
                     }),
                 ),
@@ -255,7 +256,8 @@ mod tests {
                     ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                         webhook_url: "https://chat.googleapis.test/default".to_string(),
                         owner_team: None,
-                        title_template: "[{{status}}] {{alertname}}".to_string(),
+                        title_template: Some("[{{status}}] {{alertname}}".to_string()),
+                        template: None,
                         timeout_secs: 10,
                     }),
                 ),

@@ -514,9 +514,9 @@ receivers:
     timeout_secs: 10
 ```
 
-The current Google Chat adapter keeps the SigNoz grouped card behavior. Generic
-and chat-style targets receive canonical alert-event payloads through the same
-durable delivery queue, retry, redaction, and replay behavior.
+All receiver types consume the same canonical single-event or durable
+`NotificationBatch` input. Generic and chat-style targets use the same durable
+delivery queue, retry, redaction, and replay behavior as Google Chat.
 
 Matrix receivers send `m.notice` room messages through the Matrix Client-Server
 API. The configured token must belong to a Matrix user or bot already joined to
@@ -524,6 +524,69 @@ the target room with permission to send messages. Operators should prefer
 `access_token_env` so Matrix access tokens are not stored in config files. The
 configured `room_id` must be a canonical `!room:server` ID; aliases such as
 `#alerts:server` are not resolved.
+
+### Outbound notification templates
+
+Receivers may define a runtime MiniJinja 2.x `template` block. Google Chat,
+Slack, Mattermost, Discord, and Matrix support `title` and `body` in their
+standard layouts. All receiver families support a mutually exclusive `payload`
+field that renders the complete outbound JSON object; generic webhooks support
+payload mode only. Legacy `title_template` remains unchanged when `template`
+is absent and cannot be combined with the new block.
+
+```yaml
+receivers:
+  platform-slack:
+    type: slack
+    webhook_url: "https://hooks.slack.com/services/..."
+    template:
+      title: "[{{ alert.severity | upper }}] {{ alert.title }}"
+      body: "{% if alert.body %}{{ alert.body }}{% endif %}"
+
+  downstream:
+    type: generic_webhook
+    webhook_url: "https://alerts.example.test/webhook"
+    template:
+      payload: |-
+        {"title": {{ alert.title | tojson }},
+         "route": {{ delivery.route | tojson }}}
+```
+
+The serializable template context is intentionally narrower than `AlertEvent`:
+
+```text
+alert:
+  integration, source, status, severity, title, body, fingerprint,
+  starts_at, ends_at, labels, annotations, links
+delivery:
+  route, receiver, owner_team
+group:                              # batched delivery only
+  count, status, severity_counts, instances
+status, severity, title, alertname # legacy flat aliases
+```
+
+`raw_payload`, receiver and server configuration, URLs, headers, tokens,
+passwords, management data, and process environment variables are never in the
+context. Strict undefined behavior makes unknown values fail. `tojson` is the
+required JSON-value encoder for payload templates; `items` supports map
+iteration. Includes, imports, inheritance, macros, filesystem/network loading,
+user functions, and live reload are not enabled.
+
+The engine compiles configured templates once before the application starts and
+uses fixed internal safeguards: 64 KiB source size, 4 KiB rendered title,
+32 KiB Google Chat payload, 40 KiB Slack/Mattermost payload, 16 KiB Discord
+payload, 64 KiB Matrix payload, 256 KiB generic-webhook payload, recursion depth
+32, and 50,000 instructions per render. Standard Google Chat and Matrix paths
+escape rendered body text before inserting it in HTML-bearing fields.
+
+Payload output must parse as a JSON object and meet the receiver's minimal
+shape (`text`/`cardsV2`, `text`/`blocks`, `content`/`embeds`, or Matrix
+`msgtype` plus `body`). Static syntax and config errors fail startup.
+Data-dependent rendering, resource-limit, JSON, and shape errors are permanent:
+the delivery is attempted once, performs no HTTP request, and moves directly to
+`dead_letter`. The stored message identifies only the receiver, template field,
+safe error class, and line; it never stores rendered output, context, template
+source, or secrets. Replays always render with the current receiver template.
 
 Generic JSON integrations can name a source preset for operator clarity and
 validation. Supported generic presets are `alertmanager`, `grafana`,
