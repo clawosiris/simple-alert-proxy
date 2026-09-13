@@ -65,6 +65,7 @@ impl Storage {
                 title TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
                 raw_payload TEXT NOT NULL,
+                normalized_event TEXT,
                 created_at INTEGER NOT NULL,
                 FOREIGN KEY(alert_group_id) REFERENCES alert_groups(id)
             );
@@ -101,6 +102,38 @@ impl Storage {
                 response_summary TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
+                FOREIGN KEY(alert_event_id) REFERENCES alert_events(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_key TEXT NOT NULL,
+                receiver TEXT NOT NULL,
+                route_name TEXT NOT NULL,
+                owner_team TEXT,
+                escalation_policy TEXT,
+                status TEXT NOT NULL,
+                due_at INTEGER NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                payload_bytes INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_notification_batches_due
+                ON notification_batches(status, due_at, id);
+
+            CREATE TABLE IF NOT EXISTS notification_batch_members (
+                batch_id INTEGER NOT NULL,
+                delivery_record_id INTEGER NOT NULL UNIQUE,
+                alert_event_id INTEGER NOT NULL,
+                event_bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY(batch_id, delivery_record_id),
+                FOREIGN KEY(batch_id) REFERENCES notification_batches(id),
+                FOREIGN KEY(delivery_record_id) REFERENCES delivery_records(id),
                 FOREIGN KEY(alert_event_id) REFERENCES alert_events(id)
             );
 
@@ -181,6 +214,7 @@ impl Storage {
             "#,
         )?;
         add_column_if_missing(&conn, "alert_events", "alert_group_id INTEGER")?;
+        add_column_if_missing(&conn, "alert_events", "normalized_event TEXT")?;
         add_column_if_missing(&conn, "alert_groups", "team_id INTEGER")?;
         add_column_if_missing(&conn, "alert_events", "group_namespace TEXT")?;
         migrate_alert_group_namespaces(&conn)?;
@@ -211,6 +245,7 @@ impl Storage {
         owner_team: Option<&str>,
     ) -> anyhow::Result<i64> {
         let raw_payload = serde_json::to_string(&event.raw_payload)?;
+        let normalized_event = serde_json::to_string(event)?;
         let now = now_epoch_millis();
         let conn = self.conn.lock().unwrap();
         let team_id = owner_team
@@ -222,9 +257,9 @@ impl Storage {
             r#"
             INSERT INTO alert_events (
                 alert_group_id, event_id, integration, group_namespace, source, status,
-                severity, title, fingerprint, raw_payload, created_at
+                severity, title, fingerprint, raw_payload, normalized_event, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
             params![
                 alert_group_id,
@@ -237,7 +272,8 @@ impl Storage {
                 event.title,
                 event.fingerprint,
                 raw_payload,
-                now,
+                normalized_event,
+                now
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -262,6 +298,319 @@ impl Storage {
             params![alert_event_id, delivery.receiver, now, request_summary],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn queue_notification_batch(
+        &self,
+        alert_event_id: i64,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        batch_key: &str,
+        limits: NotificationBatchLimits,
+    ) -> anyhow::Result<i64> {
+        let now = now_epoch_millis();
+        let event_bytes = i64::try_from(serde_json::to_vec(event)?.len())
+            .context("normalized event size overflowed SQLite integer")?;
+        let max_events =
+            i64::try_from(limits.max_events).context("max_events overflowed SQLite integer")?;
+        let max_payload_bytes = i64::try_from(limits.max_payload_bytes)
+            .context("max_payload_bytes overflowed SQLite integer")?;
+        let request_summary = serde_json::json!({
+            "route": delivery.route_name,
+            "receiver": delivery.receiver,
+            "notification_batch": batch_key,
+        })
+        .to_string();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO delivery_records (
+                alert_event_id, target, status, attempt_count, next_retry_at,
+                last_error, request_summary, response_summary, created_at, updated_at
+            )
+            VALUES (?1, ?2, 'queued', 0, ?3, NULL, ?4, NULL, ?3, ?3)
+            "#,
+            params![alert_event_id, delivery.receiver, now, request_summary],
+        )?;
+        let delivery_id = tx.last_insert_rowid();
+
+        let existing = tx
+            .query_row(
+                r#"
+                SELECT id, event_count, payload_bytes
+                FROM notification_batches
+                WHERE batch_key = ?1 AND status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                "#,
+                params![batch_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let batch_id = match existing {
+            Some((id, count, bytes))
+                if count < max_events && bytes.saturating_add(event_bytes) <= max_payload_bytes =>
+            {
+                id
+            }
+            Some((id, _, _)) => {
+                tx.execute(
+                    "UPDATE notification_batches SET due_at = ?2, updated_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )?;
+                tx.execute(
+                    r#"
+                    UPDATE delivery_records
+                    SET next_retry_at = ?2, updated_at = ?2
+                    WHERE id IN (
+                        SELECT delivery_record_id
+                        FROM notification_batch_members
+                        WHERE batch_id = ?1
+                    )
+                    "#,
+                    params![id, now],
+                )?;
+                insert_notification_batch(&tx, batch_key, delivery, now, limits.group_wait_millis)?
+            }
+            None => {
+                insert_notification_batch(&tx, batch_key, delivery, now, limits.group_wait_millis)?
+            }
+        };
+
+        tx.execute(
+            r#"
+            INSERT INTO notification_batch_members (
+                batch_id, delivery_record_id, alert_event_id, event_bytes, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![batch_id, delivery_id, alert_event_id, event_bytes, now],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE notification_batches
+            SET event_count = event_count + 1,
+                payload_bytes = payload_bytes + ?2,
+                due_at = CASE
+                    WHEN event_count + 1 >= ?3 OR payload_bytes + ?2 >= ?4 THEN ?5
+                    ELSE due_at
+                END,
+                updated_at = ?5
+            WHERE id = ?1
+            "#,
+            params![batch_id, event_bytes, max_events, max_payload_bytes, now],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE delivery_records
+            SET next_retry_at = (
+                SELECT due_at FROM notification_batches WHERE id = ?1
+            ),
+                updated_at = ?2
+            WHERE id IN (
+                SELECT delivery_record_id
+                FROM notification_batch_members
+                WHERE batch_id = ?1
+            )
+            "#,
+            params![batch_id, now],
+        )?;
+        tx.commit()?;
+        Ok(delivery_id)
+    }
+
+    pub fn recover_notification_batches(&self) -> anyhow::Result<usize> {
+        let now = now_epoch_millis();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let recovered = tx.execute(
+            r#"
+            UPDATE notification_batches
+            SET status = 'pending', due_at = ?1, updated_at = ?1
+            WHERE status = 'delivering'
+            "#,
+            params![now],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE delivery_records
+            SET status = 'queued', next_retry_at = ?1, updated_at = ?1
+            WHERE status = 'delivering'
+              AND id IN (
+                  SELECT delivery_record_id FROM notification_batch_members
+                  JOIN notification_batches
+                    ON notification_batches.id = notification_batch_members.batch_id
+                  WHERE notification_batches.status = 'pending'
+              )
+            "#,
+            params![now],
+        )?;
+        tx.commit()?;
+        Ok(recovered)
+    }
+
+    pub fn claim_due_notification_batch(&self) -> anyhow::Result<Option<ClaimedNotificationBatch>> {
+        let now = now_epoch_millis();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let Some((
+            batch_id,
+            batch_key,
+            receiver,
+            route_name,
+            owner_team,
+            escalation_policy,
+            attempt,
+        )) = tx
+            .query_row(
+                r#"
+                SELECT id, batch_key, receiver, route_name, owner_team,
+                       escalation_policy, attempt_count + 1
+                FROM notification_batches
+                WHERE status IN ('pending', 'retrying') AND due_at <= ?1
+                ORDER BY due_at ASC, id ASC
+                LIMIT 1
+                "#,
+                params![now],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, u32>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        tx.execute(
+            r#"
+            UPDATE notification_batches
+            SET status = 'delivering', attempt_count = ?2, last_error = NULL, updated_at = ?3
+            WHERE id = ?1
+            "#,
+            params![batch_id, attempt, now],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE delivery_records
+            SET status = 'delivering', attempt_count = ?2,
+                next_retry_at = NULL, last_error = NULL, updated_at = ?3
+            WHERE id IN (
+                SELECT delivery_record_id FROM notification_batch_members WHERE batch_id = ?1
+            )
+            "#,
+            params![batch_id, attempt, now],
+        )?;
+
+        let members = {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT alert_events.normalized_event
+                FROM notification_batch_members
+                JOIN alert_events
+                  ON alert_events.id = notification_batch_members.alert_event_id
+                WHERE notification_batch_members.batch_id = ?1
+                ORDER BY notification_batch_members.delivery_record_id ASC
+                "#,
+            )?;
+            stmt.query_map(params![batch_id], |row| row.get::<_, Option<String>>(0))?
+                .map(|record| {
+                    let normalized_event = record?;
+                    let normalized_event = normalized_event
+                        .context("notification batch member is missing normalized event data")?;
+                    let event = serde_json::from_str(&normalized_event)
+                        .context("notification batch member has invalid normalized event data")?;
+                    Ok(NotificationBatchMember { event })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+
+        Ok(Some(ClaimedNotificationBatch {
+            id: batch_id,
+            batch_key,
+            delivery: Delivery {
+                route_name,
+                receiver,
+                owner_team,
+                escalation_policy,
+                group_by: Vec::new(),
+            },
+            attempt,
+            members,
+        }))
+    }
+
+    pub fn mark_notification_batch_succeeded(&self, batch_id: i64) -> anyhow::Result<()> {
+        self.finish_notification_batch(batch_id, "succeeded", None, None)
+    }
+
+    pub fn mark_notification_batch_retrying(
+        &self,
+        batch_id: i64,
+        retry_at: i64,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.finish_notification_batch(batch_id, "retrying", Some(retry_at), Some(error))
+    }
+
+    pub fn mark_notification_batch_dead_letter(
+        &self,
+        batch_id: i64,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.finish_notification_batch(batch_id, "dead_letter", None, Some(error))
+    }
+
+    fn finish_notification_batch(
+        &self,
+        batch_id: i64,
+        status: &str,
+        due_at: Option<i64>,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = now_epoch_millis();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            UPDATE notification_batches
+            SET status = ?2, due_at = COALESCE(?3, due_at), last_error = ?4, updated_at = ?5
+            WHERE id = ?1
+            "#,
+            params![batch_id, status, due_at, error, now],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE delivery_records
+            SET status = ?2,
+                next_retry_at = ?3,
+                last_error = ?4,
+                response_summary = CASE WHEN ?2 = 'succeeded' THEN 'delivered' ELSE response_summary END,
+                updated_at = ?5
+            WHERE id IN (
+                SELECT delivery_record_id FROM notification_batch_members WHERE batch_id = ?1
+            )
+            "#,
+            params![batch_id, status, due_at, error, now],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn queue_escalation(
@@ -1267,6 +1616,56 @@ pub fn now_epoch_millis() -> i64 {
         .as_millis() as i64
 }
 
+fn insert_notification_batch(
+    tx: &rusqlite::Transaction<'_>,
+    batch_key: &str,
+    delivery: &Delivery,
+    now: i64,
+    group_wait_millis: u64,
+) -> anyhow::Result<i64> {
+    let due_at = now.saturating_add(i64::try_from(group_wait_millis).unwrap_or(i64::MAX));
+    tx.execute(
+        r#"
+        INSERT INTO notification_batches (
+            batch_key, receiver, route_name, owner_team, escalation_policy,
+            status, due_at, attempt_count, event_count, payload_bytes,
+            last_error, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, 0, 0, 0, NULL, ?7, ?7)
+        "#,
+        params![
+            batch_key,
+            delivery.receiver,
+            delivery.route_name,
+            delivery.owner_team,
+            delivery.escalation_policy,
+            due_at,
+            now,
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+#[derive(Debug, Clone)]
+pub struct NotificationBatchMember {
+    pub event: AlertEvent,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NotificationBatchLimits {
+    pub group_wait_millis: u64,
+    pub max_events: usize,
+    pub max_payload_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaimedNotificationBatch {
+    pub id: i64,
+    pub batch_key: String,
+    pub delivery: Delivery,
+    pub attempt: u32,
+    pub members: Vec<NotificationBatchMember>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AlertGroupRecord {
     pub id: i64,
@@ -1577,6 +1976,21 @@ fn delivery_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Deliver
     })
 }
 
+type DeliveryReplayRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
 fn delivery_replay_record(
     conn: &Connection,
     delivery_id: i64,
@@ -1591,25 +2005,14 @@ fn delivery_replay_record(
         title,
         fingerprint,
         raw_payload,
+        normalized_event,
         target,
         request_summary,
-    ): (
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    ) = conn.query_row(
+    ): DeliveryReplayRow = conn.query_row(
         r#"
         SELECT alert_events.event_id, alert_events.integration, alert_events.group_namespace,
                alert_events.source, alert_events.status, alert_events.severity, alert_events.title,
-               alert_events.fingerprint, alert_events.raw_payload,
+               alert_events.fingerprint, alert_events.raw_payload, alert_events.normalized_event,
                delivery_records.target, delivery_records.request_summary
         FROM delivery_records
         JOIN alert_events ON alert_events.id = delivery_records.alert_event_id
@@ -1629,6 +2032,7 @@ fn delivery_replay_record(
                 row.get(8)?,
                 row.get(9)?,
                 row.get(10)?,
+                row.get(11)?,
             ))
         },
     )?;
@@ -1645,33 +2049,56 @@ fn delivery_replay_record(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| target.clone());
 
+    let fallback_event = AlertEvent {
+        event_id,
+        integration,
+        group_namespace,
+        source,
+        received_at: None,
+        status,
+        severity,
+        title,
+        body: None,
+        labels: BTreeMap::new(),
+        annotations: BTreeMap::new(),
+        links: Vec::new(),
+        starts_at: None,
+        ends_at: None,
+        fingerprint,
+        notification_group_key: None,
+        instances: Vec::new(),
+        raw_payload: serde_json::from_str(&raw_payload).unwrap_or(serde_json::Value::Null),
+    };
+    let event = normalized_event
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(fallback_event);
+
     Ok(DeliveryReplayRecord {
-        event: AlertEvent {
-            event_id,
-            integration,
-            group_namespace,
-            source,
-            received_at: None,
-            status,
-            severity,
-            title,
-            body: None,
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            links: Vec::new(),
-            starts_at: None,
-            ends_at: None,
-            fingerprint,
-            raw_payload: serde_json::from_str(&raw_payload).unwrap_or(serde_json::Value::Null),
-        },
+        event,
         delivery: Delivery {
             route_name,
             receiver,
             owner_team: None,
             escalation_policy: None,
+            group_by: Vec::new(),
         },
     })
 }
+
+type LatestAlertEventRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+);
 
 fn latest_alert_event_for_group(
     conn: &Connection,
@@ -1688,21 +2115,11 @@ fn latest_alert_event_for_group(
         title,
         fingerprint,
         raw_payload,
-    ): (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    ) = conn.query_row(
+        normalized_event,
+    ): LatestAlertEventRow = conn.query_row(
         r#"
         SELECT id, event_id, integration, group_namespace, source, status, severity, title,
-               fingerprint, raw_payload
+               fingerprint, raw_payload, normalized_event
         FROM alert_events
         WHERE alert_group_id = ?1
         ORDER BY created_at DESC, id DESC
@@ -1721,31 +2138,37 @@ fn latest_alert_event_for_group(
                 row.get(7)?,
                 row.get(8)?,
                 row.get(9)?,
+                row.get(10)?,
             ))
         },
     )?;
 
-    Ok((
-        id,
-        AlertEvent {
-            event_id,
-            integration,
-            group_namespace,
-            source,
-            received_at: None,
-            status,
-            severity,
-            title,
-            body: None,
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            links: Vec::new(),
-            starts_at: None,
-            ends_at: None,
-            fingerprint,
-            raw_payload: serde_json::from_str(&raw_payload).unwrap_or(serde_json::Value::Null),
-        },
-    ))
+    let fallback_event = AlertEvent {
+        event_id,
+        integration,
+        group_namespace,
+        source,
+        received_at: None,
+        status,
+        severity,
+        title,
+        body: None,
+        labels: BTreeMap::new(),
+        annotations: BTreeMap::new(),
+        links: Vec::new(),
+        starts_at: None,
+        ends_at: None,
+        fingerprint,
+        notification_group_key: None,
+        instances: Vec::new(),
+        raw_payload: serde_json::from_str(&raw_payload).unwrap_or(serde_json::Value::Null),
+    };
+    let event = normalized_event
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or(fallback_event);
+
+    Ok((id, event))
 }
 
 fn advisory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdvisoryRecord> {
@@ -2162,6 +2585,7 @@ fn cancel_escalations_stopped_by_resolve(
 fn prune_alerts_before_tx(conn: &Connection, cutoff: i64) -> anyhow::Result<usize> {
     conn.execute("DROP TABLE IF EXISTS retention_old_events", [])?;
     conn.execute("DROP TABLE IF EXISTS retention_old_deliveries", [])?;
+    conn.execute("DROP TABLE IF EXISTS retention_affected_batches", [])?;
     conn.execute("DROP TABLE IF EXISTS retention_orphan_groups", [])?;
 
     conn.execute(
@@ -2182,6 +2606,15 @@ fn prune_alerts_before_tx(conn: &Connection, cutoff: i64) -> anyhow::Result<usiz
         "#,
         [],
     )?;
+    conn.execute(
+        r#"
+        CREATE TEMP TABLE retention_affected_batches AS
+        SELECT DISTINCT batch_id AS id
+        FROM notification_batch_members
+        WHERE delivery_record_id IN (SELECT id FROM retention_old_deliveries)
+        "#,
+        [],
+    )?;
 
     let deleted_events =
         conn.query_row("SELECT COUNT(*) FROM retention_old_events", [], |row| {
@@ -2190,6 +2623,39 @@ fn prune_alerts_before_tx(conn: &Connection, cutoff: i64) -> anyhow::Result<usiz
 
     conn.execute(
         "DELETE FROM audit_entries WHERE delivery_record_id IN (SELECT id FROM retention_old_deliveries)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM notification_batch_members WHERE delivery_record_id IN (SELECT id FROM retention_old_deliveries)",
+        [],
+    )?;
+    conn.execute(
+        r#"
+        UPDATE notification_batches
+        SET event_count = (
+                SELECT COUNT(*)
+                FROM notification_batch_members
+                WHERE notification_batch_members.batch_id = notification_batches.id
+            ),
+            payload_bytes = COALESCE((
+                SELECT SUM(event_bytes)
+                FROM notification_batch_members
+                WHERE notification_batch_members.batch_id = notification_batches.id
+            ), 0)
+        WHERE id IN (SELECT id FROM retention_affected_batches)
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        DELETE FROM notification_batches
+        WHERE id IN (SELECT id FROM retention_affected_batches)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM notification_batch_members
+              WHERE notification_batch_members.batch_id = notification_batches.id
+          )
+        "#,
         [],
     )?;
     conn.execute(
@@ -2268,6 +2734,7 @@ fn prune_alerts_before_tx(conn: &Connection, cutoff: i64) -> anyhow::Result<usiz
 
     conn.execute("DROP TABLE retention_old_events", [])?;
     conn.execute("DROP TABLE retention_old_deliveries", [])?;
+    conn.execute("DROP TABLE retention_affected_batches", [])?;
     conn.execute("DROP TABLE retention_orphan_groups", [])?;
 
     usize::try_from(deleted_events).context("deleted alert event count overflowed usize")
@@ -2706,6 +3173,297 @@ mod tests {
         assert!(storage.claim_due_escalation().unwrap().is_none());
     }
 
+    #[test]
+    fn notification_batches_persist_members_and_fan_out_success() {
+        let storage = Storage::open(":memory:").unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: Some("platform".to_string()),
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+
+        for fingerprint in ["one", "two"] {
+            let event = test_event(fingerprint, "firing");
+            let event_id = storage.store_event(&event).unwrap();
+            storage
+                .queue_notification_batch(
+                    event_id,
+                    &event,
+                    &delivery,
+                    "same-batch",
+                    NotificationBatchLimits {
+                        group_wait_millis: 0,
+                        max_events: 100,
+                        max_payload_bytes: 256 * 1024,
+                    },
+                )
+                .unwrap();
+        }
+
+        let batch = storage.claim_due_notification_batch().unwrap().unwrap();
+        assert_eq!(batch.members.len(), 2);
+        assert_eq!(batch.attempt, 1);
+        assert_eq!(storage.delivery_statuses().unwrap(), vec!["delivering"; 2]);
+
+        storage.mark_notification_batch_succeeded(batch.id).unwrap();
+        assert_eq!(storage.delivery_statuses().unwrap(), vec!["succeeded"; 2]);
+        assert_eq!(storage.delivery_attempts().unwrap(), vec![1, 1]);
+    }
+
+    #[test]
+    fn notification_batch_limits_create_new_generations() {
+        let storage = Storage::open(":memory:").unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+
+        for fingerprint in ["one", "two"] {
+            let event = test_event(fingerprint, "firing");
+            let event_id = storage.store_event(&event).unwrap();
+            storage
+                .queue_notification_batch(
+                    event_id,
+                    &event,
+                    &delivery,
+                    "bounded-batch",
+                    NotificationBatchLimits {
+                        group_wait_millis: 60_000,
+                        max_events: 1,
+                        max_payload_bytes: 256 * 1024,
+                    },
+                )
+                .unwrap();
+        }
+
+        let first = storage.claim_due_notification_batch().unwrap().unwrap();
+        let second = storage.claim_due_notification_batch().unwrap().unwrap();
+        assert_eq!(first.members.len(), 1);
+        assert_eq!(second.members.len(), 1);
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn notification_batch_due_time_updates_every_member_delivery() {
+        let storage = Storage::open(":memory:").unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+
+        for fingerprint in ["one", "two"] {
+            let event = test_event(fingerprint, "firing");
+            let event_id = storage.store_event(&event).unwrap();
+            storage
+                .queue_notification_batch(
+                    event_id,
+                    &event,
+                    &delivery,
+                    "due-time-batch",
+                    NotificationBatchLimits {
+                        group_wait_millis: 60_000,
+                        max_events: 2,
+                        max_payload_bytes: 256 * 1024,
+                    },
+                )
+                .unwrap();
+        }
+
+        let conn = storage.conn.lock().unwrap();
+        let inconsistent_members: i64 = conn
+            .query_row(
+                r#"
+                SELECT COUNT(*)
+                FROM notification_batch_members
+                JOIN delivery_records
+                  ON delivery_records.id = notification_batch_members.delivery_record_id
+                JOIN notification_batches
+                  ON notification_batches.id = notification_batch_members.batch_id
+                WHERE delivery_records.next_retry_at IS NULL
+                   OR delivery_records.next_retry_at != notification_batches.due_at
+                "#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inconsistent_members, 0);
+    }
+
+    #[test]
+    fn notification_batch_payload_limit_isolates_oversized_events() {
+        let storage = Storage::open(":memory:").unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+
+        for fingerprint in ["oversized-one", "oversized-two"] {
+            let event = test_event(fingerprint, "firing");
+            let event_id = storage.store_event(&event).unwrap();
+            storage
+                .queue_notification_batch(
+                    event_id,
+                    &event,
+                    &delivery,
+                    "payload-bounded-batch",
+                    NotificationBatchLimits {
+                        group_wait_millis: 60_000,
+                        max_events: 100,
+                        max_payload_bytes: 1,
+                    },
+                )
+                .unwrap();
+        }
+
+        let first = storage.claim_due_notification_batch().unwrap().unwrap();
+        let second = storage.claim_due_notification_batch().unwrap().unwrap();
+        assert_eq!(first.members.len(), 1);
+        assert_eq!(second.members.len(), 1);
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn notification_batch_recovery_requeues_interrupted_attempt() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = test_event("recover", "firing");
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        storage
+            .queue_notification_batch(
+                event_id,
+                &event,
+                &delivery,
+                "recover-batch",
+                NotificationBatchLimits {
+                    group_wait_millis: 0,
+                    max_events: 100,
+                    max_payload_bytes: 256 * 1024,
+                },
+            )
+            .unwrap();
+        let first = storage.claim_due_notification_batch().unwrap().unwrap();
+        assert_eq!(first.attempt, 1);
+
+        assert_eq!(storage.recover_notification_batches().unwrap(), 1);
+        let recovered = storage.claim_due_notification_batch().unwrap().unwrap();
+        assert_eq!(recovered.id, first.id);
+        assert_eq!(recovered.attempt, 2);
+        assert_eq!(recovered.members[0].event.fingerprint, "recover");
+    }
+
+    #[test]
+    fn notification_batch_retry_and_dead_letter_fan_out() {
+        let storage = Storage::open(":memory:").unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        for fingerprint in ["one", "two"] {
+            let event = test_event(fingerprint, "firing");
+            let event_id = storage.store_event(&event).unwrap();
+            storage
+                .queue_notification_batch(
+                    event_id,
+                    &event,
+                    &delivery,
+                    "retry-batch",
+                    NotificationBatchLimits {
+                        group_wait_millis: 0,
+                        max_events: 100,
+                        max_payload_bytes: 256 * 1024,
+                    },
+                )
+                .unwrap();
+        }
+
+        let batch = storage.claim_due_notification_batch().unwrap().unwrap();
+        storage
+            .mark_notification_batch_retrying(batch.id, now_epoch_millis(), "failed")
+            .unwrap();
+        assert_eq!(storage.delivery_statuses().unwrap(), vec!["retrying"; 2]);
+
+        let retry = storage.claim_due_notification_batch().unwrap().unwrap();
+        assert_eq!(retry.attempt, 2);
+        storage
+            .mark_notification_batch_dead_letter(retry.id, "failed again")
+            .unwrap();
+        assert_eq!(storage.delivery_statuses().unwrap(), vec!["dead_letter"; 2]);
+        assert_eq!(storage.delivery_attempts().unwrap(), vec![2, 2]);
+    }
+
+    #[test]
+    fn retention_removes_notification_batch_members_before_old_events() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = test_event("old-batch-member", "firing");
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        storage
+            .queue_notification_batch(
+                event_id,
+                &event,
+                &delivery,
+                "old-batch",
+                NotificationBatchLimits {
+                    group_wait_millis: 60_000,
+                    max_events: 100,
+                    max_payload_bytes: 256 * 1024,
+                },
+            )
+            .unwrap();
+
+        let old = now_epoch_millis() - 3 * 24 * 60 * 60 * 1_000;
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE alert_events SET created_at = ?2 WHERE id = ?1",
+                params![event_id, old],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(storage.prune_alerts_older_than_days(1).unwrap(), 1);
+        let conn = storage.conn.lock().unwrap();
+        for table in [
+            "alert_events",
+            "delivery_records",
+            "notification_batch_members",
+            "notification_batches",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "expected {table} to be pruned");
+        }
+    }
+
     fn test_event(fingerprint: &str, status: &str) -> AlertEvent {
         AlertEvent {
             event_id: format!("event-{fingerprint}"),
@@ -2723,6 +3481,8 @@ mod tests {
             starts_at: None,
             ends_at: None,
             fingerprint: fingerprint.to_string(),
+            notification_group_key: None,
+            instances: Vec::new(),
             raw_payload: serde_json::json!({ "fingerprint": fingerprint }),
         }
     }
@@ -2744,6 +3504,8 @@ mod tests {
             starts_at: None,
             ends_at: None,
             fingerprint: fingerprint.to_string(),
+            notification_group_key: None,
+            instances: Vec::new(),
             raw_payload: serde_json::json!({ "fingerprint": fingerprint }),
         };
         let event_id = storage.store_event(&event)?;
@@ -2754,6 +3516,7 @@ mod tests {
                 receiver: "chat".to_string(),
                 owner_team: None,
                 escalation_policy: None,
+                group_by: Vec::new(),
             },
         )?;
 

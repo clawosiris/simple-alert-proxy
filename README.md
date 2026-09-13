@@ -279,6 +279,7 @@ integrations:
     title: "finding.title"
     body: "finding.description"
     fingerprint: "finding.id"
+    notification_group_key: "group.id"
     labels:
       asset: "asset.host"
     annotations:
@@ -438,6 +439,7 @@ integrations:
     title: "finding.title"
     body: "finding.description"
     fingerprint: "finding.id"
+    notification_group_key: "group.id"
     starts_at: "observed_at"
     labels:
       asset: "asset.host"
@@ -538,24 +540,47 @@ Auth note:
   reverse proxy in front that adds the inbound bearer header before forwarding
   to `simple-alert-proxy`.
 
-## Alert Grouping
+## Notification Batching
 
-Alert grouping is enabled by default. The proxy accepts matching webhook
-requests, waits briefly before sending outbound notifications, and combines
-multiple SigNoz webhook calls for the same `ruleId` into one Google Chat card
-with multiple instances:
+Notification batching is enabled by default. After normalization and routing,
+the proxy persists matching events, waits briefly, then sends one bounded batch
+to the selected receiver:
 
 ```yaml
-alert_grouping:
+notification_batching:
   enabled: true
-  debounce_millis: 1000
+  group_wait_millis: 1000
+  max_events: 100
+  max_payload_bytes: 262144
 ```
 
-The gateway also persists normalized alert groups keyed by a canonical group
-namespace plus source fingerprint. Every configured integration has its own
-namespace; Grafana further scopes it by `orgId` when present. Repeated active
-events inside the same namespace increment the group count and update
-timestamps; resolved events mark only that namespaced group resolved.
+SigNoz supplies `ruleId` as its source group hint and Grafana supplies
+`groupKey`. A generic JSON integration can map its own hint with
+`notification_group_key`. A route can override the source hint with canonical
+selectors; every selector must resolve or that event is delivered separately:
+
+```yaml
+routing:
+  routes:
+    - name: "production-alerts"
+      receiver: "critical-chat"
+      group_by: ["integration", "label.alertname", "label.environment"]
+```
+
+Supported selectors are `event_id`, `integration`, `group_namespace`, `source`,
+`status`, `severity`, `title`, `fingerprint`, `label.<name>`, and
+`annotation.<name>`. Batch identity also isolates receiver, route, owner team,
+escalation policy, group namespace, and lifecycle status. Pending batches and
+their delivery records survive restarts; attempts, retries, successes, and dead
+letters are applied to every member.
+
+`alert_grouping` and `debounce_millis` remain accepted as legacy aliases. A
+generic-webhook batch with one event keeps the existing `{event, delivery}`
+schema; multi-event batches use `{batch, events, delivery}`.
+
+Notification batches are separate from lifecycle `AlertGroup` records. The
+latter remain keyed by canonical group namespace plus source fingerprint and
+drive deduplication, acknowledgement, resolution, silence, and escalation state.
 
 ## Debug Logging
 
