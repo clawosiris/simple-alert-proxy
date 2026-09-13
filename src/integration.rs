@@ -67,6 +67,8 @@ impl Integration for GenericJsonIntegration<'_> {
         );
 
         event.body = optional_string(&raw, self.config.body.as_deref());
+        event.notification_group_key =
+            optional_string(&raw, self.config.notification_group_key.as_deref());
         event.labels = mapped_strings(&raw, &self.config.labels);
         event.annotations = mapped_strings(&raw, &self.config.annotations);
         event.starts_at = optional_string(&raw, self.config.starts_at.as_deref());
@@ -189,6 +191,7 @@ mod tests {
             title: "finding.title".to_string(),
             body: Some("finding.description".to_string()),
             fingerprint: "finding.id".to_string(),
+            notification_group_key: Some("group.id".to_string()),
             starts_at: Some("observed_at".to_string()),
             ends_at: None,
             labels: BTreeMap::from([("asset".to_string(), "asset.host".to_string())]),
@@ -200,6 +203,7 @@ mod tests {
         let events = integration
             .normalize(serde_json::json!({
                 "state": "firing",
+                "group": { "id": "edge-certs" },
                 "risk": { "level": "high" },
                 "finding": {
                     "id": "finding-1",
@@ -221,6 +225,7 @@ mod tests {
         assert_eq!(event.severity, "high");
         assert_eq!(event.title, "TLS certificate expired");
         assert_eq!(event.fingerprint, "finding-1");
+        assert_eq!(event.notification_group_key.as_deref(), Some("edge-certs"));
         assert_eq!(event.labels["asset"], "edge-1");
         assert_eq!(event.annotations["plugin"], "ssl-cert-check");
         assert_eq!(
@@ -241,6 +246,7 @@ mod tests {
             title: "title".to_string(),
             body: None,
             fingerprint: "id".to_string(),
+            notification_group_key: None,
             starts_at: None,
             ends_at: None,
             labels: BTreeMap::new(),
