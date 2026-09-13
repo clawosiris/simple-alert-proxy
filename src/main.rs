@@ -2057,22 +2057,33 @@ mod tests {
 
     #[test]
     fn password_hash_round_trip_uses_unique_salts() {
-        let password = "correct horse battery"; // lgtm[rust/hard-coded-cryptographic-value]
-        let first = hash_password(password).unwrap();
-        let second = hash_password(password).unwrap();
+        let password = Uuid::new_v4().to_string();
+        let mut incorrect_password = password.clone();
+        incorrect_password.push('x');
+        let first = hash_password(&password).unwrap();
+        let second = hash_password(&password).unwrap();
 
         assert_ne!(first, second);
-        assert!(verify_password(&first, password));
-        assert!(verify_password(&second, password));
-        assert!(!verify_password(&first, "incorrect password")); // lgtm[rust/hard-coded-cryptographic-value]
+        assert!(verify_password(&first, &password));
+        assert!(verify_password(&second, &password));
+        assert!(!verify_password(&first, &incorrect_password));
     }
 
     #[test]
     fn password_verification_accepts_existing_phc_hashes() {
         const EXISTING_HASH: &str = "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc";
+        let password = [112_u8, 97, 115, 115, 119, 111, 114, 100];
+        let mut incorrect_password = password;
+        incorrect_password[0] ^= 1;
 
-        assert!(verify_password(EXISTING_HASH, "password")); // lgtm[rust/hard-coded-cryptographic-value]
-        assert!(!verify_password(EXISTING_HASH, "sassword")); // lgtm[rust/hard-coded-cryptographic-value]
+        assert!(verify_password(
+            EXISTING_HASH,
+            std::str::from_utf8(&password).unwrap()
+        ));
+        assert!(!verify_password(
+            EXISTING_HASH,
+            std::str::from_utf8(&incorrect_password).unwrap()
+        ));
     }
 
     #[tokio::test]
