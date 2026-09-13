@@ -19,6 +19,10 @@ pub struct AlertEvent {
     pub starts_at: Option<String>,
     pub ends_at: Option<String>,
     pub fingerprint: String,
+    #[serde(default)]
+    pub notification_group_key: Option<String>,
+    #[serde(default)]
+    pub instances: Vec<AlertInstance>,
     pub raw_payload: Value,
 }
 
@@ -26,6 +30,20 @@ pub struct AlertEvent {
 pub struct AlertLink {
     pub label: String,
     pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertInstance {
+    pub status: String,
+    pub severity: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub annotations: BTreeMap<String, String>,
+    pub links: Vec<AlertLink>,
+    pub starts_at: Option<String>,
+    pub ends_at: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 impl AlertEvent {
@@ -63,6 +81,8 @@ impl AlertEvent {
             starts_at: None,
             ends_at: None,
             fingerprint,
+            notification_group_key: None,
+            instances: Vec::new(),
             raw_payload,
         }
     }

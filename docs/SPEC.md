@@ -95,7 +95,12 @@ Accepts SigNoz alert webhook JSON. The parser expects Alertmanager-style fields:
 
 The raw payload is retained for routing rules that need JSON pointer access.
 
-The proxy groups alerts by `ruleId` before delivery. When one webhook payload contains alerts for multiple `ruleId` values, the proxy splits the payload by `ruleId`. When SigNoz emits separate webhook requests for instances of the same rule, the proxy accepts each request, holds grouped alerts for the configured debounce window, and then sends one outgoing notification with the instances combined.
+The proxy derives a notification group hint from `ruleId` before delivery. When
+one webhook payload contains alerts for multiple `ruleId` values, the proxy
+splits the payload by `ruleId`. When SigNoz emits separate webhook requests for
+instances of the same rule, the generic durable batching layer holds their
+normalized events for the configured group-wait window and sends one outgoing
+notification with the instances combined.
 
 Success returns `202 Accepted` with an accepted delivery summary:
 
@@ -106,7 +111,9 @@ Success returns `202 Accepted` with an accepted delivery summary:
 }
 ```
 
-Invalid payloads return `400`. Ungrouped receiver failures return `502`. Grouped delivery failures happen after the webhook response and are logged.
+Invalid payloads return `400`. Receiver delivery failures happen after the
+webhook response and are logged while the durable delivery state advances
+through retry or dead-letter handling.
 
 If bearer authentication is enabled, missing or invalid credentials return `401`.
 
@@ -137,6 +144,7 @@ integrations:
     title: "finding.title"
     body: "finding.description"
     fingerprint: "finding.id"
+    notification_group_key: "group.id"
     starts_at: "observed_at"
     labels:
       asset: "asset.host"
@@ -369,15 +377,34 @@ and correlations without changing alert lifecycle state. Lifecycle mutation is
 rejected unless intelligence is enabled and the operator explicitly configures
 `allow_lifecycle_mutation`.
 
-Alert grouping uses a short debounce window so separate SigNoz webhook calls for the same rule can be combined before delivery. Grouped alerts are enqueued before the webhook response returns, then flushed in the background after the debounce window.
+Notification batching runs after normalization and routing. Source hints use
+SigNoZ `ruleId`, Grafana `groupKey`, or the optional generic JSON
+`notification_group_key` mapping. Routes can override the hint with canonical
+`group_by` selectors. Pending batches and member delivery records are persisted
+before the webhook response returns and resume after restart.
 
 ```yaml
-alert_grouping:
+notification_batching:
   enabled: true
-  debounce_millis: 1000
+  group_wait_millis: 1000
+  max_events: 100
+  max_payload_bytes: 262144
+
+routing:
+  routes:
+    - name: production
+      receiver: operations
+      group_by: [integration, label.alertname, label.cluster]
 ```
 
-The grouping key includes receiver, route, status, and `ruleId`, so unrelated routes and firing/resolved transitions are not merged into the same outgoing notification.
+The batch key includes receiver, route, owner team, escalation policy, canonical
+group namespace, lifecycle status, and resolved grouping values. Missing route
+selectors disable batching for that event. `alert_grouping` and
+`debounce_millis` remain accepted as compatibility aliases. Batches are bounded
+by normalized event count and serialized normalized-event bytes.
+
+`NotificationBatch` is an outbound delivery concept and remains independent of
+the lifecycle/deduplication `AlertGroup` model.
 
 ## Debug Logging
 

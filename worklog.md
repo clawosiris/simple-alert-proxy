@@ -78,3 +78,9 @@
 - Completed issue #76 implementation: canonical events and SQLite records now carry `group_namespace`; Grafana uses configured integration plus `orgId` while preserving raw fingerprints/group keys; receiver identity remains routing metadata; the migration preserves group IDs and dependent records while replacing global fingerprint uniqueness; regressions cover integration/org lifecycle, ownership/action isolation, scoped reads, escalation cancellation, and legacy database migration. Verified with formatting, 129 tests, Clippy with warnings denied, and diff checks.
 - Started release `v0.0.12` from `main` at `b92d2a0`: bumped Cargo package metadata, lockfile, and the README container pull example after confirming post-merge `main` CI passed.
 - Started issue #74 on `fix/issue-74-grafana-payload-isolation`: scope each canonical Grafana event's raw payload to its own alert instance while preserving group/common and unknown top-level context, with parser and end-to-end receiver/storage regressions.
+
+2026-09-13
+
+- Started generic outbound notification batching on `feat/generic-notification-batching`: canonical source group hints and instances, route-level normalized `group_by`, durable SQLite batches with recovery/bounds/retries, receiver-wide batch delivery, and migration of the SigNoZ/Google Chat special path.
+- Completed issue #94 implementation locally: replaced the SigNoZ-only in-memory aggregator with generic durable notification batches, added source hints for SigNoZ/Grafana/generic JSON, route selector overrides and isolation, SQLite persistence/recovery/bounds/fan-out state, every receiver payload family, legacy config aliases, docs, and regression coverage.
+- Audited limit-triggered flush bookkeeping and fixed every member delivery record to track the batch's accelerated due time. Verified formatting, Clippy with warnings denied, 147 tests, diff checks, and a clean release container build on the approved remote worker.
