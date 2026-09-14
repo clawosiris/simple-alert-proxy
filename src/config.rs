@@ -137,6 +137,7 @@ impl AppConfig {
         }
 
         for (name, receiver) in &self.receivers {
+            receiver.validate_template(name)?;
             match receiver {
                 ReceiverConfig::GoogleChat(receiver) if receiver.timeout_secs == 0 => {
                     bail!("receiver {name} timeout_secs must be greater than zero")
@@ -891,6 +892,80 @@ impl ReceiverConfig {
             Self::Matrix(receiver) => receiver.owner_team.as_deref(),
         }
     }
+
+    pub fn notification_template(&self) -> Option<&NotificationTemplateConfig> {
+        match self {
+            Self::GoogleChat(receiver) => receiver.template.as_ref(),
+            Self::GenericWebhook(receiver) => receiver.template.as_ref(),
+            Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
+                receiver.template.as_ref()
+            }
+            Self::Matrix(receiver) => receiver.template.as_ref(),
+        }
+    }
+
+    pub fn legacy_title_template(&self) -> Option<&str> {
+        match self {
+            Self::GoogleChat(receiver) => receiver.title_template.as_deref(),
+            Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
+                receiver.title_template.as_deref()
+            }
+            Self::Matrix(receiver) => receiver.title_template.as_deref(),
+            Self::GenericWebhook(_) => None,
+        }
+    }
+
+    fn validate_template(&self, name: &str) -> anyhow::Result<()> {
+        let template = self.notification_template();
+        if template.is_some() && self.legacy_title_template().is_some() {
+            bail!("receiver {name} cannot combine title_template with the template block");
+        }
+        if let Some(template) = template {
+            template.validate(name, matches!(self, Self::GenericWebhook(_)))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationTemplateConfig {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub payload: Option<String>,
+}
+
+impl NotificationTemplateConfig {
+    fn validate(&self, receiver_name: &str, payload_only: bool) -> anyhow::Result<()> {
+        if self.title.is_none() && self.body.is_none() && self.payload.is_none() {
+            bail!("receiver {receiver_name} template block must configure title, body, or payload");
+        }
+        if self.payload.is_some() && (self.title.is_some() || self.body.is_some()) {
+            bail!(
+                "receiver {receiver_name} template.payload is mutually exclusive with template.title and template.body"
+            );
+        }
+        if payload_only && (self.title.is_some() || self.body.is_some()) {
+            bail!(
+                "receiver {receiver_name} generic_webhook templates support template.payload only"
+            );
+        }
+        for (field, source) in [
+            ("title", self.title.as_deref()),
+            ("body", self.body.as_deref()),
+            ("payload", self.payload.as_deref()),
+        ] {
+            if source
+                .is_some_and(|source| source.len() > crate::template::MAX_TEMPLATE_SOURCE_BYTES)
+            {
+                bail!(
+                    "receiver {receiver_name} template.{field} exceeds the {} byte source limit",
+                    crate::template::MAX_TEMPLATE_SOURCE_BYTES
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -898,8 +973,10 @@ pub struct GoogleChatReceiverConfig {
     pub webhook_url: String,
     #[serde(default, alias = "team")]
     pub owner_team: Option<String>,
-    #[serde(default = "default_title_template")]
-    pub title_template: String,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub template: Option<NotificationTemplateConfig>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -911,6 +988,8 @@ pub struct GenericWebhookReceiverConfig {
     pub owner_team: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub template: Option<NotificationTemplateConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -918,8 +997,10 @@ pub struct ChatWebhookReceiverConfig {
     pub webhook_url: String,
     #[serde(default, alias = "team")]
     pub owner_team: Option<String>,
-    #[serde(default = "default_title_template")]
-    pub title_template: String,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub template: Option<NotificationTemplateConfig>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -932,8 +1013,10 @@ pub struct MatrixReceiverConfig {
     pub access_token_env: Option<String>,
     #[serde(default, alias = "team")]
     pub owner_team: Option<String>,
-    #[serde(default = "default_title_template")]
-    pub title_template: String,
+    #[serde(default)]
+    pub title_template: Option<String>,
+    #[serde(default)]
+    pub template: Option<NotificationTemplateConfig>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }
@@ -1083,8 +1166,8 @@ fn default_notification_batch_max_payload_bytes() -> usize {
     256 * 1024
 }
 
-fn default_title_template() -> String {
-    "[{{status}}] {{alertname}}".to_string()
+pub fn default_title_template() -> &'static str {
+    "[{{status}}] {{alertname}}"
 }
 
 fn default_timeout_secs() -> u64 {
@@ -1222,7 +1305,8 @@ mod tests {
                 ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                     webhook_url: "https://chat.googleapis.test/default".to_string(),
                     owner_team: None,
-                    title_template: "[{{status}}] {{alertname}}".to_string(),
+                    title_template: Some("[{{status}}] {{alertname}}".to_string()),
+                    template: None,
                     timeout_secs: 10,
                 }),
             )]),
@@ -1245,7 +1329,8 @@ mod tests {
             access_token: None,
             access_token_env: Some("MATRIX_TOKEN".to_string()),
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
 
@@ -1260,7 +1345,8 @@ mod tests {
             access_token: None,
             access_token_env: None,
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
 
@@ -1281,7 +1367,8 @@ mod tests {
             access_token: Some("inline".to_string()),
             access_token_env: Some("MATRIX_TOKEN".to_string()),
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
 
@@ -1302,7 +1389,8 @@ mod tests {
             access_token: Some("inline".to_string()),
             access_token_env: None,
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
 
@@ -1319,7 +1407,8 @@ mod tests {
             access_token: Some("inline".to_string()),
             access_token_env: None,
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
 
@@ -1605,6 +1694,90 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ambiguous_and_invalid_receiver_template_configuration() {
+        let cases = [
+            (
+                NotificationTemplateConfig {
+                    title: Some("{{ alert.title }}".to_string()),
+                    body: None,
+                    payload: Some("{}".to_string()),
+                },
+                Some("legacy".to_string()),
+                "cannot combine title_template",
+            ),
+            (
+                NotificationTemplateConfig {
+                    title: Some("{{ alert.title }}".to_string()),
+                    body: None,
+                    payload: None,
+                },
+                None,
+                "generic_webhook templates support template.payload only",
+            ),
+            (
+                NotificationTemplateConfig {
+                    title: Some("{{ alert.title }}".to_string()),
+                    body: None,
+                    payload: Some("{}".to_string()),
+                },
+                None,
+                "template.payload is mutually exclusive",
+            ),
+            (
+                NotificationTemplateConfig::default(),
+                None,
+                "must configure title, body, or payload",
+            ),
+        ];
+
+        for (template, legacy_title, expected) in cases {
+            let mut config = minimal_valid_config();
+            config.receivers.insert(
+                "templated".to_string(),
+                if expected.contains("generic_webhook") {
+                    ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                        webhook_url: "https://example.test/hook".to_string(),
+                        owner_team: None,
+                        timeout_secs: 10,
+                        template: Some(template),
+                    })
+                } else {
+                    ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
+                        webhook_url: "https://example.test/hook".to_string(),
+                        owner_team: None,
+                        title_template: legacy_title,
+                        template: Some(template),
+                        timeout_secs: 10,
+                    })
+                },
+            );
+
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_template_sources_over_the_internal_limit() {
+        let mut config = minimal_valid_config();
+        config.receivers.insert(
+            "templated".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url: "https://example.test/hook".to_string(),
+                owner_team: None,
+                timeout_secs: 10,
+                template: Some(NotificationTemplateConfig {
+                    payload: Some("x".repeat(crate::template::MAX_TEMPLATE_SOURCE_BYTES + 1)),
+                    ..Default::default()
+                }),
+            }),
+        );
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("source limit"));
+    }
+
+    #[test]
     fn loopback_bind_allows_local_management_without_auth() {
         let mut config = minimal_valid_config();
         config.server.auth = None;
@@ -1642,7 +1815,8 @@ mod tests {
                 ReceiverConfig::GoogleChat(GoogleChatReceiverConfig {
                     webhook_url: "https://chat.example.test/hook".to_string(),
                     owner_team: None,
-                    title_template: default_title_template(),
+                    title_template: Some(default_title_template().to_string()),
+                    template: None,
                     timeout_secs: default_timeout_secs(),
                 }),
             )]),

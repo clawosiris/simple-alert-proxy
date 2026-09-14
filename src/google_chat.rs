@@ -7,22 +7,28 @@ use crate::{
     notification::NotificationBatch,
     redaction,
     routing::Delivery,
+    template::{
+        NotificationTemplateEngine, NotificationTemplateError, PayloadKind, RenderedNotification,
+        validate_payload_size,
+    },
 };
 use reqwest::StatusCode;
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct GoogleChatClient {
     http: reqwest::Client,
+    templates: Arc<NotificationTemplateEngine>,
 }
 
 impl GoogleChatClient {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(receivers: &BTreeMap<String, ReceiverConfig>) -> anyhow::Result<Self> {
+        Ok(Self {
             http: reqwest::Client::new(),
-        }
+            templates: NotificationTemplateEngine::compile(receivers)?,
+        })
     }
 
     pub async fn send_event(
@@ -32,18 +38,38 @@ impl GoogleChatClient {
         delivery: &Delivery,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
-        let message = if event.instances.is_empty() {
-            build_event_message(receiver, event, delivery)
+        let target = PayloadKind::GoogleChat;
+        let (rendered, message) = if event.instances.is_empty() {
+            let rendered =
+                self.templates
+                    .render_event(&delivery.receiver, event, delivery, target)?;
+            let message = rendered
+                .as_ref()
+                .and_then(|rendered| rendered.payload.clone())
+                .unwrap_or_else(|| {
+                    build_event_message(receiver, event, delivery, rendered.as_ref())
+                });
+            (rendered, message)
         } else {
-            build_batch_message(
-                receiver,
-                &NotificationBatch::new(
-                    event.notification_group_key.clone().unwrap_or_default(),
-                    vec![event.clone()],
-                ),
-                delivery,
-            )
+            let batch = NotificationBatch::new(
+                event.notification_group_key.clone().unwrap_or_default(),
+                vec![event.clone()],
+            );
+            let rendered =
+                self.templates
+                    .render_batch(&delivery.receiver, &batch, delivery, target)?;
+            let message = rendered
+                .as_ref()
+                .and_then(|rendered| rendered.payload.clone())
+                .unwrap_or_else(|| {
+                    build_batch_message(receiver, &batch, delivery, rendered.as_ref())
+                });
+            (rendered, message)
         };
+
+        if rendered.is_some() {
+            validate_payload_size(&delivery.receiver, target, &message)?;
+        }
 
         if let Some(debug) = debug {
             log_outgoing_alert(&message, debug);
@@ -109,7 +135,19 @@ impl GoogleChatClient {
     ) -> Result<(), GoogleChatError> {
         match receiver {
             ReceiverConfig::GoogleChat(receiver) => {
-                let message = build_batch_message(receiver, batch, delivery);
+                let target = PayloadKind::GoogleChat;
+                let rendered =
+                    self.templates
+                        .render_batch(&delivery.receiver, batch, delivery, target)?;
+                let message = rendered
+                    .as_ref()
+                    .and_then(|rendered| rendered.payload.clone())
+                    .unwrap_or_else(|| {
+                        build_batch_message(receiver, batch, delivery, rendered.as_ref())
+                    });
+                if rendered.is_some() {
+                    validate_payload_size(&delivery.receiver, target, &message)?;
+                }
                 self.post_json(
                     &receiver.webhook_url,
                     receiver.timeout_secs,
@@ -119,12 +157,22 @@ impl GoogleChatClient {
                 .await
             }
             ReceiverConfig::GenericWebhook(receiver) => {
-                if batch.events.len() == 1 {
+                let target = PayloadKind::GenericWebhook;
+                let rendered =
+                    self.templates
+                        .render_batch(&delivery.receiver, batch, delivery, target)?;
+                if rendered.is_none() && batch.events.len() == 1 {
                     return self
                         .send_generic_webhook(receiver, batch.primary(), delivery, debug)
                         .await;
                 }
-                let message = build_generic_batch_message(batch, delivery);
+                let message = rendered
+                    .as_ref()
+                    .and_then(|rendered| rendered.payload.clone())
+                    .unwrap_or_else(|| build_generic_batch_message(batch, delivery));
+                if rendered.is_some() {
+                    validate_payload_size(&delivery.receiver, target, &message)?;
+                }
                 self.post_json(
                     &receiver.webhook_url,
                     receiver.timeout_secs,
@@ -159,13 +207,25 @@ impl GoogleChatClient {
         delivery: &Delivery,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
-        let message = json!({
-            "event": event,
-            "delivery": {
-                "route": delivery.route_name,
-                "receiver": delivery.receiver,
-            }
-        });
+        let target = PayloadKind::GenericWebhook;
+        let rendered = self
+            .templates
+            .render_event(&delivery.receiver, event, delivery, target)?;
+        let message = rendered
+            .as_ref()
+            .and_then(|rendered| rendered.payload.clone())
+            .unwrap_or_else(|| {
+                json!({
+                    "event": event,
+                    "delivery": {
+                        "route": delivery.route_name,
+                        "receiver": delivery.receiver,
+                    }
+                })
+            });
+        if rendered.is_some() {
+            validate_payload_size(&delivery.receiver, target, &message)?;
+        }
         self.post_json(
             &receiver.webhook_url,
             receiver.timeout_secs,
@@ -183,31 +243,19 @@ impl GoogleChatClient {
         debug: Option<DebugDeliveryLog<'_>>,
         target: ChatTarget,
     ) -> Result<(), GoogleChatError> {
-        let title = receiver
-            .title_template
-            .replace("{{status}}", &event.status)
-            .replace("{{alertname}}", &event.title)
-            .replace("{{title}}", &event.title)
-            .replace("{{severity}}", &event.severity);
-        let text = format!(
-            "{title} via {} | {} | {}",
-            delivery.route_name, event.source, event.fingerprint
-        );
-        let message = match target {
-            ChatTarget::Slack | ChatTarget::Mattermost => json!({ "text": text }),
-            ChatTarget::Discord => json!({
-                "content": text,
-                "embeds": [{
-                    "title": event.title,
-                    "description": event.body,
-                    "fields": [
-                        { "name": "Status", "value": event.status, "inline": true },
-                        { "name": "Severity", "value": event.severity, "inline": true },
-                        { "name": "Source", "value": event.source, "inline": true }
-                    ]
-                }]
-            }),
-        };
+        let payload_kind = target.payload_kind();
+        let rendered =
+            self.templates
+                .render_event(&delivery.receiver, event, delivery, payload_kind)?;
+        let message = rendered
+            .as_ref()
+            .and_then(|rendered| rendered.payload.clone())
+            .unwrap_or_else(|| {
+                build_chat_event_message(receiver, event, delivery, target, rendered.as_ref())
+            });
+        if rendered.is_some() {
+            validate_payload_size(&delivery.receiver, payload_kind, &message)?;
+        }
         self.post_json(
             &receiver.webhook_url,
             receiver.timeout_secs,
@@ -225,7 +273,19 @@ impl GoogleChatClient {
         debug: Option<DebugDeliveryLog<'_>>,
         target: ChatTarget,
     ) -> Result<(), GoogleChatError> {
-        let message = build_chat_batch_message(receiver, batch, delivery, target);
+        let payload_kind = target.payload_kind();
+        let rendered =
+            self.templates
+                .render_batch(&delivery.receiver, batch, delivery, payload_kind)?;
+        let message = rendered
+            .as_ref()
+            .and_then(|rendered| rendered.payload.clone())
+            .unwrap_or_else(|| {
+                build_chat_batch_message(receiver, batch, delivery, target, rendered.as_ref())
+            });
+        if rendered.is_some() {
+            validate_payload_size(&delivery.receiver, payload_kind, &message)?;
+        }
         self.post_json(
             &receiver.webhook_url,
             receiver.timeout_secs,
@@ -243,20 +303,19 @@ impl GoogleChatClient {
         transaction_id: &str,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
-        let title = receiver
-            .title_template
-            .replace("{{status}}", &event.status)
-            .replace("{{alertname}}", &event.title)
-            .replace("{{title}}", &event.title)
-            .replace("{{severity}}", &event.severity);
-        let body = matrix_plaintext_body(&title, event, delivery);
-        let formatted_body = matrix_html_body(&title, event, delivery);
-        let message = json!({
-            "msgtype": "m.notice",
-            "body": body,
-            "format": "org.matrix.custom.html",
-            "formatted_body": formatted_body,
-        });
+        let target = PayloadKind::Matrix;
+        let rendered = self
+            .templates
+            .render_event(&delivery.receiver, event, delivery, target)?;
+        let message = rendered
+            .as_ref()
+            .and_then(|rendered| rendered.payload.clone())
+            .unwrap_or_else(|| {
+                build_matrix_event_message(receiver, event, delivery, rendered.as_ref())
+            });
+        if rendered.is_some() {
+            validate_payload_size(&delivery.receiver, target, &message)?;
+        }
         let token = receiver
             .resolved_access_token()
             .map_err(|error| GoogleChatError::Config(error.to_string()))?;
@@ -290,7 +349,19 @@ impl GoogleChatClient {
         transaction_id: &str,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
-        let message = build_matrix_batch_message(receiver, batch, delivery);
+        let target = PayloadKind::Matrix;
+        let rendered = self
+            .templates
+            .render_batch(&delivery.receiver, batch, delivery, target)?;
+        let message = rendered
+            .as_ref()
+            .and_then(|rendered| rendered.payload.clone())
+            .unwrap_or_else(|| {
+                build_matrix_batch_message(receiver, batch, delivery, rendered.as_ref())
+            });
+        if rendered.is_some() {
+            validate_payload_size(&delivery.receiver, target, &message)?;
+        }
         let token = receiver
             .resolved_access_token()
             .map_err(|error| GoogleChatError::Config(error.to_string()))?;
@@ -453,6 +524,16 @@ enum ChatTarget {
     Discord,
 }
 
+impl ChatTarget {
+    fn payload_kind(self) -> PayloadKind {
+        match self {
+            Self::Slack => PayloadKind::Slack,
+            Self::Mattermost => PayloadKind::Mattermost,
+            Self::Discord => PayloadKind::Discord,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DebugDeliveryLog<'a> {
     pub route_name: &'a str,
@@ -478,8 +559,26 @@ fn build_event_message(
     receiver: &GoogleChatReceiverConfig,
     event: &AlertEvent,
     delivery: &Delivery,
+    rendered: Option<&RenderedNotification>,
 ) -> serde_json::Value {
-    let title = format_event_title(receiver, event, delivery);
+    let title = rendered
+        .map(|rendered| rendered_title(rendered, event))
+        .unwrap_or_else(|| format_event_title(receiver, event, delivery));
+    let mut sections = build_event_sections(event);
+    if let Some(body) = rendered.and_then(|rendered| rendered.body.as_deref())
+        && !body.is_empty()
+    {
+        sections.insert(
+            0,
+            json!({
+                "widgets": [{
+                    "textParagraph": {
+                        "text": escape_chat_html(body),
+                    }
+                }]
+            }),
+        );
+    }
 
     json!({
         "cardsV2": [{
@@ -489,7 +588,7 @@ fn build_event_message(
                     "title": title,
                     "subtitle": format!("{} | {} | {}", event.source, event.status, event.severity),
                 },
-                "sections": build_event_sections(event),
+                "sections": sections,
             }
         }],
     })
@@ -499,9 +598,12 @@ fn build_batch_message(
     receiver: &GoogleChatReceiverConfig,
     batch: &NotificationBatch,
     delivery: &Delivery,
+    rendered: Option<&RenderedNotification>,
 ) -> serde_json::Value {
     let event = batch.primary();
-    let title = format_event_title(receiver, event, delivery);
+    let title = rendered
+        .map(|rendered| rendered_title(rendered, event))
+        .unwrap_or_else(|| format_event_title(receiver, event, delivery));
     let mut summary_widgets = vec![
         json!({
             "decoratedText": {
@@ -534,6 +636,17 @@ fn build_batch_message(
         .map(|line| json!({ "textParagraph": { "text": line } }))
         .collect::<Vec<_>>();
     let mut sections = vec![json!({ "widgets": summary_widgets })];
+    if let Some(body) = rendered.and_then(|rendered| rendered.body.as_deref())
+        && !body.is_empty()
+    {
+        sections.push(json!({
+            "widgets": [{
+                "textParagraph": {
+                    "text": escape_chat_html(body),
+                }
+            }]
+        }));
+    }
     if !instance_widgets.is_empty() {
         sections.push(json!({
             "header": "Instances",
@@ -583,9 +696,31 @@ fn build_chat_batch_message(
     batch: &NotificationBatch,
     delivery: &Delivery,
     target: ChatTarget,
+    rendered: Option<&RenderedNotification>,
 ) -> serde_json::Value {
     let event = batch.primary();
-    let title = format_template_title(&receiver.title_template, event);
+    if let Some(rendered) = rendered {
+        let title = rendered_title(rendered, event);
+        let lines = batch_instance_lines(batch);
+        let body = rendered.body.clone().unwrap_or_else(|| lines.join("\n"));
+        let text = join_title_body(&title, &body);
+        return match target {
+            ChatTarget::Slack | ChatTarget::Mattermost => json!({ "text": text }),
+            ChatTarget::Discord => json!({
+                "content": title,
+                "embeds": [{
+                    "title": rendered_title(rendered, event),
+                    "description": body,
+                    "fields": [
+                        { "name": "Status", "value": event.status, "inline": true },
+                        { "name": "Instances", "value": batch.instance_count().to_string(), "inline": true },
+                        { "name": "Source", "value": event.source, "inline": true }
+                    ]
+                }]
+            }),
+        };
+    }
+    let title = format_template_title(receiver.title_template.as_deref(), event);
     let summary = format!(
         "{title} via {} | {} instances | {}",
         delivery.route_name,
@@ -618,9 +753,18 @@ fn build_matrix_batch_message(
     receiver: &MatrixReceiverConfig,
     batch: &NotificationBatch,
     delivery: &Delivery,
+    rendered: Option<&RenderedNotification>,
 ) -> serde_json::Value {
     let event = batch.primary();
-    let title = format_template_title(&receiver.title_template, event);
+    if let Some(rendered) = rendered {
+        let title = rendered_title(rendered, event);
+        let body = rendered
+            .body
+            .clone()
+            .unwrap_or_else(|| batch_instance_lines(batch).join("\n"));
+        return matrix_standard_message(&title, &body);
+    }
+    let title = format_template_title(receiver.title_template.as_deref(), event);
     let mut lines = vec![
         title,
         format!("Route: {}", delivery.route_name),
@@ -649,7 +793,118 @@ fn build_matrix_batch_message(
     })
 }
 
-fn format_template_title(template: &str, event: &AlertEvent) -> String {
+fn build_chat_event_message(
+    receiver: &ChatWebhookReceiverConfig,
+    event: &AlertEvent,
+    delivery: &Delivery,
+    target: ChatTarget,
+    rendered: Option<&RenderedNotification>,
+) -> serde_json::Value {
+    if let Some(rendered) = rendered {
+        let title = rendered_title(rendered, event);
+        let body = rendered
+            .body
+            .as_deref()
+            .or(event.body.as_deref())
+            .unwrap_or_default();
+        let text = join_title_body(&title, body);
+        return match target {
+            ChatTarget::Slack | ChatTarget::Mattermost => json!({ "text": text }),
+            ChatTarget::Discord => json!({
+                "content": title,
+                "embeds": [{
+                    "title": rendered_title(rendered, event),
+                    "description": body,
+                    "fields": [
+                        { "name": "Status", "value": event.status, "inline": true },
+                        { "name": "Severity", "value": event.severity, "inline": true },
+                        { "name": "Source", "value": event.source, "inline": true }
+                    ]
+                }]
+            }),
+        };
+    }
+
+    let title = format_template_title(receiver.title_template.as_deref(), event);
+    let text = format!(
+        "{title} via {} | {} | {}",
+        delivery.route_name, event.source, event.fingerprint
+    );
+    match target {
+        ChatTarget::Slack | ChatTarget::Mattermost => json!({ "text": text }),
+        ChatTarget::Discord => json!({
+            "content": text,
+            "embeds": [{
+                "title": event.title,
+                "description": event.body,
+                "fields": [
+                    { "name": "Status", "value": event.status, "inline": true },
+                    { "name": "Severity", "value": event.severity, "inline": true },
+                    { "name": "Source", "value": event.source, "inline": true }
+                ]
+            }]
+        }),
+    }
+}
+
+fn build_matrix_event_message(
+    receiver: &MatrixReceiverConfig,
+    event: &AlertEvent,
+    delivery: &Delivery,
+    rendered: Option<&RenderedNotification>,
+) -> serde_json::Value {
+    if let Some(rendered) = rendered {
+        let title = rendered_title(rendered, event);
+        let body = rendered
+            .body
+            .as_deref()
+            .or(event.body.as_deref())
+            .unwrap_or_default();
+        return matrix_standard_message(&title, body);
+    }
+    let title = format_template_title(receiver.title_template.as_deref(), event);
+    let body = matrix_plaintext_body(&title, event, delivery);
+    let formatted_body = matrix_html_body(&title, event, delivery);
+    json!({
+        "msgtype": "m.notice",
+        "body": body,
+        "format": "org.matrix.custom.html",
+        "formatted_body": formatted_body,
+    })
+}
+
+fn matrix_standard_message(title: &str, body: &str) -> serde_json::Value {
+    let plaintext = join_title_body(title, body);
+    let formatted_body = plaintext
+        .lines()
+        .map(escape_html)
+        .collect::<Vec<_>>()
+        .join("<br>");
+    json!({
+        "msgtype": "m.notice",
+        "body": plaintext,
+        "format": "org.matrix.custom.html",
+        "formatted_body": formatted_body,
+    })
+}
+
+fn rendered_title(rendered: &RenderedNotification, event: &AlertEvent) -> String {
+    rendered
+        .title
+        .clone()
+        .unwrap_or_else(|| event.title.clone())
+}
+
+fn join_title_body(title: &str, body: &str) -> String {
+    if body.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n{body}")
+    }
+}
+
+fn format_template_title(template: Option<&str>, event: &AlertEvent) -> String {
+    let template = template.unwrap_or(crate::config::default_title_template());
     template
         .replace("{{status}}", &event.status)
         .replace("{{alertname}}", &event.title)
@@ -715,12 +970,7 @@ fn format_event_title(
     event: &AlertEvent,
     delivery: &Delivery,
 ) -> String {
-    let mut title = receiver
-        .title_template
-        .replace("{{status}}", &event.status)
-        .replace("{{alertname}}", &event.title)
-        .replace("{{title}}", &event.title)
-        .replace("{{severity}}", &event.severity);
+    let mut title = format_template_title(receiver.title_template.as_deref(), event);
 
     if !delivery.route_name.is_empty() {
         title.push_str(&format!(" via {}", delivery.route_name));
@@ -826,6 +1076,8 @@ pub enum GoogleChatError {
     Rejected(StatusCode),
     #[error("target config error: {0}")]
     Config(String),
+    #[error(transparent)]
+    Template(#[from] NotificationTemplateError),
 }
 
 #[cfg(test)]
@@ -843,7 +1095,8 @@ mod tests {
         let receiver = GoogleChatReceiverConfig {
             webhook_url: "https://chat.googleapis.test/ops".to_string(),
             owner_team: None,
-            title_template: "[{{status}}] {{alertname}}".to_string(),
+            title_template: None,
+            template: None,
             timeout_secs: 10,
         };
         let delivery = Delivery {
@@ -855,7 +1108,7 @@ mod tests {
         };
 
         let batch = NotificationBatch::new("batch-1", vec![alert.to_alert_event("signoz")]);
-        let payload = build_batch_message(&receiver, &batch, &delivery);
+        let payload = build_batch_message(&receiver, &batch, &delivery, None);
         let summary_widgets = payload["cardsV2"][0]["card"]["sections"][0]["widgets"]
             .as_array()
             .unwrap();
@@ -911,7 +1164,8 @@ mod tests {
         let receiver = GoogleChatReceiverConfig {
             webhook_url: "https://chat.googleapis.test/ops".to_string(),
             owner_team: None,
-            title_template: "[{{status}}] {{alertname}}".to_string(),
+            title_template: Some("[{{status}}] {{alertname}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
         let delivery = Delivery {
@@ -923,7 +1177,7 @@ mod tests {
         };
 
         let batch = NotificationBatch::new("batch-1", vec![alert.to_alert_event("signoz")]);
-        let payload = build_batch_message(&receiver, &batch, &delivery);
+        let payload = build_batch_message(&receiver, &batch, &delivery, None);
         let instances = payload["cardsV2"][0]["card"]["sections"][1]["widgets"]
             .as_array()
             .unwrap();
@@ -970,7 +1224,8 @@ mod tests {
         let chat = ChatWebhookReceiverConfig {
             webhook_url: "https://hooks.example.test".to_string(),
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
         let matrix = MatrixReceiverConfig {
@@ -979,7 +1234,8 @@ mod tests {
             access_token: Some("secret".to_string()),
             access_token_env: None,
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
 
@@ -988,14 +1244,14 @@ mod tests {
         assert_eq!(generic["events"].as_array().unwrap().len(), 2);
 
         for target in [ChatTarget::Slack, ChatTarget::Mattermost] {
-            let payload = build_chat_batch_message(&chat, &batch, &delivery, target);
+            let payload = build_chat_batch_message(&chat, &batch, &delivery, target, None);
             let text = payload["text"].as_str().unwrap();
             assert!(text.contains("2 instances"));
             assert!(text.contains("api-1 | critical"));
             assert!(text.contains("api-2 | warning"));
         }
 
-        let discord = build_chat_batch_message(&chat, &batch, &delivery, ChatTarget::Discord);
+        let discord = build_chat_batch_message(&chat, &batch, &delivery, ChatTarget::Discord, None);
         assert_eq!(discord["embeds"][0]["fields"][1]["value"], "2");
         assert!(
             discord["embeds"][0]["description"]
@@ -1004,7 +1260,7 @@ mod tests {
                 .contains("api-2 | warning")
         );
 
-        let matrix = build_matrix_batch_message(&matrix, &batch, &delivery);
+        let matrix = build_matrix_batch_message(&matrix, &batch, &delivery, None);
         assert!(matrix["body"].as_str().unwrap().contains("Instances: 2"));
         assert!(
             matrix["formatted_body"]
@@ -1032,7 +1288,8 @@ mod tests {
         let receiver = GoogleChatReceiverConfig {
             webhook_url: "https://chat.googleapis.test/ops".to_string(),
             owner_team: None,
-            title_template: "[{{status}}] {{alertname}}".to_string(),
+            title_template: Some("[{{status}}] {{alertname}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
         let delivery = Delivery {
@@ -1043,7 +1300,7 @@ mod tests {
             group_by: Vec::new(),
         };
 
-        let payload = build_event_message(&receiver, &event, &delivery);
+        let payload = build_event_message(&receiver, &event, &delivery, None);
 
         assert_eq!(
             payload["cardsV2"][0]["card"]["header"]["title"].as_str(),
@@ -1084,7 +1341,8 @@ mod tests {
             access_token: Some("token".to_string()),
             access_token_env: None,
             owner_team: None,
-            title_template: "[{{status}}] {{title}}".to_string(),
+            title_template: Some("[{{status}}] {{title}}".to_string()),
+            template: None,
             timeout_secs: 10,
         };
 
