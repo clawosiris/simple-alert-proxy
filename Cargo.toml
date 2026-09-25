@@ -10,6 +10,7 @@ argon2 = "0.6"
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+cloudevents-sdk = { version = "0.9", features = ["http-binding"] }
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "json", "serde", "std_collections"] }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

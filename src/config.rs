@@ -93,6 +93,9 @@ impl AppConfig {
                 IntegrationConfig::GenericJson(config) => {
                     config.validate(name)?;
                 }
+                IntegrationConfig::CloudEvents(config) => {
+                    config.validate(name)?;
+                }
             }
         }
         self.validate_integration_paths()?;
@@ -621,6 +624,7 @@ impl DeliveryConfig {
 pub enum IntegrationConfig {
     Builtin(BuiltinIntegrationConfig),
     GenericJson(Box<GenericJsonIntegrationConfig>),
+    CloudEvents(Box<CloudEventsIntegrationConfig>),
 }
 
 impl IntegrationConfig {
@@ -628,6 +632,7 @@ impl IntegrationConfig {
         match self {
             IntegrationConfig::Builtin(config) => &config.path,
             IntegrationConfig::GenericJson(config) => &config.path,
+            IntegrationConfig::CloudEvents(config) => &config.path,
         }
     }
 }
@@ -667,6 +672,19 @@ pub struct GenericJsonIntegrationConfig {
     pub path: String,
     pub auth: Option<AuthConfig>,
     pub source: String,
+    #[serde(flatten)]
+    pub mapping: AlertMappingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudEventsIntegrationConfig {
+    pub path: String,
+    pub auth: Option<AuthConfig>,
+    pub mapping: AlertMappingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AlertMappingConfig {
     pub status: String,
     pub severity: Option<String>,
     pub title: String,
@@ -685,22 +703,29 @@ pub struct GenericJsonIntegrationConfig {
 
 impl GenericJsonIntegrationConfig {
     fn validate(&self, name: &str) -> anyhow::Result<()> {
-        if self.path.is_empty() {
-            bail!("integration {name} path must not be empty");
-        }
+        validate_integration_path_and_auth(name, &self.path, self.auth.as_ref())?;
 
         if let Some(preset) = &self.preset {
             validate_source_preset(name, preset)?;
-        }
-
-        if !self.path.starts_with("/webhooks/") {
-            bail!("integration {name} path must start with /webhooks/");
         }
 
         if self.source.is_empty() {
             bail!("integration {name} source must not be empty");
         }
 
+        self.mapping.validate(name)
+    }
+}
+
+impl CloudEventsIntegrationConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        validate_integration_path_and_auth(name, &self.path, self.auth.as_ref())?;
+        self.mapping.validate(name)
+    }
+}
+
+impl AlertMappingConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
         if self.status.is_empty() {
             bail!("integration {name} status field must not be empty");
         }
@@ -713,14 +738,30 @@ impl GenericJsonIntegrationConfig {
             bail!("integration {name} fingerprint field must not be empty");
         }
 
-        if let Some(auth) = &self.auth
-            && auth.bearer_token.is_empty()
-        {
-            bail!("integration {name} auth.bearer_token must not be empty");
-        }
-
         Ok(())
     }
+}
+
+fn validate_integration_path_and_auth(
+    name: &str,
+    path: &str,
+    auth: Option<&AuthConfig>,
+) -> anyhow::Result<()> {
+    if path.is_empty() {
+        bail!("integration {name} path must not be empty");
+    }
+
+    if !path.starts_with("/webhooks/") {
+        bail!("integration {name} path must start with /webhooks/");
+    }
+
+    if let Some(auth) = auth
+        && auth.bearer_token.is_empty()
+    {
+        bail!("integration {name} auth.bearer_token must not be empty");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1275,17 +1316,19 @@ mod tests {
                     path: "/webhooks/openvas".to_string(),
                     auth: None,
                     source: "openvas".to_string(),
-                    status: "state".to_string(),
-                    severity: None,
-                    title: "".to_string(),
-                    body: None,
-                    fingerprint: "id".to_string(),
-                    notification_group_key: None,
-                    starts_at: None,
-                    ends_at: None,
-                    labels: BTreeMap::new(),
-                    annotations: BTreeMap::new(),
-                    links: BTreeMap::new(),
+                    mapping: AlertMappingConfig {
+                        status: "state".to_string(),
+                        severity: None,
+                        title: "".to_string(),
+                        body: None,
+                        fingerprint: "id".to_string(),
+                        notification_group_key: None,
+                        starts_at: None,
+                        ends_at: None,
+                        labels: BTreeMap::new(),
+                        annotations: BTreeMap::new(),
+                        links: BTreeMap::new(),
+                    },
                 })),
             )]),
             storage: StorageConfig {
@@ -1318,6 +1361,48 @@ mod tests {
             error
                 .to_string()
                 .contains("integration openvas title field must not be empty")
+        );
+    }
+
+    #[test]
+    fn validates_cloudevents_integration_path_auth_and_mapping() {
+        let mut config = minimal_valid_config();
+        config.integrations.insert(
+            "platform-events".to_string(),
+            IntegrationConfig::CloudEvents(Box::new(CloudEventsIntegrationConfig {
+                path: "/webhooks/cloudevents/platform".to_string(),
+                auth: None,
+                mapping: AlertMappingConfig {
+                    status: "data.status".to_string(),
+                    severity: Some("data.severity".to_string()),
+                    title: "data.title".to_string(),
+                    body: None,
+                    fingerprint: "subject".to_string(),
+                    notification_group_key: None,
+                    starts_at: Some("time".to_string()),
+                    ends_at: None,
+                    labels: BTreeMap::new(),
+                    annotations: BTreeMap::new(),
+                    links: BTreeMap::new(),
+                },
+            })),
+        );
+
+        config.validate().unwrap();
+
+        let IntegrationConfig::CloudEvents(integration) = config
+            .integrations
+            .get_mut("platform-events")
+            .expect("CloudEvents integration")
+        else {
+            panic!("expected CloudEvents integration")
+        };
+        integration.mapping.fingerprint.clear();
+        let error = config.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("integration platform-events fingerprint field must not be empty")
         );
     }
 

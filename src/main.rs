@@ -32,6 +32,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod alert;
+mod cloudevents;
 mod config;
 mod google_chat;
 mod grafana;
@@ -49,7 +50,7 @@ use crate::{
     alert::AlertEvent,
     config::{AppConfig, ReceiverConfig},
     google_chat::{DebugDeliveryLog, GoogleChatClient},
-    integration::{GenericJsonIntegration, Integration, SigNozIntegration},
+    integration::{CloudEventsIntegration, GenericJsonIntegration, Integration, SigNozIntegration},
     notification::{NotificationBatch, batch_key},
     routing::{Delivery, RouteEngine},
     storage::{
@@ -984,6 +985,11 @@ async fn list_integrations(
                 "preset": config.preset,
                 "path": config.path,
             }),
+            config::IntegrationConfig::CloudEvents(config) => serde_json::json!({
+                "name": name,
+                "type": "cloudevents",
+                "path": config.path,
+            }),
         })
         .collect::<Vec<_>>();
     if !state
@@ -1171,6 +1177,24 @@ async fn handle_webhook(
 
             let integration = GenericJsonIntegration::new(name, config);
             let events = integration.normalize(payload)?;
+            process_generic_events(&state, &events)
+        }
+        Ok(integration::ConfiguredIntegration::CloudEvents(name, config)) => {
+            authorize(
+                config.auth.as_ref().or(state.config.server.auth.as_ref()),
+                &headers,
+            )?;
+            let decoded = cloudevents::decode(&headers, &body)?;
+            if state.config.debug.log_alerts {
+                log_debug_json(
+                    "incoming CloudEvent",
+                    &decoded.envelope,
+                    state.config.debug.log_full_payloads,
+                );
+            }
+
+            let integration = CloudEventsIntegration::new(name, config);
+            let events = integration.normalize(decoded)?;
             process_generic_events(&state, &events)
         }
         Err(integration::IntegrationError::Unknown(_))
@@ -2034,6 +2058,8 @@ enum WebhookError {
     InvalidPayload(#[from] signoz::AlertParseError),
     #[error("invalid integration payload: {0}")]
     Integration(#[from] integration::IntegrationError),
+    #[error("invalid CloudEvents input: {0}")]
+    CloudEvents(#[from] cloudevents::CloudEventsError),
     #[error("storage failed: {0}")]
     Storage(#[from] anyhow::Error),
     #[error("delivery failed: {0}")]
@@ -2057,6 +2083,12 @@ impl IntoResponse for WebhookError {
                 StatusCode::NOT_FOUND
             }
             WebhookError::Integration(_) => StatusCode::BAD_REQUEST,
+            WebhookError::CloudEvents(cloudevents::CloudEventsError::Malformed(_)) => {
+                StatusCode::BAD_REQUEST
+            }
+            WebhookError::CloudEvents(cloudevents::CloudEventsError::UnsupportedMediaType(_)) => {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            }
             WebhookError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebhookError::Delivery(_) => StatusCode::BAD_GATEWAY,
         };
@@ -2071,12 +2103,13 @@ impl IntoResponse for WebhookError {
 mod tests {
     use super::*;
     use crate::config::{
-        AuthConfig, BuiltinIntegrationConfig, ChatWebhookReceiverConfig, DebugConfig,
-        DeliveryConfig, EscalationConfig, EscalationPolicyConfig, EscalationStepConfig,
-        GenericJsonIntegrationConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
-        IntegrationConfig, IntelligenceConfig, ManagementConfig, MatrixReceiverConfig,
-        NotificationBatchingConfig, NotificationTemplateConfig, ReceiverConfig, RoutingConfig,
-        ScheduleConfig, ServerConfig, ServerLimitsConfig, StorageConfig,
+        AlertMappingConfig, AuthConfig, BuiltinIntegrationConfig, ChatWebhookReceiverConfig,
+        CloudEventsIntegrationConfig, DebugConfig, DeliveryConfig, EscalationConfig,
+        EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
+        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
+        IntelligenceConfig, ManagementConfig, MatrixReceiverConfig, NotificationBatchingConfig,
+        NotificationTemplateConfig, ReceiverConfig, RoutingConfig, ScheduleConfig, ServerConfig,
+        ServerLimitsConfig, StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -3001,17 +3034,19 @@ mod tests {
                     path: "/webhooks/shared".to_string(),
                     auth: None,
                     source: "openvas".to_string(),
-                    status: "state".to_string(),
-                    severity: None,
-                    title: "title".to_string(),
-                    body: None,
-                    fingerprint: "id".to_string(),
-                    notification_group_key: None,
-                    starts_at: None,
-                    ends_at: None,
-                    labels: BTreeMap::new(),
-                    annotations: BTreeMap::new(),
-                    links: BTreeMap::new(),
+                    mapping: AlertMappingConfig {
+                        status: "state".to_string(),
+                        severity: None,
+                        title: "title".to_string(),
+                        body: None,
+                        fingerprint: "id".to_string(),
+                        notification_group_key: None,
+                        starts_at: None,
+                        ends_at: None,
+                        labels: BTreeMap::new(),
+                        annotations: BTreeMap::new(),
+                        links: BTreeMap::new(),
+                    },
                 })),
             ),
         ]);
@@ -3157,17 +3192,19 @@ mod tests {
                 path: "/webhooks/openvas".to_string(),
                 auth: None,
                 source: "openvas".to_string(),
-                status: "state".to_string(),
-                severity: Some("risk.level".to_string()),
-                title: "finding.title".to_string(),
-                body: Some("finding.description".to_string()),
-                fingerprint: "finding.id".to_string(),
-                notification_group_key: None,
-                starts_at: Some("observed_at".to_string()),
-                ends_at: None,
-                labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
-                annotations: BTreeMap::from([("asset".to_string(), "asset.host".to_string())]),
-                links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+                mapping: AlertMappingConfig {
+                    status: "state".to_string(),
+                    severity: Some("risk.level".to_string()),
+                    title: "finding.title".to_string(),
+                    body: Some("finding.description".to_string()),
+                    fingerprint: "finding.id".to_string(),
+                    notification_group_key: None,
+                    starts_at: Some("observed_at".to_string()),
+                    ends_at: None,
+                    labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
+                    annotations: BTreeMap::from([("asset".to_string(), "asset.host".to_string())]),
+                    links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+                },
             })),
         )]);
         let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
@@ -3197,6 +3234,159 @@ mod tests {
             received[0]["cardsV2"][0]["card"]["header"]["subtitle"].as_str(),
             Some("openvas | firing | high")
         );
+    }
+
+    #[tokio::test]
+    async fn cloudevents_structured_and_binary_requests_share_lifecycle_group() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.enabled = false;
+        config.integrations = cloudevents_test_integrations();
+        config.routing.default_receiver = None;
+        config.routing.routes = vec![config::RouteConfig {
+            name: "platform-cloudevents".to_string(),
+            receiver: "target".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+            continue_matching: false,
+            matchers: vec![config::MatcherConfig {
+                field: "payload.tenant".to_string(),
+                equals: Some("platform".to_string()),
+                regex: None,
+                contains: None,
+            }],
+        }];
+        config.receivers = BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+                template: None,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let unauthorized = app
+            .clone()
+            .oneshot(cloudevents_structured_request(
+                "occurrence-1",
+                "firing",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let firing = app
+            .clone()
+            .oneshot(cloudevents_structured_request(
+                "occurrence-1",
+                "firing",
+                Some("cloudevents-token"),
+            ))
+            .await
+            .unwrap();
+        let resolved = app
+            .clone()
+            .oneshot(cloudevents_binary_request(
+                "occurrence-2",
+                "resolved",
+                Some("cloudevents-token"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(firing.status(), StatusCode::ACCEPTED);
+        assert_eq!(resolved.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 2).await;
+        wait_for_succeeded_deliveries(app.clone(), 2).await;
+
+        let events = get_api_json(app.clone(), "/api/alert-events").await;
+        assert_eq!(events.as_array().unwrap().len(), 2);
+        let event_ids = events
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["event_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(event_ids.iter().any(|id| id.ends_with(":12:occurrence-1")));
+        assert!(event_ids.iter().any(|id| id.ends_with(":12:occurrence-2")));
+        assert!(events.as_array().unwrap().iter().all(|event| {
+            event["source"] == "urn:example:monitoring"
+                && event["fingerprint"] == "service/api"
+                && event["raw_payload"]["type"] == "com.example.alert"
+                && event["raw_payload"]["tenant"] == "platform"
+        }));
+
+        let groups = get_api_json(app.clone(), "/api/alert-groups").await;
+        assert_eq!(groups.as_array().unwrap().len(), 1);
+        assert_eq!(groups[0]["status"], "resolved");
+        assert_eq!(groups[0]["event_count"], 2);
+
+        let integrations = get_api_json(app, "/api/integrations").await;
+        assert!(integrations.as_array().unwrap().iter().any(|integration| {
+            integration["name"] == "platform-events" && integration["type"] == "cloudevents"
+        }));
+    }
+
+    #[tokio::test]
+    async fn cloudevents_endpoint_distinguishes_bad_requests_and_unsupported_media() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.integrations = cloudevents_test_integrations();
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/cloudevents/platform")
+                    .header(header::CONTENT_TYPE, "application/cloudevents+json")
+                    .header(header::AUTHORIZATION, "Bearer cloudevents-token")
+                    .body(Body::from(r#"{"specversion":"1.0"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        let batch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/cloudevents/platform")
+                    .header(header::CONTENT_TYPE, "application/cloudevents-batch+json")
+                    .header(header::AUTHORIZATION, "Bearer cloudevents-token")
+                    .body(Body::from("[]"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let non_json = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/cloudevents/platform")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .header(header::AUTHORIZATION, "Bearer cloudevents-token")
+                    .header("ce-specversion", "1.0")
+                    .header("ce-id", "occurrence-1")
+                    .header("ce-source", "urn:example:monitoring")
+                    .header("ce-type", "com.example.alert")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_json.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
@@ -3372,7 +3562,7 @@ mod tests {
         else {
             panic!("expected generic integration")
         };
-        integration.notification_group_key = Some("group.id".to_string());
+        integration.mapping.notification_group_key = Some("group.id".to_string());
         config.routing.routes.clear();
         config.routing.default_receiver = Some("target".to_string());
         config.receivers = BTreeMap::from([(
@@ -3427,7 +3617,7 @@ mod tests {
         else {
             panic!("expected generic integration")
         };
-        integration.notification_group_key = Some("group.id".to_string());
+        integration.mapping.notification_group_key = Some("group.id".to_string());
         config.routing.routes.clear();
         config.routing.default_receiver = Some("target".to_string());
         config.receivers = BTreeMap::from([(
@@ -3480,7 +3670,7 @@ mod tests {
         else {
             panic!("expected generic integration")
         };
-        integration.notification_group_key = Some("group.id".to_string());
+        integration.mapping.notification_group_key = Some("group.id".to_string());
         config.routing.default_receiver = None;
         config.routing.routes = vec![config::RouteConfig {
             name: "plugin-batch".to_string(),
@@ -5774,6 +5964,70 @@ mod tests {
             .unwrap()
     }
 
+    fn cloudevents_structured_request(
+        id: &str,
+        status: &str,
+        token: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/webhooks/cloudevents/platform")
+            .header(header::CONTENT_TYPE, "application/cloudevents+json");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(
+                serde_json::json!({
+                    "specversion": "1.0",
+                    "id": id,
+                    "source": "urn:example:monitoring",
+                    "type": "com.example.alert",
+                    "subject": "service/api",
+                    "time": "2026-09-25T12:00:00Z",
+                    "tenant": "platform",
+                    "data": {
+                        "status": status,
+                        "severity": "critical",
+                        "title": "API availability",
+                        "message": "Synthetic CloudEvent",
+                        "group": "platform-api"
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn cloudevents_binary_request(id: &str, status: &str, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/webhooks/cloudevents/platform")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("ce-specversion", "1.0")
+            .header("ce-id", id)
+            .header("ce-source", "urn:example:monitoring")
+            .header("ce-type", "com.example.alert")
+            .header("ce-subject", "service/api")
+            .header("ce-time", "2026-09-25T12:00:00Z")
+            .header("ce-tenant", "platform");
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(
+                serde_json::json!({
+                    "status": status,
+                    "severity": "critical",
+                    "title": "API availability",
+                    "message": "Synthetic CloudEvent",
+                    "group": "platform-api"
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
     fn grafana_request() -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -5837,17 +6091,50 @@ mod tests {
                 path: "/webhooks/openvas".to_string(),
                 auth: None,
                 source: "openvas".to_string(),
-                status: "state".to_string(),
-                severity: Some("risk.level".to_string()),
-                title: "finding.title".to_string(),
-                body: Some("finding.description".to_string()),
-                fingerprint: "finding.id".to_string(),
-                notification_group_key: None,
-                starts_at: None,
-                ends_at: None,
-                labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
-                annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
-                links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+                mapping: AlertMappingConfig {
+                    status: "state".to_string(),
+                    severity: Some("risk.level".to_string()),
+                    title: "finding.title".to_string(),
+                    body: Some("finding.description".to_string()),
+                    fingerprint: "finding.id".to_string(),
+                    notification_group_key: None,
+                    starts_at: None,
+                    ends_at: None,
+                    labels: BTreeMap::from([("severity".to_string(), "risk.level".to_string())]),
+                    annotations: BTreeMap::from([(
+                        "plugin".to_string(),
+                        "finding.plugin".to_string(),
+                    )]),
+                    links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+                },
+            })),
+        )])
+    }
+
+    fn cloudevents_test_integrations() -> BTreeMap<String, IntegrationConfig> {
+        BTreeMap::from([(
+            "platform-events".to_string(),
+            IntegrationConfig::CloudEvents(Box::new(CloudEventsIntegrationConfig {
+                path: "/webhooks/cloudevents/platform".to_string(),
+                auth: Some(AuthConfig {
+                    bearer_token: "cloudevents-token".to_string(),
+                }),
+                mapping: AlertMappingConfig {
+                    status: "data.status".to_string(),
+                    severity: Some("data.severity".to_string()),
+                    title: "data.title".to_string(),
+                    body: Some("data.message".to_string()),
+                    fingerprint: "subject".to_string(),
+                    notification_group_key: Some("data.group".to_string()),
+                    starts_at: Some("time".to_string()),
+                    ends_at: None,
+                    labels: BTreeMap::from([
+                        ("tenant".to_string(), "tenant".to_string()),
+                        ("event_type".to_string(), "type".to_string()),
+                    ]),
+                    annotations: BTreeMap::new(),
+                    links: BTreeMap::new(),
+                },
             })),
         )])
     }
@@ -5860,20 +6147,25 @@ mod tests {
                 path: "/webhooks/synthetic".to_string(),
                 auth: None,
                 source: "synthetic-monitor".to_string(),
-                status: "state".to_string(),
-                severity: Some("risk.level".to_string()),
-                title: "finding.title".to_string(),
-                body: Some("finding.description".to_string()),
-                fingerprint: "finding.id".to_string(),
-                notification_group_key: None,
-                starts_at: Some("observed_at".to_string()),
-                ends_at: None,
-                labels: BTreeMap::from([
-                    ("service".to_string(), "asset.service".to_string()),
-                    ("host".to_string(), "asset.host".to_string()),
-                ]),
-                annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
-                links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+                mapping: AlertMappingConfig {
+                    status: "state".to_string(),
+                    severity: Some("risk.level".to_string()),
+                    title: "finding.title".to_string(),
+                    body: Some("finding.description".to_string()),
+                    fingerprint: "finding.id".to_string(),
+                    notification_group_key: None,
+                    starts_at: Some("observed_at".to_string()),
+                    ends_at: None,
+                    labels: BTreeMap::from([
+                        ("service".to_string(), "asset.service".to_string()),
+                        ("host".to_string(), "asset.host".to_string()),
+                    ]),
+                    annotations: BTreeMap::from([(
+                        "plugin".to_string(),
+                        "finding.plugin".to_string(),
+                    )]),
+                    links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+                },
             })),
         )])
     }
