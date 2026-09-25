@@ -62,6 +62,27 @@ integrations:
     links:
       source: "finding.url"
 
+  # CloudEvents inputs use a nested mapping. CloudEvents context attributes
+  # and extensions are top-level; event data is under `data`.
+  # platform-events:
+  #   type: "cloudevents"
+  #   path: "/webhooks/cloudevents/platform"
+  #   auth:
+  #     bearer_token: "replace-me"
+  #   mapping:
+  #     status: "data.status"
+  #     severity: "data.severity"
+  #     title: "data.title"
+  #     body: "data.message"
+  #     fingerprint: "subject"
+  #     notification_group_key: "data.group"
+  #     starts_at: "time"
+  #     labels:
+  #       tenant: "tenant"
+  #       event_type: "type"
+  #     links:
+  #       runbook: "data.runbook"
+
 storage:
   type: "sqlite"
   path: "/var/lib/simple-alert-proxy/data/simple-alert-proxy.db"

@@ -3,7 +3,11 @@ use std::collections::BTreeMap;
 
 use crate::{
     alert::{AlertEvent, AlertLink},
-    config::{BuiltinIntegrationConfig, GenericJsonIntegrationConfig, IntegrationConfig},
+    cloudevents::DecodedCloudEvent,
+    config::{
+        AlertMappingConfig, BuiltinIntegrationConfig, CloudEventsIntegrationConfig,
+        GenericJsonIntegrationConfig, IntegrationConfig,
+    },
     grafana::{self, GrafanaIntegration},
     signoz::{self, SigNozAlert},
 };
@@ -50,43 +54,82 @@ impl<'a> GenericJsonIntegration<'a> {
 
 impl Integration for GenericJsonIntegration<'_> {
     fn normalize(&self, raw: Value) -> Result<Vec<AlertEvent>, IntegrationError> {
-        let status = required_string(&raw, &self.config.status, "status")?;
-        let title = required_string(&raw, &self.config.title, "title")?;
-        let fingerprint = required_string(&raw, &self.config.fingerprint, "fingerprint")?;
-        let severity = optional_string(&raw, self.config.severity.as_deref())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let mut event = AlertEvent::new(
+        Ok(vec![normalize_mapped_event(
             self.name,
-            self.config.source.clone(),
-            status,
-            severity,
-            title,
-            fingerprint,
-            raw.clone(),
-        );
+            &self.config.source,
+            &self.config.mapping,
+            raw,
+        )?])
+    }
+}
 
-        event.body = optional_string(&raw, self.config.body.as_deref());
-        event.notification_group_key =
-            optional_string(&raw, self.config.notification_group_key.as_deref());
-        event.labels = mapped_strings(&raw, &self.config.labels);
-        event.annotations = mapped_strings(&raw, &self.config.annotations);
-        event.starts_at = optional_string(&raw, self.config.starts_at.as_deref());
-        event.ends_at = optional_string(&raw, self.config.ends_at.as_deref());
-        event.links = self
-            .config
-            .links
-            .iter()
-            .filter_map(|(label, path)| {
-                optional_string(&raw, Some(path)).map(|url| AlertLink {
-                    label: label.clone(),
-                    url,
-                })
-            })
-            .collect();
+#[derive(Debug, Clone)]
+pub struct CloudEventsIntegration<'a> {
+    name: &'a str,
+    config: &'a CloudEventsIntegrationConfig,
+}
 
+impl<'a> CloudEventsIntegration<'a> {
+    pub fn new(name: &'a str, config: &'a CloudEventsIntegrationConfig) -> Self {
+        Self { name, config }
+    }
+
+    pub fn normalize(
+        &self,
+        decoded: DecodedCloudEvent,
+    ) -> Result<Vec<AlertEvent>, IntegrationError> {
+        let occurrence_id = decoded.occurrence_id();
+        let mut event = normalize_mapped_event(
+            self.name,
+            &decoded.source,
+            &self.config.mapping,
+            decoded.envelope,
+        )?;
+        event.event_id = occurrence_id;
         Ok(vec![event])
     }
+}
+
+fn normalize_mapped_event(
+    name: &str,
+    source: &str,
+    mapping: &AlertMappingConfig,
+    raw: Value,
+) -> Result<AlertEvent, IntegrationError> {
+    let status = required_string(&raw, &mapping.status, "status")?;
+    let title = required_string(&raw, &mapping.title, "title")?;
+    let fingerprint = required_string(&raw, &mapping.fingerprint, "fingerprint")?;
+    let severity =
+        optional_string(&raw, mapping.severity.as_deref()).unwrap_or_else(|| "unknown".to_string());
+
+    let mut event = AlertEvent::new(
+        name,
+        source,
+        status,
+        severity,
+        title,
+        fingerprint,
+        raw.clone(),
+    );
+
+    event.body = optional_string(&raw, mapping.body.as_deref());
+    event.notification_group_key = optional_string(&raw, mapping.notification_group_key.as_deref());
+    event.labels = mapped_strings(&raw, &mapping.labels);
+    event.annotations = mapped_strings(&raw, &mapping.annotations);
+    event.starts_at = optional_string(&raw, mapping.starts_at.as_deref());
+    event.ends_at = optional_string(&raw, mapping.ends_at.as_deref());
+    event.links = mapping
+        .links
+        .iter()
+        .filter_map(|(label, path)| {
+            optional_string(&raw, Some(path)).map(|url| AlertLink {
+                label: label.clone(),
+                url,
+            })
+        })
+        .collect();
+
+    Ok(event)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +151,7 @@ pub fn normalize_grafana(name: &str, raw: Value) -> Result<Vec<AlertEvent>, Inte
 pub enum ConfiguredIntegration<'a> {
     Builtin(&'a str, &'a BuiltinIntegrationConfig),
     GenericJson(&'a str, &'a GenericJsonIntegrationConfig),
+    CloudEvents(&'a str, &'a CloudEventsIntegrationConfig),
 }
 
 pub fn configured_integration_for_path<'a>(
@@ -122,6 +166,9 @@ pub fn configured_integration_for_path<'a>(
             }
             IntegrationConfig::GenericJson(config) if config.path == path => {
                 Some(ConfiguredIntegration::GenericJson(name.as_str(), config))
+            }
+            IntegrationConfig::CloudEvents(config) if config.path == path => {
+                Some(ConfiguredIntegration::CloudEvents(name.as_str(), config))
             }
             _ => None,
         })
@@ -186,17 +233,19 @@ mod tests {
             path: "/webhooks/openvas".to_string(),
             auth: None,
             source: "openvas".to_string(),
-            status: "state".to_string(),
-            severity: Some("risk.level".to_string()),
-            title: "finding.title".to_string(),
-            body: Some("finding.description".to_string()),
-            fingerprint: "finding.id".to_string(),
-            notification_group_key: Some("group.id".to_string()),
-            starts_at: Some("observed_at".to_string()),
-            ends_at: None,
-            labels: BTreeMap::from([("asset".to_string(), "asset.host".to_string())]),
-            annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
-            links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+            mapping: AlertMappingConfig {
+                status: "state".to_string(),
+                severity: Some("risk.level".to_string()),
+                title: "finding.title".to_string(),
+                body: Some("finding.description".to_string()),
+                fingerprint: "finding.id".to_string(),
+                notification_group_key: Some("group.id".to_string()),
+                starts_at: Some("observed_at".to_string()),
+                ends_at: None,
+                labels: BTreeMap::from([("asset".to_string(), "asset.host".to_string())]),
+                annotations: BTreeMap::from([("plugin".to_string(), "finding.plugin".to_string())]),
+                links: BTreeMap::from([("source".to_string(), "finding.url".to_string())]),
+            },
         };
         let integration = GenericJsonIntegration::new("openvas", &config);
 
@@ -241,17 +290,19 @@ mod tests {
             path: "/webhooks/openvas".to_string(),
             auth: None,
             source: "openvas".to_string(),
-            status: "state".to_string(),
-            severity: None,
-            title: "title".to_string(),
-            body: None,
-            fingerprint: "id".to_string(),
-            notification_group_key: None,
-            starts_at: None,
-            ends_at: None,
-            labels: BTreeMap::new(),
-            annotations: BTreeMap::new(),
-            links: BTreeMap::new(),
+            mapping: AlertMappingConfig {
+                status: "state".to_string(),
+                severity: None,
+                title: "title".to_string(),
+                body: None,
+                fingerprint: "id".to_string(),
+                notification_group_key: None,
+                starts_at: None,
+                ends_at: None,
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                links: BTreeMap::new(),
+            },
         };
         let integration = GenericJsonIntegration::new("openvas", &config);
 
