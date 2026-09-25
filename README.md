@@ -1,9 +1,10 @@
 # simple-alert-proxy
 
 `simple-alert-proxy` is a compact Rust alert webhook gateway. It accepts SigNoz,
-Grafana, and generic JSON alert webhooks, normalizes them into canonical alert
-events, routes them to chat or webhook targets, persists delivery state in
-SQLite, and serves a small operator UI for inspecting and acting on alerts.
+Grafana, CloudEvents 1.0, and generic JSON alert webhooks, normalizes them into
+canonical alert events, routes them to chat or webhook targets, persists
+delivery state in SQLite, and serves a small operator UI for inspecting and
+acting on alerts.
 
 The current mainline implementation keeps the original SigNoz-to-Google-Chat
 behavior as a compatibility path while adding source-agnostic integrations,
@@ -14,6 +15,7 @@ scheduling, and optional advisory intelligence scaffolding.
 
 - SigNoz compatibility endpoint at `POST /webhooks/signoz`
 - First-class Grafana webhook endpoint support through configured integrations
+- CloudEvents 1.0 structured and binary JSON input
 - Generic JSON integrations at `POST /webhooks/{integration}`
 - Config-only mapping into canonical alert events
 - Routing by status, labels, annotations, or JSON payload fields
@@ -466,11 +468,13 @@ intelligence:
 
 ## Input Setup
 
-`simple-alert-proxy` supports two intake styles:
+`simple-alert-proxy` supports three intake styles:
 
 - Built-in source presets such as SigNoz and Grafana through configured
   `POST /webhooks/{integration}` paths
 - Configured generic JSON integrations through `POST /webhooks/{integration}`
+- CloudEvents 1.0 structured or binary JSON through configured
+  `POST /webhooks/{integration}` paths
 
 Built-in integrations are configured under `integrations` and keep parser logic
 for payload shapes that need source-specific handling. SigNoz,
@@ -528,6 +532,75 @@ curl -X POST http://127.0.0.1:8080/webhooks/openvas-example \
   -H 'authorization: Bearer replace-me' \
   --data @examples/generic-json-webhook.json
 ```
+
+### CloudEvents 1.0
+
+CloudEvents integrations accept one event per request in either JSON structured
+content mode or HTTP binary content mode. They validate the CloudEvents envelope
+and then apply the same declarative alert mapping used by generic JSON inputs.
+Core context attributes and extensions are top-level mapping values (`source`,
+`type`, `subject`, `time`, `tenant`, and so on); event data is under `data`.
+
+```yaml
+integrations:
+  platform-events:
+    type: "cloudevents"
+    path: "/webhooks/cloudevents/platform"
+    auth:
+      bearer_token: "replace-me"
+    mapping:
+      status: "data.status"
+      severity: "data.severity"
+      title: "data.title"
+      body: "data.message"
+      fingerprint: "subject"
+      notification_group_key: "data.group"
+      starts_at: "time"
+      labels:
+        tenant: "tenant"
+        event_type: "type"
+      links:
+        runbook: "data.runbook"
+```
+
+Send the bundled structured event:
+
+```bash
+curl -X POST http://127.0.0.1:8080/webhooks/cloudevents/platform \
+  -H 'content-type: application/cloudevents+json' \
+  -H 'authorization: Bearer replace-me' \
+  --data @examples/cloudevents-webhook.json
+```
+
+Send the equivalent data in binary content mode, where CloudEvents context is
+carried in `ce-*` headers:
+
+```bash
+curl -X POST http://127.0.0.1:8080/webhooks/cloudevents/platform \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer replace-me' \
+  -H 'ce-specversion: 1.0' \
+  -H 'ce-id: incident-42-firing-1' \
+  -H 'ce-source: urn:example:monitoring' \
+  -H 'ce-type: com.example.alert.status.v1' \
+  -H 'ce-subject: service/api' \
+  -H 'ce-time: 2026-09-25T12:00:00Z' \
+  -H 'ce-tenant: platform' \
+  --data '{"status":"firing","severity":"critical","title":"API availability is low","message":"Availability dropped below the SLO","group":"platform-api"}'
+```
+
+The normalized raw payload has the same structured envelope in both modes, so
+routing can match context with fields such as `source`, `payload.type`, or
+`payload.tenant`. CloudEvents `source` plus `id` identifies this occurrence and
+is stored as the canonical event ID. It is deliberately separate from the
+configured alert `fingerprint`: firing and resolved occurrences should use new
+CloudEvents IDs while mapping to the same lifecycle fingerprint (often
+`subject`, an extension, or `data.fingerprint`).
+
+Malformed CloudEvents return `400 Bad Request`. Batch mode, non-JSON event data,
+and unsupported encodings return `415 Unsupported Media Type`. JSON batch mode,
+duplicate suppression, and the separate CloudEvents HTTP Webhook profile
+(OPTIONS consent, rate negotiation, and query-token behavior) are not included.
 
 Use `POST /debug/webhook` while integrating a new source if you need to inspect
 the redacted inbound payload before committing a mapping.

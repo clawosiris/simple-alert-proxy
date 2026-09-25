@@ -1,0 +1,18 @@
+{
+  "specversion": "1.0",
+  "id": "incident-42-firing-1",
+  "source": "urn:example:monitoring",
+  "type": "com.example.alert.status.v1",
+  "subject": "service/api",
+  "time": "2026-09-25T12:00:00Z",
+  "tenant": "platform",
+  "datacontenttype": "application/json",
+  "data": {
+    "status": "firing",
+    "severity": "critical",
+    "title": "API availability is low",
+    "message": "Availability dropped below the SLO",
+    "group": "platform-api",
+    "runbook": "https://runbooks.example.test/api-availability"
+  }
+}

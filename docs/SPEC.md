@@ -122,7 +122,9 @@ If bearer authentication is enabled, missing or invalid credentials return `401`
 Configured integrations live under `integrations`. Built-in integrations use
 source-specific parsers for payload shapes that need stable behavior. Generic
 JSON integrations map fields from arbitrary JSON payloads into the canonical
-alert event model with config only.
+alert event model with config only. CloudEvents integrations validate version
+1.0 structured or binary JSON input, rebuild one structured mapping document,
+and apply a nested mapping block to it.
 
 ```yaml
 integrations:
@@ -152,13 +154,39 @@ integrations:
       plugin: "finding.plugin"
     links:
       source: "finding.url"
+
+  platform-events:
+    type: cloudevents
+    path: "/webhooks/cloudevents/platform"
+    auth:
+      bearer_token: "replace-me"
+    mapping:
+      status: "data.status"
+      severity: "data.severity"
+      title: "data.title"
+      body: "data.message"
+      fingerprint: "subject"
+      starts_at: "time"
+      labels:
+        tenant: "tenant"
+        event_type: "type"
 ```
 
 Field mappings accept either dotted paths such as `finding.title` or JSON
-pointers such as `/finding/title`. Required mappings are `source`, `status`,
-`title`, and `fingerprint`; invalid integration config fails at startup with a
-clear validation error. A missing configured integration returns `404`, while a
-payload missing a required mapped field returns `400`.
+pointers such as `/finding/title`. Generic JSON integrations require a `source`
+plus `status`, `title`, and `fingerprint` mappings. CloudEvents supplies its
+source from the envelope and requires `status`, `title`, and `fingerprint`
+mappings. Invalid integration config fails at startup with a clear validation
+error. A missing configured integration returns `404`, while a payload missing
+a required mapped field returns `400`.
+
+CloudEvents structured mode requires `application/cloudevents+json`. Binary
+mode requires `ce-specversion`, `ce-id`, `ce-source`, and `ce-type` headers plus
+a JSON `Content-Type`; context attributes and extensions become top-level
+mapping fields and event data is placed under `data`. `source` plus `id` is the
+stored occurrence identity, while the configured `fingerprint` remains the
+lifecycle-group identity. Unsupported media, batch mode, and non-JSON event data
+return `415`; malformed events and unsupported spec versions return `400`.
 
 Integration-specific bearer auth overrides the server-level bearer token for
 that integration. If no integration auth is configured, the server auth setting

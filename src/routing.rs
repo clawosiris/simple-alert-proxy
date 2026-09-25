@@ -175,12 +175,17 @@ fn field_value(event: &AlertEvent, field: &str) -> Option<String> {
         let pointer = if pointer.starts_with('/') {
             pointer.to_string()
         } else {
-            format!("/{pointer}")
+            format!("/{}", pointer.replace('.', "/"))
         };
         return event
             .raw_payload
             .pointer(&pointer)
-            .and_then(|value| value.as_str().map(ToOwned::to_owned));
+            .and_then(|value| match value {
+                serde_json::Value::String(value) => Some(value.clone()),
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                serde_json::Value::Bool(value) => Some(value.to_string()),
+                _ => None,
+            });
     }
 
     None
