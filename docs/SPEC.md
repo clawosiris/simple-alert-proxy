@@ -499,7 +499,7 @@ team `operator`/`owner` role.
 ## Receivers
 
 Receiver support includes Google Chat incoming webhooks, generic outbound
-webhooks, Slack, Mattermost, Discord, and Matrix.
+webhooks, CloudEvents 1.0 webhooks, Slack, Mattermost, Discord, and Matrix.
 
 ```yaml
 receivers:
@@ -513,6 +513,15 @@ receivers:
   generic-webhook:
     type: generic_webhook
     webhook_url: "https://alerts.example.test/webhook"
+    timeout_secs: 10
+
+  event-bus:
+    type: cloudevents_webhook
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    mode: structured
+    event_type: "io.github.clawosiris.simple-alert-proxy.alert.v1"
+    batch_type: "io.github.clawosiris.simple-alert-proxy.notification-batch.v1"
     timeout_secs: 10
 
   slack-alerts:
@@ -543,8 +552,46 @@ receivers:
 ```
 
 All receiver types consume the same canonical single-event or durable
-`NotificationBatch` input. Generic and chat-style targets use the same durable
-delivery queue, retry, redaction, and replay behavior as Google Chat.
+`NotificationBatch` input. Generic, CloudEvents, and chat-style targets use the
+same durable delivery queue, retry, redaction, and replay behavior as Google
+Chat.
+
+### Outbound CloudEvents contract
+
+`cloudevents_webhook` sends one CloudEvents 1.0 event per queued delivery.
+`mode: structured` (the default) uses `application/cloudevents+json`; `mode:
+binary` uses `application/json` data plus `ce-*` headers. Both modes encode the
+same SDK-built context and JSON data. The configured `source` is a required
+URI-reference. Alert and durable-batch types have the versioned defaults shown
+above and may be overridden with non-empty HTTP-representable strings.
+
+Single-event `data` is `{event, delivery}`. `event` contains `event_id`,
+`integration`, `group_namespace`, `source`, `received_at`, `status`, `severity`,
+`title`, `body`, `labels`, `annotations`, `links`, `starts_at`, `ends_at`,
+`fingerprint`, `notification_group_key`, and `instances`; it never contains
+`raw_payload`. `delivery` contains route, receiver, and optional owner team.
+
+A durable `NotificationBatch` is one CloudEvent and one retry/dead-letter unit,
+including a one-member batch. Its `data` is `{batch, events, delivery}`, where
+`batch` contains the persisted group key, instance count, and severity counts,
+and `events` contains the normalized raw-free event records. It is not
+`application/cloudevents-batch+json` and members are not fanned out.
+
+CloudEvents `id` is the receiver-neutral durable delivery key: stable for
+automatic retry and batch recovery, unique for separate queued deliveries, and
+renewed on explicit replay. Source occurrence identity stays in `data.event_id`.
+Single-event `subject` percent-encodes lifecycle `group_namespace` and
+`fingerprint`; batch `subject` percent-encodes the persisted notification group
+key. `time` uses canonical `received_at` when present (the primary member for a
+batch). Extensions carry route, receiver, status, severity, integration, and a
+string `batched` flag.
+
+A `template.payload` is allowed but replaces only CloudEvents `data`; required
+context and delivery attributes cannot be removed or overridden. The complete
+encoded event uses the generic-webhook 256 KiB limit. Destination configuration,
+raw payloads, credentials, and environment values remain unavailable. The
+separate CloudEvents HTTP Webhook profile, CloudEvents batch format, arbitrary
+headers/auth, signing, and envelope mirroring are outside this contract.
 
 Matrix receivers send `m.notice` room messages through the Matrix Client-Server
 API. The configured token must belong to a Matrix user or bot already joined to
@@ -558,9 +605,10 @@ configured `room_id` must be a canonical `!room:server` ID; aliases such as
 Receivers may define a runtime MiniJinja 2.x `template` block. Google Chat,
 Slack, Mattermost, Discord, and Matrix support `title` and `body` in their
 standard layouts. All receiver families support a mutually exclusive `payload`
-field that renders the complete outbound JSON object; generic webhooks support
-payload mode only. Legacy `title_template` remains unchanged when `template`
-is absent and cannot be combined with the new block.
+field. It renders the complete outbound JSON object except for CloudEvents,
+where it renders only `data`; generic and CloudEvents webhooks support payload
+mode only. Legacy `title_template` remains unchanged when `template` is absent
+and cannot be combined with the new block.
 
 ```yaml
 receivers:
@@ -603,9 +651,10 @@ user functions, and live reload are not enabled.
 The engine compiles configured templates once before the application starts and
 uses fixed internal safeguards: 64 KiB source size, 4 KiB rendered title,
 32 KiB Google Chat payload, 40 KiB Slack/Mattermost payload, 16 KiB Discord
-payload, 64 KiB Matrix payload, 256 KiB generic-webhook payload, recursion depth
-32, and 50,000 instructions per render. Standard Google Chat and Matrix paths
-escape rendered body text before inserting it in HTML-bearing fields.
+payload, 64 KiB Matrix payload, 256 KiB generic-webhook payload or complete
+encoded CloudEvent, recursion depth 32, and 50,000 instructions per render.
+Standard Google Chat and Matrix paths escape rendered body text before inserting
+it in HTML-bearing fields.
 
 Payload output must parse as a JSON object and meet the receiver's minimal
 shape (`text`/`cardsV2`, `text`/`blocks`, `content`/`embeds`, or Matrix

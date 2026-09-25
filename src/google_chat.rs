@@ -1,8 +1,9 @@
 use crate::{
     alert::AlertEvent,
+    cloudevents_outbound::{self, OutboundCloudEventsError},
     config::{
-        ChatWebhookReceiverConfig, GenericWebhookReceiverConfig, GoogleChatReceiverConfig,
-        MatrixReceiverConfig, ReceiverConfig,
+        ChatWebhookReceiverConfig, CloudEventsWebhookReceiverConfig, GenericWebhookReceiverConfig,
+        GoogleChatReceiverConfig, MatrixReceiverConfig, ReceiverConfig,
     },
     notification::NotificationBatch,
     redaction,
@@ -95,7 +96,7 @@ impl GoogleChatClient {
         receiver: &ReceiverConfig,
         event: &AlertEvent,
         delivery: &Delivery,
-        matrix_transaction_id: &str,
+        delivery_idempotency_key: &str,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
         match receiver {
@@ -105,6 +106,16 @@ impl GoogleChatClient {
             ReceiverConfig::GenericWebhook(receiver) => {
                 self.send_generic_webhook(receiver, event, delivery, debug)
                     .await
+            }
+            ReceiverConfig::CloudEventsWebhook(receiver) => {
+                self.send_cloudevents_webhook(
+                    receiver,
+                    event,
+                    delivery,
+                    delivery_idempotency_key,
+                    debug,
+                )
+                .await
             }
             ReceiverConfig::Slack(receiver) => {
                 self.send_chat_webhook(receiver, event, delivery, debug, ChatTarget::Slack)
@@ -119,7 +130,7 @@ impl GoogleChatClient {
                     .await
             }
             ReceiverConfig::Matrix(receiver) => {
-                self.send_matrix(receiver, event, delivery, matrix_transaction_id, debug)
+                self.send_matrix(receiver, event, delivery, delivery_idempotency_key, debug)
                     .await
             }
         }
@@ -130,7 +141,7 @@ impl GoogleChatClient {
         receiver: &ReceiverConfig,
         batch: &NotificationBatch,
         delivery: &Delivery,
-        matrix_transaction_id: &str,
+        delivery_idempotency_key: &str,
         debug: Option<DebugDeliveryLog<'_>>,
     ) -> Result<(), GoogleChatError> {
         match receiver {
@@ -181,6 +192,16 @@ impl GoogleChatClient {
                 )
                 .await
             }
+            ReceiverConfig::CloudEventsWebhook(receiver) => {
+                self.send_cloudevents_batch(
+                    receiver,
+                    batch,
+                    delivery,
+                    delivery_idempotency_key,
+                    debug,
+                )
+                .await
+            }
             ReceiverConfig::Slack(receiver) => {
                 self.send_chat_batch(receiver, batch, delivery, debug, ChatTarget::Slack)
                     .await
@@ -194,7 +215,7 @@ impl GoogleChatClient {
                     .await
             }
             ReceiverConfig::Matrix(receiver) => {
-                self.send_matrix_batch(receiver, batch, delivery, matrix_transaction_id, debug)
+                self.send_matrix_batch(receiver, batch, delivery, delivery_idempotency_key, debug)
                     .await
             }
         }
@@ -233,6 +254,81 @@ impl GoogleChatClient {
             debug,
         )
         .await
+    }
+
+    async fn send_cloudevents_webhook(
+        &self,
+        receiver: &CloudEventsWebhookReceiverConfig,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        delivery_idempotency_key: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let target = PayloadKind::CloudEventsWebhook;
+        let rendered = self
+            .templates
+            .render_event(&delivery.receiver, event, delivery, target)?;
+        let cloud_event = cloudevents_outbound::build_alert_event(
+            receiver,
+            event,
+            delivery,
+            delivery_idempotency_key,
+            rendered.and_then(|rendered| rendered.payload),
+        )?;
+        self.post_cloudevent(receiver, cloud_event, delivery, target, debug)
+            .await
+    }
+
+    async fn send_cloudevents_batch(
+        &self,
+        receiver: &CloudEventsWebhookReceiverConfig,
+        batch: &NotificationBatch,
+        delivery: &Delivery,
+        delivery_idempotency_key: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let target = PayloadKind::CloudEventsWebhook;
+        let rendered = self
+            .templates
+            .render_batch(&delivery.receiver, batch, delivery, target)?;
+        let cloud_event = cloudevents_outbound::build_batch_event(
+            receiver,
+            batch,
+            delivery,
+            delivery_idempotency_key,
+            rendered.and_then(|rendered| rendered.payload),
+        )?;
+        self.post_cloudevent(receiver, cloud_event, delivery, target, debug)
+            .await
+    }
+
+    async fn post_cloudevent(
+        &self,
+        receiver: &CloudEventsWebhookReceiverConfig,
+        cloud_event: cloudevents::Event,
+        delivery: &Delivery,
+        target: PayloadKind,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let envelope =
+            serde_json::to_value(&cloud_event).map_err(OutboundCloudEventsError::from)?;
+        validate_payload_size(&delivery.receiver, target, &envelope)?;
+        if let Some(debug) = debug {
+            log_outgoing_alert(&envelope, debug);
+        }
+
+        let request = self
+            .http
+            .post(&receiver.webhook_url)
+            .timeout(Duration::from_secs(receiver.timeout_secs));
+        let response = cloudevents_outbound::encode_request(cloud_event, receiver.mode, request)?
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(GoogleChatError::Rejected(response.status()))
+        }
     }
 
     async fn send_chat_webhook(
@@ -1078,6 +1174,8 @@ pub enum GoogleChatError {
     Config(String),
     #[error(transparent)]
     Template(#[from] NotificationTemplateError),
+    #[error(transparent)]
+    CloudEvents(#[from] OutboundCloudEventsError),
 }
 
 #[cfg(test)]
