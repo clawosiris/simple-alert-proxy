@@ -23,20 +23,29 @@ scheduling, and optional advisory intelligence scaffolding.
 - SQLite persistence for alert events, alert groups, deliveries, audit entries,
   escalation tasks, and advisory enrichment
 - Durable delivery queue with bounded retry and dead-letter handling
+- Restart-safe notification batching, retry, dead-letter, and replay behavior
 - Alert groups keyed by integration/tenant namespace plus normalized fingerprint
 - Operator APIs for alert groups, events, deliveries, integrations, and routes
 - Lifecycle actions for acknowledge, resolve, silence, and delivery replay
 - Static operator UI at `/` and `/ui`
-- Optional HTTPS listener with certificate/key paths
-- Optional bearer-token authentication for inbound webhooks and APIs
+- Local users, teams, scoped RBAC, and SQLite-backed operator sessions
+- Optional HTTPS listener with certificate/key files or environment sources
+- Separate optional bearer-token authentication for webhooks and management
 - Request body size limits, receiver timeouts, and redacted stored summaries
 - Config-defined escalation policies with ack/resolve stop conditions
 - Optional intelligence config that is disabled by default and advisory only
+- Black-box binary and non-root container end-to-end test suites
 
 ## Quick Start
 
+The bundled config is container-oriented and stores SQLite under
+`/var/lib/simple-alert-proxy/data`. For a local binary run, copy it and change
+`storage.path` to a writable local path first:
+
 ```bash
-cargo run -- --config examples/config.yaml
+cp examples/config.yaml .local-config.yaml
+# Edit .local-config.yaml: storage.path: "simple-alert-proxy.db"
+cargo run -- --config .local-config.yaml
 ```
 
 To run the published container image, copy the example config first. It already
@@ -158,12 +167,21 @@ from the request.
 
 ### Read APIs
 
+- `POST /auth/login`
+- `POST /auth/logout`
 - `GET /api/alert-groups`
 - `GET /api/alert-events`
 - `GET /api/deliveries`
 - `GET /api/advisories`
 - `GET /api/integrations`
 - `GET /api/routes`
+- `GET /api/me`
+- `GET/POST /api/users`
+- `POST /api/users/{id}/password`
+- `POST /api/users/{id}/disable`
+- `GET/POST /api/teams`
+- `POST /api/team-memberships`
+- `PUT`, `DELETE /api/teams/{team_id}/members/{user_id}`
 
 ### Lifecycle APIs
 
@@ -173,19 +191,23 @@ from the request.
 - `POST /api/deliveries/{id}/replay`
 
 Lifecycle actions update persistent state and write audit entries. Acknowledge
-and resolve actions also cancel scheduled escalation tasks for the alert group.
+and resolve actions cancel scheduled escalation steps whose matching
+`stop_on_ack` or `stop_on_resolve` flag is enabled.
 
-Management APIs use `management.auth.bearer_token` when configured. If that is
-not set, they fall back to `server.auth.bearer_token` for compatibility. Exposed
-non-loopback binds require effective management auth unless
-`management.allow_unauthenticated: true` is set deliberately.
+Management APIs and the UI support local user sessions as well as bearer auth.
+`management.auth.bearer_token` takes precedence; if it is not set, management
+falls back to `server.auth.bearer_token` for compatibility. Exposed non-loopback
+binds require bearer auth, local users, or deliberate
+`management.allow_unauthenticated: true`. `/healthz` is always public.
 
 ## Configuration
 
-See [examples/config.yaml](examples/config.yaml) for a complete working
-configuration and [docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md](docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md)
-for the current implementation plan. [docs/SPEC.md](docs/SPEC.md) still contains
-lower-level API and compatibility notes.
+See [examples/config.yaml](examples/config.yaml) for the complete
+container-oriented example and [docs/SPEC.md](docs/SPEC.md) for the current
+behavioral reference. The
+[product requirements](docs/ALERT_WEBHOOK_GATEWAY_PRD.md) and
+[OpenSpec plan](docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md) preserve the design and
+implementation history and identify remaining gaps.
 
 The default SigNoz compatibility path remains `/webhooks/signoz`. Older configs
 can still use `server.webhook_path`; new configs should model SigNoz as a
@@ -208,7 +230,8 @@ management:
   local_users: true
   bootstrap_admin_password_env: "SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD"
   session_ttl_secs: 28800
-  secure_cookies: true
+  # Set true only when TLS terminates at a trusted reverse proxy.
+  # secure_cookies: true
   allow_unauthenticated: false
 
 integrations:
@@ -244,6 +267,12 @@ Session cookies are `HttpOnly` and `SameSite=Lax`. They use the `Secure`
 attribute automatically when native `server.tls` is configured. Set
 `management.secure_cookies: true` when TLS terminates at a trusted reverse proxy
 or ingress in front of the app.
+
+Local passwords must contain at least 12 characters. Five failed logins lock an
+account for 15 minutes. Global roles are `admin`, `operator`, `viewer`, and
+`scoped`; team roles are `owner`, `operator`, and `viewer`. Session-authenticated
+mutations require the `X-CSRF-Token` value returned by `/api/me`. The bearer
+token remains an admin-equivalent emergency path and is not subject to CSRF.
 
 `server.limits.webhook_concurrency` bounds concurrent webhook intake requests.
 `server.limits.management_concurrency` bounds concurrent API, UI, and debug
@@ -567,6 +596,9 @@ intelligence:
   enabled: false
   allow_lifecycle_mutation: false
 ```
+
+This release provides the config, storage, API, and UI scaffolding for advisory
+records. It does not call an intelligence provider or generate advisories.
 
 ## Input Setup
 
@@ -941,8 +973,9 @@ Set `SIMPLE_ALERT_PROXY_TLS_CERT_FILE` and
 real host-side source paths. On startup, the helper copies them into
 `/etc/simple-alert-proxy/tls.crt` and `/etc/simple-alert-proxy/tls.key` with
 ownership and permissions that allow the containerized service to read them.
-Set `SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD` there as well for first-run
-WebUI admin creation:
+The Quadlet also forwards this environment file into the container. Set
+`SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD` there for first-run WebUI admin
+creation:
 
 ```ini
 SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD=change-this-long-password

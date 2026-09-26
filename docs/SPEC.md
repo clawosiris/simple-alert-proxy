@@ -2,14 +2,17 @@
 
 ## Goal
 
-Build a small Rust notification proxy that receives SigNoz alert webhooks, normalizes the alert payload, evaluates routing rules, and sends the alert to one or more Google Chat spaces through incoming webhooks.
+Provide a compact Rust alert webhook gateway that accepts SigNoz, Grafana,
+CloudEvents 1.0, and generic JSON inputs; normalizes and groups alert events;
+persists lifecycle and delivery state; routes to chat or webhook receivers; and
+gives operators a small authenticated API and UI.
 
 ## Non-Goals
 
 - Replacing SigNoz alert rules
-- Owning incident lifecycle state
-- Providing a UI
-- Storing alert history beyond logs and optional future metrics
+- Replacing a full incident-management, ticketing, or on-call platform
+- Providing multi-node/high-availability storage
+- Making optional intelligence part of delivery correctness
 
 ## Runtime
 
@@ -39,14 +42,21 @@ after repeated failures so systemd can restart it with `Restart=on-failure`.
 
 The gateway exposes compact JSON read APIs for operator and later UI use:
 
+- `POST /auth/login`
+- `POST /auth/logout`
 - `GET /api/alert-groups`
 - `GET /api/alert-events`
 - `GET /api/deliveries`
+- `GET /api/advisories`
 - `GET /api/integrations`
 - `GET /api/routes`
+- `GET /api/me`
+- user, team, and team-membership administration under `/api/users`,
+  `/api/teams`, and `/api/team-memberships`
 
-If server bearer authentication is configured, these endpoints require the same
-`Authorization: Bearer ...` header as inbound webhooks.
+These endpoints use management bearer authentication or an authenticated local
+user session. Management bearer auth falls back to the inbound server bearer
+token when no separate management token is configured.
 
 ### Debug Webhook
 
@@ -56,9 +66,9 @@ logs the payload to stderr, and returns `202 Accepted` with
 payload. Payload fields are redacted by default unless
 `debug.log_full_payloads` is explicitly enabled.
 
-This endpoint is always authenticated. It requires `server.auth.bearer_token`
-to be configured and requires the matching `Authorization: Bearer ...` header on
-the request; otherwise it returns `401 Unauthorized`.
+This endpoint follows management authentication: a management bearer token,
+the server bearer fallback, or a local user session. It is unauthenticated only
+when `management.allow_unauthenticated: true` is explicitly configured.
 
 ### Lifecycle APIs
 
@@ -75,10 +85,10 @@ a one-hour default window until configurable policies are added.
 ### Operator UI
 
 The service serves a compact operator UI at `/` and `/ui`. The UI uses the JSON
-read/action APIs to show alert groups, normalized event detail, raw payloads,
-route information, delivery attempts/errors, and ack/resolve/silence/replay
-controls. It is intentionally static and served by the Rust binary so the
-single-container deployment path stays simple.
+read/action APIs to show alert groups, normalized event detail, redacted raw
+payloads, route information, delivery attempts/errors, and
+ack/resolve/silence/replay controls. It is intentionally static and served by
+the Rust binary so the single-container deployment path stays simple.
 
 ### `POST /webhooks/signoz`
 
@@ -274,8 +284,18 @@ management auth unless `management.allow_unauthenticated: true` is configured
 explicitly. Loopback-only development can run without management auth. `/healthz`
 stays public.
 
-The built-in operator UI stores the management token in browser `sessionStorage`
-and attaches it as `Authorization: Bearer ...` to every `/api/*` request.
+The built-in operator UI supports SQLite-backed local users and session cookies,
+as well as the legacy management-token path. Session-authenticated mutations
+require the CSRF token returned by `/api/me`. Global roles are `admin`,
+`operator`, `viewer`, and `scoped`; team memberships use `owner`, `operator`,
+or `viewer` and constrain team-owned alert groups. Bearer authentication remains
+admin-equivalent for bootstrap and emergency use.
+
+Local passwords require at least 12 characters. Five failed logins lock an
+account for 15 minutes. Sessions use `HttpOnly`, `SameSite=Lax` cookies; the
+`Secure` attribute is automatic with native TLS and can be forced behind a
+trusted TLS-terminating proxy. Admin protections prevent self-disable and
+disabling the last active administrator.
 
 ## Limits And Timeouts
 
@@ -298,7 +318,7 @@ remain cheap during webhook pressure.
 Per-client/IP rate limiting is best enforced at a trusted reverse proxy or
 ingress until this service has explicit proxy-header trust rules.
 
-Google Chat receivers use `timeout_secs` to bound outbound delivery time.
+All receiver types use `timeout_secs` to bound outbound delivery time.
 
 ```yaml
 receivers:
@@ -347,7 +367,8 @@ Escalation policies are config-defined ordered steps. Routes can select a policy
 with `escalation_policy`; the first step is persisted as a scheduled escalation
 task when an active alert is accepted. The escalation worker claims due tasks,
 executes the step, and schedules the next step. Acknowledging or resolving the
-alert group cancels scheduled escalation tasks.
+alert group cancels scheduled steps only when their `stop_on_ack` or
+`stop_on_resolve` flag applies.
 
 ```yaml
 escalation:
@@ -401,9 +422,13 @@ intelligence:
 ```
 
 The advisory storage model supports suggested summaries, labels, fingerprints,
-and correlations without changing alert lifecycle state. Lifecycle mutation is
-rejected unless intelligence is enabled and the operator explicitly configures
+and correlations without changing alert lifecycle state. The current release
+provides config, storage, API, and UI scaffolding only: it does not invoke a
+provider or generate advisories. Lifecycle mutation is rejected unless
+intelligence is enabled and the operator explicitly configures
 `allow_lifecycle_mutation`.
+
+## Notification Batching
 
 Notification batching runs after normalization and routing. Source hints use
 SigNoZ `ruleId`, Grafana `groupKey`, or the optional generic JSON
@@ -449,7 +474,8 @@ When enabled, the service writes incoming webhook payloads and outgoing receiver
 Only enable `log_full_payloads: true` for trusted local diagnostics. Raw alert payloads can contain sensitive labels, annotations, hostnames, URLs, and incident context.
 
 For one-off payload inspection, `POST /debug/webhook` logs a JSON request body
-without storing or delivering it. It still requires bearer authentication.
+without storing or delivering it. It follows management authentication and is
+open only when `management.allow_unauthenticated: true` is deliberate.
 
 ## Routing
 
@@ -673,13 +699,15 @@ parser.
 
 ## Security
 
-Required before production:
+Production deployment checklist:
 
 - Configure bearer authentication for inbound SigNoz webhooks
 - Prefer HMAC verification if the deployed SigNoz webhook path supports it
 - Redact webhook URLs in logs
 - Avoid logging full alert payloads by default
-- Add receiver retry limits and optional dead-letter handling
+- Configure management authentication or local users on exposed binds
+- Keep the SQLite data directory durable and writable by the runtime user
+- Keep bounded retry and dead-letter settings appropriate for each receiver
 
 ## Observability
 
@@ -698,11 +726,11 @@ Future metrics:
 - `delivery_failures_total`
 - `delivery_latency_seconds`
 
-## MVP Milestones
+## Implemented Baseline
 
-1. Compile and run with YAML config
-2. Accept real SigNoz webhook payloads
-3. Deliver compact Google Chat card messages
-4. Add route tests and config validation tests
-5. Add inbound auth and request limits
-6. Package as a container image
+The original MVP milestones are complete: YAML config, SigNoz compatibility,
+Google Chat delivery, route/config tests, inbound auth and limits, and a
+non-root container image. The current gateway additionally includes durable
+SQLite delivery, lifecycle state, management users/teams, multiple source and
+receiver families, escalation, notification batching, and black-box binary and
+container tests. Remaining roadmap items are tracked in the PRD and OpenSpec.

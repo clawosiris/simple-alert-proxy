@@ -4,11 +4,23 @@
 
 - id: `alert-webhook-gateway`
 - repo: `clawosiris/simple-alert-proxy`
-- status: `proposed`
+- status: `implemented with follow-up gaps`
+- last_reviewed: `2026-09-26`
 - owner: `Simple Alert`
 - source_prd: `docs/ALERT_WEBHOOK_GATEWAY_PRD.md`
 - scope: evolve the current SigNoz-to-Google-Chat proxy into a compact,
   source-agnostic alert webhook gateway.
+
+This document records the phased implementation plan and its current status.
+For the exact supported API and configuration contract, use
+[SPEC.md](SPEC.md) and the root [README](../README.md).
+
+Phases 0–4 are implemented. Phase 5 includes the planned source presets and
+chat/webhook targets plus Matrix and CloudEvents; ticketing targets remain
+open. Phase 6 includes static YAML schedules, escalation, users, teams, and
+ownership, while external schedules and richer schedule-aware routing remain
+open. Phase 7 currently provides advisory config, storage, API, and UI
+scaffolding only; no provider is invoked and no advisories are generated.
 
 ## Principles
 
@@ -209,8 +221,8 @@ Provide a compact UI for normal alert inspection and intervention.
   presentation.
 - REQ-4.2: The UI SHALL show alert group list, severity/status, title, source,
   event count, last event time, and acknowledgement state.
-- REQ-4.3: The UI SHALL show alert detail, raw payload, normalized event data,
-  route explanation, delivery attempts, and errors.
+- REQ-4.3: The UI SHALL show alert detail, redacted raw payload, normalized
+  event data, route explanation, delivery attempts, and errors.
 - REQ-4.4: The UI SHALL provide ack, resolve, silence, and replay controls.
 - REQ-4.5: The UI SHALL handle mobile and desktop widths without overlapping
   text or controls.
@@ -227,7 +239,7 @@ Provide a compact UI for normal alert inspection and intervention.
 - The UI reads alert groups, events, deliveries, integrations, and routes from
   the Phase 3 APIs.
 - The detail panel includes lifecycle controls for ack, resolve, silence, and
-  delivery replay, plus normalized event JSON and raw payload JSON.
+  delivery replay, plus normalized event JSON and redacted raw payload JSON.
 - Route smoke coverage verifies the UI is served by the Rust binary.
 
 ### Acceptance
@@ -261,8 +273,8 @@ Expand useful integrations after lifecycle correctness is in place.
 
 ### Implementation Notes
 
-- Receiver config supports `generic_webhook`, `slack`, `mattermost`, and
-  `discord` in addition to `google_chat`.
+- Receiver config supports `generic_webhook`, `cloudevents_webhook`, `slack`,
+  `mattermost`, `discord`, and `matrix` in addition to `google_chat`.
 - Non-Google-Chat targets receive canonical alert-event payloads through the
   same durable delivery queue and retry/dead-letter path.
 - Generic JSON integrations validate optional preset names for
@@ -285,7 +297,7 @@ Add delayed routing behavior that reacts to alert lifecycle state.
 - REQ-6.1: The service SHALL define escalation policies with ordered steps,
   delays, and stop conditions.
 - REQ-6.2: Escalation SHALL stop when an alert group is acknowledged or
-  resolved.
+  resolved and the corresponding step stop condition is enabled.
 - REQ-6.3: Routes SHALL be able to select escalation policies.
 - REQ-6.4: Schedules SHOULD initially come from external sources such as
   iCalendar, Google Calendar, CalDAV, GoAlert, or static YAML.
@@ -307,7 +319,8 @@ Add delayed routing behavior that reacts to alert lifecycle state.
 - The escalation worker claims due tasks, executes receiver/webhook/schedule
   receiver steps as delivery records, records deferred user/team steps, and
   schedules the next step.
-- Acknowledge and resolve actions cancel scheduled escalation tasks.
+- Acknowledge and resolve actions cancel scheduled escalation tasks whose
+  matching `stop_on_ack` or `stop_on_resolve` flag is enabled.
 - Static YAML on-call schedules are the initial schedule source, with entries
   targeting exactly one receiver, user, or team. External schedule systems are
   intended to feed the same config shape.
@@ -315,7 +328,8 @@ Add delayed routing behavior that reacts to alert lifecycle state.
 ### Acceptance
 
 - An unacknowledged alert can escalate after a configured delay.
-- Acknowledging before the delay prevents later escalation steps.
+- Acknowledging before the delay prevents later escalation steps configured
+  with `stop_on_ack`.
 - Multiple escalation steps execute in order while the alert remains active.
 
 ## Phase 7: Optional Intelligence
@@ -346,6 +360,7 @@ Add advisory intelligence without making it part of correctness.
   state.
 - The operator UI renders advisories in a separate detail section so suggestions
   do not look canonical.
+- Provider execution and advisory generation are not yet implemented.
 
 ### Acceptance
 
@@ -356,12 +371,16 @@ Add advisory intelligence without making it part of correctness.
 
 - Unit tests for parser, mapping, routing, storage, and target adapters.
 - Integration tests for webhook acceptance through delivery queue creation.
+- Black-box binary tests for real HTTP/HTTPS listeners, restart recovery,
+  retries, replay, startup failure, and signal handling.
+- Non-root Podman tests for image health, mounts, persistent state, TLS, and
+  container shutdown behavior.
 - Config validation tests for invalid auth, missing mappings, and missing
   target secrets.
 - CI must run formatting, linting, tests, and container build checks.
 - Release notes must call out config migrations when they eventually exist.
 
-## Initial Implementation Slices
+## Initial Implementation Slices (Completed)
 
 1. Add canonical alert model and SigNoz-to-canonical conversion helpers.
 2. Add integration config types and validation without changing runtime routing.
