@@ -2,3 +2,5 @@
 /.env
 /config.yaml
 *.log
+__pycache__/
+*.py[cod]

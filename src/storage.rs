@@ -434,7 +434,7 @@ impl Storage {
             r#"
             UPDATE notification_batches
             SET status = 'pending', due_at = ?1, updated_at = ?1
-            WHERE status = 'delivering'
+            WHERE status IN ('pending', 'delivering')
             "#,
             params![now],
         )?;
@@ -442,7 +442,7 @@ impl Storage {
             r#"
             UPDATE delivery_records
             SET status = 'queued', next_retry_at = ?1, updated_at = ?1
-            WHERE status = 'delivering'
+            WHERE status IN ('queued', 'delivering')
               AND id IN (
                   SELECT delivery_record_id FROM notification_batch_members
                   JOIN notification_batches
@@ -453,6 +453,59 @@ impl Storage {
             params![now],
         )?;
         tx.commit()?;
+        Ok(recovered)
+    }
+
+    pub fn recover_deliveries(&self) -> anyhow::Result<Vec<RecoveredDelivery>> {
+        let now = now_epoch_millis();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT delivery_records.id, delivery_records.status,
+                   delivery_records.attempt_count
+            FROM delivery_records
+            LEFT JOIN notification_batch_members
+              ON notification_batch_members.delivery_record_id = delivery_records.id
+            WHERE delivery_records.status IN ('queued', 'delivering', 'retrying')
+              AND notification_batch_members.delivery_record_id IS NULL
+            ORDER BY delivery_records.id ASC
+            "#,
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut recovered = Vec::with_capacity(records.len());
+        for (id, status, attempt_count) in records {
+            let replay = delivery_replay_record(&conn, id)?;
+            let next_attempt = match status.as_str() {
+                "delivering" => attempt_count.max(1),
+                "retrying" => attempt_count.saturating_add(1).max(1),
+                _ => 1,
+            };
+            conn.execute(
+                r#"
+                UPDATE delivery_records
+                SET status = 'queued', next_retry_at = ?2, updated_at = ?2
+                WHERE id = ?1
+                "#,
+                params![id, now],
+            )?;
+            recovered.push(RecoveredDelivery {
+                id,
+                event: replay.event,
+                delivery: replay.delivery,
+                next_attempt,
+            });
+        }
+
         Ok(recovered)
     }
 
@@ -1722,6 +1775,14 @@ pub struct DeliveryRecord {
 pub struct DeliveryReplayRecord {
     pub event: AlertEvent,
     pub delivery: Delivery,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredDelivery {
+    pub id: i64,
+    pub event: AlertEvent,
+    pub delivery: Delivery,
+    pub next_attempt: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -3366,6 +3427,87 @@ mod tests {
         assert_eq!(recovered.id, first.id);
         assert_eq!(recovered.attempt, 2);
         assert_eq!(recovered.members[0].event.fingerprint, "recover");
+    }
+
+    #[test]
+    fn notification_batch_recovery_makes_pending_work_immediately_due() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = test_event("recover-pending", "firing");
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        storage
+            .queue_notification_batch(
+                event_id,
+                &event,
+                &delivery,
+                "recover-pending-batch",
+                NotificationBatchLimits {
+                    group_wait_millis: 60_000,
+                    max_events: 100,
+                    max_payload_bytes: 256 * 1024,
+                },
+            )
+            .unwrap();
+        assert!(storage.claim_due_notification_batch().unwrap().is_none());
+
+        assert_eq!(storage.recover_notification_batches().unwrap(), 1);
+        let recovered = storage.claim_due_notification_batch().unwrap().unwrap();
+        assert_eq!(recovered.members[0].event.fingerprint, "recover-pending");
+    }
+
+    #[test]
+    fn delivery_recovery_requeues_only_unbatched_interrupted_work() {
+        let storage = Storage::open(":memory:").unwrap();
+        let event = test_event("recover-delivery", "firing");
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "ops".to_string(),
+            receiver: "chat".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
+
+        let queued = storage.recover_deliveries().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, delivery_id);
+        assert_eq!(queued[0].event.fingerprint, "recover-delivery");
+        assert_eq!(queued[0].delivery.receiver, "chat");
+        assert_eq!(queued[0].next_attempt, 1);
+
+        storage.mark_attempt(delivery_id, 1).unwrap();
+        let interrupted = storage.recover_deliveries().unwrap();
+        assert_eq!(interrupted[0].next_attempt, 1);
+
+        storage
+            .mark_retrying(delivery_id, now_epoch_millis(), "temporary")
+            .unwrap();
+        let retrying = storage.recover_deliveries().unwrap();
+        assert_eq!(retrying[0].next_attempt, 2);
+
+        let batch_event = test_event("batched", "firing");
+        let batch_event_id = storage.store_event(&batch_event).unwrap();
+        storage
+            .queue_notification_batch(
+                batch_event_id,
+                &batch_event,
+                &delivery,
+                "recover-delivery-batch",
+                NotificationBatchLimits {
+                    group_wait_millis: 60_000,
+                    max_events: 100,
+                    max_payload_bytes: 256 * 1024,
+                },
+            )
+            .unwrap();
+        assert_eq!(storage.recover_deliveries().unwrap().len(), 1);
     }
 
     #[test]
