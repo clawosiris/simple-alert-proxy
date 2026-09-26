@@ -15,7 +15,12 @@ Run the same checks used by CI before opening a pull request:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
+git diff --check
 ```
+
+For documentation-only changes, `git diff --check` is normally sufficient.
+Also run the relevant config tests when examples change. For workflow changes,
+run `actionlint` when it is available locally.
 
 Container changes should also keep this passing:
 
