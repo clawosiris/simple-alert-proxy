@@ -888,7 +888,7 @@ After creating the container-ready `.local/simple-alert-proxy/config.yaml` from
 the Quick Start, build and run a local image:
 
 ```bash
-podman build -t simple-alert-proxy:local .
+podman build --format docker -t simple-alert-proxy:local .
 podman run --rm -p 8080:8080 \
   -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z" \
   -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy/data:Z" \
@@ -975,8 +975,30 @@ it through the unit's `Restart=on-failure` policy.
 
 ```bash
 cargo fmt --check
-cargo test
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
 ```
+
+Black-box tests also exercise the compiled production process and container over
+real HTTP/HTTPS sockets. Run the binary suite with:
+
+```bash
+cargo build --release --locked
+SYSTEM_E2E_BIN=target/release/simple-alert-proxy \
+  python3 -m unittest -v tests.system.test_binary_e2e
+```
+
+Run the production-like non-root Podman suite with:
+
+```bash
+sudo podman build --format docker -t simple-alert-proxy:e2e .
+CONTAINER_ENGINE="sudo podman" \
+CONTAINER_E2E_IMAGE=simple-alert-proxy:e2e \
+  python3 -m unittest -v tests.container.test_container_e2e
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the test-layer boundaries, hermetic
+test guarantees, and failure-artifact behavior.
 
 Current gateway planning and compatibility docs:
 
