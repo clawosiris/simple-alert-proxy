@@ -15,7 +15,7 @@ scheduling, and optional advisory intelligence scaffolding.
 
 - SigNoz compatibility endpoint at `POST /webhooks/signoz`
 - First-class Grafana webhook endpoint support through configured integrations
-- CloudEvents 1.0 structured and binary JSON input
+- CloudEvents 1.0 structured and binary JSON input and outbound delivery
 - Generic JSON integrations at `POST /webhooks/{integration}`
 - Config-only mapping into canonical alert events
 - Routing by status, labels, annotations, or JSON payload fields
@@ -23,20 +23,29 @@ scheduling, and optional advisory intelligence scaffolding.
 - SQLite persistence for alert events, alert groups, deliveries, audit entries,
   escalation tasks, and advisory enrichment
 - Durable delivery queue with bounded retry and dead-letter handling
+- Restart-safe notification batching, retry, dead-letter, and replay behavior
 - Alert groups keyed by integration/tenant namespace plus normalized fingerprint
 - Operator APIs for alert groups, events, deliveries, integrations, and routes
 - Lifecycle actions for acknowledge, resolve, silence, and delivery replay
 - Static operator UI at `/` and `/ui`
-- Optional HTTPS listener with certificate/key paths
-- Optional bearer-token authentication for inbound webhooks and APIs
+- Local users, teams, scoped RBAC, and SQLite-backed operator sessions
+- Optional HTTPS listener with certificate/key files or environment sources
+- Separate optional bearer-token authentication for webhooks and management
 - Request body size limits, receiver timeouts, and redacted stored summaries
 - Config-defined escalation policies with ack/resolve stop conditions
 - Optional intelligence config that is disabled by default and advisory only
+- Black-box binary and non-root container end-to-end test suites
 
 ## Quick Start
 
+The bundled config is container-oriented and stores SQLite under
+`/var/lib/simple-alert-proxy/data`. For a local binary run, copy it and change
+`storage.path` to a writable local path first:
+
 ```bash
-cargo run -- --config examples/config.yaml
+cp examples/config.yaml .local-config.yaml
+# Edit .local-config.yaml: storage.path: "simple-alert-proxy.db"
+cargo run -- --config .local-config.yaml
 ```
 
 To run the published container image, copy the example config first. It already
@@ -158,12 +167,21 @@ from the request.
 
 ### Read APIs
 
+- `POST /auth/login`
+- `POST /auth/logout`
 - `GET /api/alert-groups`
 - `GET /api/alert-events`
 - `GET /api/deliveries`
 - `GET /api/advisories`
 - `GET /api/integrations`
 - `GET /api/routes`
+- `GET /api/me`
+- `GET/POST /api/users`
+- `POST /api/users/{id}/password`
+- `POST /api/users/{id}/disable`
+- `GET/POST /api/teams`
+- `POST /api/team-memberships`
+- `PUT`, `DELETE /api/teams/{team_id}/members/{user_id}`
 
 ### Lifecycle APIs
 
@@ -173,19 +191,23 @@ from the request.
 - `POST /api/deliveries/{id}/replay`
 
 Lifecycle actions update persistent state and write audit entries. Acknowledge
-and resolve actions also cancel scheduled escalation tasks for the alert group.
+and resolve actions cancel scheduled escalation steps whose matching
+`stop_on_ack` or `stop_on_resolve` flag is enabled.
 
-Management APIs use `management.auth.bearer_token` when configured. If that is
-not set, they fall back to `server.auth.bearer_token` for compatibility. Exposed
-non-loopback binds require effective management auth unless
-`management.allow_unauthenticated: true` is set deliberately.
+Management APIs and the UI support local user sessions as well as bearer auth.
+`management.auth.bearer_token` takes precedence; if it is not set, management
+falls back to `server.auth.bearer_token` for compatibility. Exposed non-loopback
+binds require bearer auth, local users, or deliberate
+`management.allow_unauthenticated: true`. `/healthz` is always public.
 
 ## Configuration
 
-See [examples/config.yaml](examples/config.yaml) for a complete working
-configuration and [docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md](docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md)
-for the current implementation plan. [docs/SPEC.md](docs/SPEC.md) still contains
-lower-level API and compatibility notes.
+See [examples/config.yaml](examples/config.yaml) for the complete
+container-oriented example and [docs/SPEC.md](docs/SPEC.md) for the current
+behavioral reference. The
+[product requirements](docs/ALERT_WEBHOOK_GATEWAY_PRD.md) and
+[OpenSpec plan](docs/ALERT_WEBHOOK_GATEWAY_OPENSPEC.md) preserve the design and
+implementation history and identify remaining gaps.
 
 The default SigNoz compatibility path remains `/webhooks/signoz`. Older configs
 can still use `server.webhook_path`; new configs should model SigNoz as a
@@ -208,7 +230,8 @@ management:
   local_users: true
   bootstrap_admin_password_env: "SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD"
   session_ttl_secs: 28800
-  secure_cookies: true
+  # Set true only when TLS terminates at a trusted reverse proxy.
+  # secure_cookies: true
   allow_unauthenticated: false
 
 integrations:
@@ -244,6 +267,12 @@ Session cookies are `HttpOnly` and `SameSite=Lax`. They use the `Secure`
 attribute automatically when native `server.tls` is configured. Set
 `management.secure_cookies: true` when TLS terminates at a trusted reverse proxy
 or ingress in front of the app.
+
+Local passwords must contain at least 12 characters. Five failed logins lock an
+account for 15 minutes. Global roles are `admin`, `operator`, `viewer`, and
+`scoped`; team roles are `owner`, `operator`, and `viewer`. Session-authenticated
+mutations require the `X-CSRF-Token` value returned by `/api/me`. The bearer
+token remains an admin-equivalent emergency path and is not subject to CSRF.
 
 `server.limits.webhook_concurrency` bounds concurrent webhook intake requests.
 `server.limits.management_concurrency` bounds concurrent API, UI, and debug
@@ -319,6 +348,12 @@ receivers:
     type: "generic_webhook"
     webhook_url: "https://alerts.example.test/webhook"
 
+  event-bus:
+    type: "cloudevents_webhook"
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    mode: "structured"
+
   slack-alerts:
     type: "slack"
     webhook_url: "https://hooks.slack.com/services/example"
@@ -346,13 +381,108 @@ and can send messages there. Prefer `access_token_env` over inline
 use the canonical `!room:server` form; room aliases such as `#alerts:server`
 are not resolved.
 
+### Outbound CloudEvents 1.0
+
+Use a distinct `cloudevents_webhook` receiver when the downstream service
+accepts CloudEvents. This does not change the existing `generic_webhook` media
+type or payload contract.
+
+```yaml
+receivers:
+  event-bus:
+    type: cloudevents_webhook
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    mode: structured # structured (default) or binary
+    event_type: "io.github.clawosiris.simple-alert-proxy.alert.v1"
+    batch_type: "io.github.clawosiris.simple-alert-proxy.notification-batch.v1"
+    timeout_secs: 10
+```
+
+`webhook_url` must be an absolute HTTP(S) URL. `source` is required and must be
+a valid URI-reference. The two versioned event types shown above are the
+defaults. Structured mode sends `application/cloudevents+json`; binary mode
+sends the JSON `data` as `application/json` with `ce-*` context headers. Both
+modes represent the same CloudEvent.
+
+For a single alert, the default `data` schema is:
+
+```json
+{
+  "event": {
+    "event_id": "source occurrence identity",
+    "integration": "openvas",
+    "group_namespace": "integration/openvas",
+    "source": "openvas",
+    "received_at": "2026-09-25T18:00:00Z",
+    "status": "firing",
+    "severity": "critical",
+    "title": "TLS certificate expired",
+    "body": null,
+    "labels": {},
+    "annotations": {},
+    "links": [],
+    "starts_at": null,
+    "ends_at": null,
+    "fingerprint": "finding-42",
+    "notification_group_key": null,
+    "instances": []
+  },
+  "delivery": {
+    "route": "default",
+    "receiver": "event-bus",
+    "owner_team": "platform"
+  }
+}
+```
+
+Raw source payloads are deliberately excluded. A durable notification batch is
+one `notification-batch.v1` CloudEvent—not CloudEvents batch format and not one
+request per member—with `data` shaped as
+`{batch: {group_key, count, severity_counts}, events: [...], delivery: {...}}`.
+The `events` entries use the same normalized, raw-free fields shown above. Even
+a one-member durable batch uses the batch event type and schema.
+
+The CloudEvents `id` identifies the outbound delivery. It stays stable across
+automatic retries and durable batch recovery, differs across routes/receivers,
+and is renewed by an explicit replay. Source occurrence `event_id` remains in
+`data`; lifecycle identity is carried by `subject` as the percent-encoded
+`group_namespace` plus `fingerprint`. Batch `subject` carries the persisted
+notification `group_key`. `time` uses the stable canonical `received_at` value
+(the primary member for a batch) when present. Extensions expose `route`,
+`receiver`, `status`, `severity`, `integration`, and string `batched` metadata.
+
+`template.payload` on this receiver replaces only `data`; `specversion`, `id`,
+`source`, `type`, `subject`, `time`, and extensions remain controlled by the
+delivery system:
+
+```yaml
+receivers:
+  event-bus:
+    type: cloudevents_webhook
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    template:
+      payload: |-
+        {
+          "summary": {{ alert.title | tojson }},
+          "severity": {{ alert.severity | tojson }},
+          "route": {{ delivery.route | tojson }}
+        }
+```
+
+CloudEvents JSON batch format, the separate HTTP Webhook profile, arbitrary
+headers/auth, request signing, and inbound-to-outbound envelope mirroring are
+not supported by this receiver.
+
 ### Notification templates
 
 All receivers support guarded MiniJinja 2.x templates. Google Chat, Slack,
 Mattermost, Discord, and Matrix accept a standard `template.title` /
-`template.body` mode. Generic webhooks accept `template.payload`; every other
-receiver can also use payload mode when its complete platform JSON body must be
-controlled.
+`template.body` mode. Generic webhooks accept `template.payload` as their
+complete body. CloudEvents webhooks accept `template.payload` as event `data`
+only; every other receiver can use payload mode to control its complete
+platform JSON body.
 
 ```yaml
 receivers:
@@ -404,8 +534,9 @@ Templates are compiled once at startup with strict undefined values, a 64 KiB
 source limit, a fixed recursion limit, and a per-render instruction budget.
 Rendered titles are limited to 4 KiB. Final payload limits are 32 KiB for
 Google Chat, 40 KiB for Slack/Mattermost, 16 KiB for Discord, 64 KiB for
-Matrix, and 256 KiB for generic webhooks. Standard Google Chat and Matrix modes
-escape alert-controlled text before placing it in HTML-bearing fields.
+Matrix, and 256 KiB for generic-webhook bodies and complete encoded CloudEvents.
+Standard Google Chat and Matrix modes escape alert-controlled text before
+placing it in HTML-bearing fields.
 
 Payload templates must render a JSON object. Minimal target-shape validation
 requires `text` or `cardsV2` for Google Chat, `text` or `blocks` for
@@ -465,6 +596,9 @@ intelligence:
   enabled: false
   allow_lifecycle_mutation: false
 ```
+
+This release provides the config, storage, API, and UI scaffolding for advisory
+records. It does not call an intelligence provider or generate advisories.
 
 ## Input Setup
 
@@ -720,7 +854,9 @@ letters are applied to every member.
 
 `alert_grouping` and `debounce_millis` remain accepted as legacy aliases. A
 generic-webhook batch with one event keeps the existing `{event, delivery}`
-schema; multi-event batches use `{batch, events, delivery}`.
+schema; multi-event batches use `{batch, events, delivery}`. A CloudEvents
+receiver always preserves the durable boundary: any notification batch,
+including one member, is one `notification-batch.v1` CloudEvent.
 
 Notification batches are separate from lifecycle `AlertGroup` records. The
 latter remain keyed by canonical group namespace plus source fingerprint and
@@ -784,7 +920,7 @@ After creating the container-ready `.local/simple-alert-proxy/config.yaml` from
 the Quick Start, build and run a local image:
 
 ```bash
-podman build -t simple-alert-proxy:local .
+podman build --format docker -t simple-alert-proxy:local .
 podman run --rm -p 8080:8080 \
   -v "$PWD/.local/simple-alert-proxy/config.yaml:/etc/simple-alert-proxy/config.yaml:ro,Z" \
   -v "$PWD/.local/simple-alert-proxy/data:/var/lib/simple-alert-proxy/data:Z" \
@@ -837,8 +973,9 @@ Set `SIMPLE_ALERT_PROXY_TLS_CERT_FILE` and
 real host-side source paths. On startup, the helper copies them into
 `/etc/simple-alert-proxy/tls.crt` and `/etc/simple-alert-proxy/tls.key` with
 ownership and permissions that allow the containerized service to read them.
-Set `SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD` there as well for first-run
-WebUI admin creation:
+The Quadlet also forwards this environment file into the container. Set
+`SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD` there for first-run WebUI admin
+creation:
 
 ```ini
 SIMPLE_ALERT_PROXY_BOOTSTRAP_ADMIN_PASSWORD=change-this-long-password
@@ -871,8 +1008,30 @@ it through the unit's `Restart=on-failure` policy.
 
 ```bash
 cargo fmt --check
-cargo test
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
 ```
+
+Black-box tests also exercise the compiled production process and container over
+real HTTP/HTTPS sockets. Run the binary suite with:
+
+```bash
+cargo build --release --locked
+SYSTEM_E2E_BIN=target/release/simple-alert-proxy \
+  python3 -m unittest -v tests.system.test_binary_e2e
+```
+
+Run the production-like non-root Podman suite with:
+
+```bash
+sudo podman build --format docker -t simple-alert-proxy:e2e .
+CONTAINER_ENGINE="sudo podman" \
+CONTAINER_E2E_IMAGE=simple-alert-proxy:e2e \
+  python3 -m unittest -v tests.container.test_container_e2e
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the test-layer boundaries, hermetic
+test guarantees, and failure-artifact behavior.
 
 Current gateway planning and compatibility docs:
 

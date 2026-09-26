@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 mod alert;
 mod cloudevents;
+mod cloudevents_outbound;
 mod config;
 mod google_chat;
 mod grafana;
@@ -55,7 +56,7 @@ use crate::{
     routing::{Delivery, RouteEngine},
     storage::{
         AuditActor, ClaimedNotificationBatch, DisableUserOutcome, NotificationBatchLimits,
-        SessionUserRecord, Storage, TeamMembershipRecord, UserRecord,
+        RecoveredDelivery, SessionUserRecord, Storage, TeamMembershipRecord, UserRecord,
     },
 };
 
@@ -187,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
     info!(%bind_addr, %webhook_path, tls = config.server.tls.is_some(), "starting simple-alert-proxy");
 
     if let Some(tls_config) = &config.server.tls {
-        tls::serve_tls(bind_addr, app, tls_config).await?;
+        tls::serve_tls(bind_addr, app, tls_config, shutdown_signal()).await?;
     } else {
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         axum::serve(
@@ -214,6 +215,7 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
             "recovered interrupted notification batches"
         );
     }
+    let recovered_deliveries = storage.recover_deliveries()?;
     let pruned_alerts = storage.prune_alerts_older_than_days(config.storage.retention_days)?;
     if pruned_alerts > 0 {
         info!(
@@ -234,6 +236,9 @@ fn build_app(config: Arc<AppConfig>, webhook_path: String) -> anyhow::Result<Rou
     };
     start_notification_batch_worker(state.clone());
     start_escalation_worker(state.clone());
+    for recovered in recovered_deliveries {
+        start_recovered_delivery(&state, recovered)?;
+    }
 
     let health = Router::new().route("/healthz", post(healthz).get(healthz));
     let mut webhooks = Router::new().route("/webhooks/{*integration}", post(handle_webhook));
@@ -406,7 +411,7 @@ async fn send_notification_batch(
             .map(|member| member.event.clone())
             .collect(),
     );
-    let matrix_transaction_id = format!("simple-alert-proxy-batch-{}", claimed.id);
+    let delivery_idempotency_key = format!("simple-alert-proxy-batch-{}", claimed.id);
     let debug = state.config.debug.log_alerts.then_some(DebugDeliveryLog {
         route_name: claimed.delivery.route_name.as_str(),
         receiver_name: claimed.delivery.receiver.as_str(),
@@ -417,7 +422,7 @@ async fn send_notification_batch(
             receiver,
             &batch,
             &claimed.delivery,
-            &matrix_transaction_id,
+            &delivery_idempotency_key,
             debug,
         )
         .await
@@ -1353,43 +1358,16 @@ fn queue_target_event_delivery(
 ) -> Result<(), WebhookError> {
     let delivery_id = state.storage.queue_delivery(alert_event_id, &delivery)?;
     queue_escalation_if_configured(state, alert_event_id, &delivery)?;
-    let worker = DeliveryWorker::new(
-        state.storage.clone(),
-        state.config.delivery.clone(),
-        state.config.debug.log_alerts,
+    let delivery_idempotency_key = format!("simple-alert-proxy-{delivery_id}");
+    spawn_delivery_worker(
+        state,
+        delivery_id,
+        event.clone(),
+        receiver.clone(),
+        delivery,
+        delivery_idempotency_key,
+        1,
     );
-    let target_client = state.target_client.clone();
-    let receiver = receiver.clone();
-    let event = event.clone();
-    let matrix_transaction_id = format!("simple-alert-proxy-{delivery_id}");
-
-    tokio::spawn(async move {
-        worker
-            .run(delivery_id, move |debug_enabled| {
-                let target_client = target_client.clone();
-                let receiver = receiver.clone();
-                let event = event.clone();
-                let delivery = delivery.clone();
-                let matrix_transaction_id = matrix_transaction_id.clone();
-                async move {
-                    let debug = debug_enabled.then_some(DebugDeliveryLog {
-                        route_name: delivery.route_name.as_str(),
-                        receiver_name: delivery.receiver.as_str(),
-                    });
-                    target_client
-                        .send_receiver_event(
-                            &receiver,
-                            &event,
-                            &delivery,
-                            &matrix_transaction_id,
-                            debug,
-                        )
-                        .await
-                        .map_err(redacted_delivery_error)
-                }
-            })
-            .await;
-    });
 
     Ok(())
 }
@@ -1406,23 +1384,73 @@ fn spawn_replayed_delivery(
         .get(&delivery.receiver)
         .with_context(|| format!("replay receiver {} is not configured", delivery.receiver))?
         .clone();
+    let delivery_idempotency_key =
+        format!("simple-alert-proxy-{delivery_id}-replay-{}", Uuid::new_v4());
+    spawn_delivery_worker(
+        state,
+        delivery_id,
+        event,
+        receiver,
+        delivery,
+        delivery_idempotency_key,
+        1,
+    );
+
+    Ok(())
+}
+
+fn start_recovered_delivery(state: &AppState, recovered: RecoveredDelivery) -> anyhow::Result<()> {
+    let receiver = state
+        .config
+        .receivers
+        .get(&recovered.delivery.receiver)
+        .with_context(|| {
+            format!(
+                "recovered delivery receiver {} is not configured",
+                recovered.delivery.receiver
+            )
+        })?
+        .clone();
+    info!(
+        delivery_id = recovered.id,
+        next_attempt = recovered.next_attempt,
+        "recovered interrupted delivery"
+    );
+    spawn_delivery_worker(
+        state,
+        recovered.id,
+        recovered.event,
+        receiver,
+        recovered.delivery,
+        format!("simple-alert-proxy-{}", recovered.id),
+        recovered.next_attempt,
+    );
+    Ok(())
+}
+
+fn spawn_delivery_worker(
+    state: &AppState,
+    delivery_id: i64,
+    event: AlertEvent,
+    receiver: ReceiverConfig,
+    delivery: Delivery,
+    delivery_idempotency_key: String,
+    first_attempt: u32,
+) {
     let worker = DeliveryWorker::new(
         state.storage.clone(),
         state.config.delivery.clone(),
         state.config.debug.log_alerts,
     );
     let target_client = state.target_client.clone();
-    let matrix_transaction_id =
-        format!("simple-alert-proxy-{delivery_id}-replay-{}", Uuid::new_v4());
-
     tokio::spawn(async move {
         worker
-            .run(delivery_id, move |debug_enabled| {
+            .run_from(delivery_id, first_attempt, move |debug_enabled| {
                 let target_client = target_client.clone();
                 let receiver = receiver.clone();
                 let event = event.clone();
                 let delivery = delivery.clone();
-                let matrix_transaction_id = matrix_transaction_id.clone();
+                let delivery_idempotency_key = delivery_idempotency_key.clone();
                 async move {
                     let debug = debug_enabled.then_some(DebugDeliveryLog {
                         route_name: delivery.route_name.as_str(),
@@ -1433,7 +1461,7 @@ fn spawn_replayed_delivery(
                             &receiver,
                             &event,
                             &delivery,
-                            &matrix_transaction_id,
+                            &delivery_idempotency_key,
                             debug,
                         )
                         .await
@@ -1442,8 +1470,6 @@ fn spawn_replayed_delivery(
             })
             .await;
     });
-
-    Ok(())
 }
 
 fn queue_escalation_if_configured(
@@ -1486,14 +1512,30 @@ impl DeliveryWorker {
         }
     }
 
+    #[cfg(test)]
     async fn run<F, Fut>(&self, delivery_id: i64, mut send: F)
     where
         F: FnMut(bool) -> Fut,
         Fut: std::future::Future<Output = Result<(), DeliveryFailure>>,
     {
-        let mut backoff = Duration::from_millis(self.config.initial_backoff_millis);
+        self.run_from(delivery_id, 1, &mut send).await;
+    }
 
-        for attempt in 1..=self.config.max_attempts {
+    async fn run_from<F, Fut>(&self, delivery_id: i64, first_attempt: u32, mut send: F)
+    where
+        F: FnMut(bool) -> Fut,
+        Fut: std::future::Future<Output = Result<(), DeliveryFailure>>,
+    {
+        let first_attempt = first_attempt.max(1);
+        let exponent = first_attempt.saturating_sub(1).min(31);
+        let mut backoff = Duration::from_millis(
+            self.config
+                .initial_backoff_millis
+                .saturating_mul(1_u64 << exponent)
+                .min(self.config.max_backoff_millis),
+        );
+
+        for attempt in first_attempt..=self.config.max_attempts {
             if let Err(error) = self.storage.mark_attempt(delivery_id, attempt) {
                 error!(%error, delivery_id, "failed to mark delivery attempt");
             }
@@ -1558,12 +1600,27 @@ impl DeliveryFailure {
 fn redacted_delivery_error(error: google_chat::GoogleChatError) -> DeliveryFailure {
     match error {
         google_chat::GoogleChatError::Rejected(status) => {
-            DeliveryFailure::retryable(format!("target rejected delivery with status {status}"))
+            let message = format!("target rejected delivery with status {status}");
+            if status.is_client_error()
+                && !matches!(
+                    status,
+                    reqwest::StatusCode::REQUEST_TIMEOUT
+                        | reqwest::StatusCode::TOO_EARLY
+                        | reqwest::StatusCode::TOO_MANY_REQUESTS
+                )
+            {
+                DeliveryFailure::permanent(message)
+            } else {
+                DeliveryFailure::retryable(message)
+            }
         }
         google_chat::GoogleChatError::Config(_) => {
             DeliveryFailure::permanent("target configuration failed")
         }
         google_chat::GoogleChatError::Template(error) => {
+            DeliveryFailure::permanent(error.to_string())
+        }
+        google_chat::GoogleChatError::CloudEvents(error) => {
             DeliveryFailure::permanent(error.to_string())
         }
         google_chat::GoogleChatError::Http(_) => {
@@ -2043,7 +2100,21 @@ fn delivery_summary(receivers: &[String]) -> Value {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2104,12 +2175,13 @@ mod tests {
     use super::*;
     use crate::config::{
         AlertMappingConfig, AuthConfig, BuiltinIntegrationConfig, ChatWebhookReceiverConfig,
-        CloudEventsIntegrationConfig, DebugConfig, DeliveryConfig, EscalationConfig,
-        EscalationPolicyConfig, EscalationStepConfig, GenericJsonIntegrationConfig,
-        GenericWebhookReceiverConfig, GoogleChatReceiverConfig, IntegrationConfig,
-        IntelligenceConfig, ManagementConfig, MatrixReceiverConfig, NotificationBatchingConfig,
-        NotificationTemplateConfig, ReceiverConfig, RoutingConfig, ScheduleConfig, ServerConfig,
-        ServerLimitsConfig, StorageConfig,
+        CloudEventsIntegrationConfig, CloudEventsWebhookMode, CloudEventsWebhookReceiverConfig,
+        DebugConfig, DeliveryConfig, EscalationConfig, EscalationPolicyConfig,
+        EscalationStepConfig, GenericJsonIntegrationConfig, GenericWebhookReceiverConfig,
+        GoogleChatReceiverConfig, IntegrationConfig, IntelligenceConfig, ManagementConfig,
+        MatrixReceiverConfig, NotificationBatchingConfig, NotificationTemplateConfig,
+        ReceiverConfig, RoutingConfig, ScheduleConfig, ServerConfig, ServerLimitsConfig,
+        StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -4213,6 +4285,28 @@ mod tests {
         assert_eq!(storage.delivery_attempts().unwrap(), vec![1]);
     }
 
+    #[test]
+    fn receiver_status_classification_retries_only_transient_responses() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_EARLY,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let failure = redacted_delivery_error(google_chat::GoogleChatError::Rejected(status));
+            assert!(!failure.permanent, "expected {status} to be retryable");
+        }
+
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::NOT_FOUND,
+        ] {
+            let failure = redacted_delivery_error(google_chat::GoogleChatError::Rejected(status));
+            assert!(failure.permanent, "expected {status} to be permanent");
+        }
+    }
+
     #[tokio::test]
     async fn grouped_google_chat_delivery_dead_letters_when_flush_fails() {
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -4770,6 +4864,303 @@ mod tests {
         let received = received.lock().unwrap();
         assert_eq!(received[0]["event"]["fingerprint"], "target-1");
         assert_eq!(received[0]["delivery"]["receiver"], "generic-target");
+    }
+
+    #[tokio::test]
+    async fn cloudevents_webhook_sends_structured_event_with_templated_data() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_cloudevents(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.enabled = false;
+        config.routing.default_receiver = Some("event-bus".to_string());
+        config.routing.routes.clear();
+        config.integrations = generic_test_integrations();
+        config.receivers.insert(
+            "event-bus".to_string(),
+            cloudevents_receiver(
+                webhook_url,
+                CloudEventsWebhookMode::Structured,
+                Some(NotificationTemplateConfig {
+                    payload: Some(
+                        r#"{"summary": {{ alert.title | tojson }}, "route": {{ delivery.route | tojson }}}"#
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                }),
+            ),
+        );
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "risk": { "level": "critical" },
+                "finding": {
+                    "id": "outbound-ce-1",
+                    "title": "CloudEvents target alert",
+                    "plugin": "test"
+                },
+                "secret": "must-not-leave-the-proxy"
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 1).await;
+        wait_for_succeeded_deliveries(app.clone(), 1).await;
+        let deliveries = get_api_json(app, "/api/deliveries").await;
+        let delivery_id = deliveries[0]["id"].as_i64().unwrap();
+        let received = received.lock().unwrap();
+        assert_eq!(received[0]["content_type"], "application/cloudevents+json");
+        let envelope = &received[0]["envelope"];
+        assert_eq!(envelope["specversion"], "1.0");
+        assert_eq!(envelope["type"], config::DEFAULT_CLOUDEVENTS_ALERT_TYPE);
+        assert_eq!(envelope["source"], "urn:simple-alert-proxy:test");
+        assert_eq!(envelope["id"], format!("simple-alert-proxy-{delivery_id}"));
+        assert_eq!(
+            envelope["subject"],
+            "alert-group/integration%2Fopenvas/outbound-ce-1"
+        );
+        assert_eq!(envelope["batched"], "false");
+        assert_eq!(envelope["data"]["summary"], "CloudEvents target alert");
+        assert_eq!(envelope["data"]["route"], "default");
+        assert!(envelope["data"].get("event").is_none());
+        assert!(!received[0].to_string().contains("must-not-leave-the-proxy"));
+    }
+
+    #[tokio::test]
+    async fn cloudevents_binary_retries_reuse_id_and_replay_renews_it() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_retrying_mock_cloudevents(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.management.allow_unauthenticated = true;
+        config.notification_batching.enabled = false;
+        config.delivery = DeliveryConfig {
+            max_attempts: 2,
+            initial_backoff_millis: 1,
+            max_backoff_millis: 1,
+        };
+        config.routing.default_receiver = Some("event-bus".to_string());
+        config.routing.routes.clear();
+        config.integrations = generic_test_integrations();
+        config.receivers.insert(
+            "event-bus".to_string(),
+            cloudevents_receiver(webhook_url, CloudEventsWebhookMode::Binary, None),
+        );
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "risk": { "level": "high" },
+                "finding": {
+                    "id": "outbound-ce-retry",
+                    "title": "Retry CloudEvents target",
+                    "plugin": "test"
+                }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 2).await;
+        wait_for_succeeded_deliveries(app.clone(), 1).await;
+
+        let deliveries = get_api_json(app.clone(), "/api/deliveries").await;
+        let delivery_id = deliveries[0]["id"].as_i64().unwrap();
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/deliveries/{delivery_id}/replay"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 3).await;
+
+        let received = received.lock().unwrap();
+        assert_eq!(received[0]["content_type"], "application/json");
+        let initial_id = received[0]["envelope"]["id"].as_str().unwrap();
+        let retry_id = received[1]["envelope"]["id"].as_str().unwrap();
+        let replay_id = received[2]["envelope"]["id"].as_str().unwrap();
+        assert_eq!(initial_id, retry_id);
+        assert_ne!(initial_id, replay_id);
+        assert!(replay_id.starts_with(&format!("simple-alert-proxy-{delivery_id}-replay-")));
+        assert_eq!(received[0]["ce_id"], initial_id);
+        assert_eq!(received[0]["ce_specversion"], "1.0");
+        assert_eq!(
+            received[0]["envelope"]["data"]["event"]["fingerprint"],
+            "outbound-ce-retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudevents_recovery_reuses_the_persisted_delivery_id() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_cloudevents(Arc::clone(&received)).await;
+        let db_path = std::env::temp_dir().join(format!(
+            "simple-alert-proxy-cloudevents-recovery-{}.db",
+            Uuid::new_v4().as_simple()
+        ));
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.management.allow_unauthenticated = true;
+        config.storage.path = db_path.to_string_lossy().to_string();
+        config.notification_batching.enabled = false;
+        config.routing.default_receiver = Some("event-bus".to_string());
+        config.routing.routes.clear();
+        config.integrations = generic_test_integrations();
+        config.receivers.insert(
+            "event-bus".to_string(),
+            cloudevents_receiver(webhook_url, CloudEventsWebhookMode::Structured, None),
+        );
+
+        let storage = Storage::open(&config.storage.path).unwrap();
+        let event = AlertEvent::new(
+            "openvas",
+            "openvas",
+            "firing",
+            "high",
+            "Recover CloudEvents target",
+            "outbound-ce-recovery",
+            serde_json::json!({}),
+        );
+        let event_id = storage.store_event(&event).unwrap();
+        let delivery = Delivery {
+            route_name: "default".to_string(),
+            receiver: "event-bus".to_string(),
+            owner_team: None,
+            escalation_policy: None,
+            group_by: Vec::new(),
+        };
+        let delivery_id = storage.queue_delivery(event_id, &delivery).unwrap();
+        drop(storage);
+
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        wait_for_received_count(&received, 1).await;
+        wait_for_succeeded_deliveries(app, 1).await;
+
+        let received = received.lock().unwrap();
+        assert_eq!(
+            received[0]["envelope"]["id"],
+            format!("simple-alert-proxy-{delivery_id}")
+        );
+        assert_eq!(
+            received[0]["envelope"]["data"]["event"]["fingerprint"],
+            "outbound-ce-recovery"
+        );
+        drop(received);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn cloudevents_durable_batches_stay_single_batch_events() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_cloudevents(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.group_wait_millis = 30;
+        config.routing.default_receiver = Some("event-bus".to_string());
+        config.routing.routes.clear();
+        config.integrations = generic_test_integrations();
+        let IntegrationConfig::GenericJson(integration) =
+            config.integrations.get_mut("openvas").unwrap()
+        else {
+            panic!("expected generic integration")
+        };
+        integration.mapping.notification_group_key = Some("group.id".to_string());
+        config.receivers.insert(
+            "event-bus".to_string(),
+            cloudevents_receiver(webhook_url, CloudEventsWebhookMode::Structured, None),
+        );
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        for fingerprint in ["batch-one", "batch-two"] {
+            let response = app
+                .clone()
+                .oneshot(generic_request(serde_json::json!({
+                    "state": "firing",
+                    "group": { "id": "multi" },
+                    "risk": { "level": "high" },
+                    "finding": {
+                        "id": fingerprint,
+                        "title": "CloudEvents batch member",
+                        "plugin": "test"
+                    }
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+        wait_for_received_count(&received, 1).await;
+
+        let response = app
+            .clone()
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "group": { "id": "single" },
+                "risk": { "level": "warning" },
+                "finding": {
+                    "id": "batch-single",
+                    "title": "One-member CloudEvents batch",
+                    "plugin": "test"
+                }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 2).await;
+        wait_for_succeeded_deliveries(app, 3).await;
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        let multi = received
+            .iter()
+            .find(|event| {
+                event["envelope"]["data"]["events"][0]["notification_group_key"] == "multi"
+            })
+            .unwrap();
+        let single = received
+            .iter()
+            .find(|event| {
+                event["envelope"]["data"]["events"][0]["notification_group_key"] == "single"
+            })
+            .unwrap();
+        for event in [multi, single] {
+            assert_eq!(
+                event["envelope"]["type"],
+                config::DEFAULT_CLOUDEVENTS_BATCH_TYPE
+            );
+            assert_eq!(event["envelope"]["batched"], "true");
+            assert!(
+                event["envelope"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("simple-alert-proxy-batch-")
+            );
+        }
+        assert_eq!(multi["envelope"]["data"]["batch"]["count"], 2);
+        assert_eq!(
+            multi["envelope"]["data"]["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(single["envelope"]["data"]["batch"]["count"], 1);
+        assert_eq!(
+            single["envelope"]["data"]["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -5764,6 +6155,96 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}/chat")
+    }
+
+    fn cloudevents_receiver(
+        webhook_url: String,
+        mode: CloudEventsWebhookMode,
+        template: Option<NotificationTemplateConfig>,
+    ) -> ReceiverConfig {
+        ReceiverConfig::CloudEventsWebhook(CloudEventsWebhookReceiverConfig {
+            webhook_url,
+            source: "urn:simple-alert-proxy:test".to_string(),
+            mode,
+            event_type: config::DEFAULT_CLOUDEVENTS_ALERT_TYPE.to_string(),
+            batch_type: config::DEFAULT_CLOUDEVENTS_BATCH_TYPE.to_string(),
+            owner_team: None,
+            timeout_secs: 10,
+            template,
+        })
+    }
+
+    fn captured_cloudevent(headers: &HeaderMap, body: &[u8]) -> Value {
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let ce_id = headers.get("ce-id").and_then(|value| value.to_str().ok());
+        let ce_specversion = headers
+            .get("ce-specversion")
+            .and_then(|value| value.to_str().ok());
+        let decoded = cloudevents::decode(headers, body).unwrap();
+        serde_json::json!({
+            "content_type": content_type,
+            "ce_id": ce_id,
+            "ce_specversion": ce_specversion,
+            "envelope": decoded.envelope,
+        })
+    }
+
+    async fn spawn_mock_cloudevents(received: Arc<Mutex<Vec<Value>>>) -> String {
+        let app = Router::new()
+            .route(
+                "/events",
+                post(
+                    |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
+                        received
+                            .lock()
+                            .unwrap()
+                            .push(captured_cloudevent(&headers, &body));
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(received);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/events")
+    }
+
+    async fn spawn_retrying_mock_cloudevents(received: Arc<Mutex<Vec<Value>>>) -> String {
+        let app = Router::new()
+            .route(
+                "/events",
+                post(
+                    |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
+                        let attempt = {
+                            let mut received = received.lock().unwrap();
+                            received.push(captured_cloudevent(&headers, &body));
+                            received.len()
+                        };
+                        if attempt == 1 {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .with_state(received);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/events")
     }
 
     async fn spawn_mock_matrix(received: Arc<Mutex<Vec<Value>>>) -> String {

@@ -1,7 +1,7 @@
 # Compatibility Baseline
 
-This file names the behavior that the mainline alert webhook gateway must
-preserve while integrations, storage, lifecycle APIs, and UI work continue.
+This file names the stable behavior that the mainline alert webhook gateway
+must preserve as new integrations and operational features are added.
 
 ## SigNoz Compatibility Integration
 
@@ -36,4 +36,21 @@ new configs should represent SigNoz under `integrations`.
 | Google Chat payload | Card payload keeps status, severity counts, source link, and instance rows. | Google Chat module tests |
 | Grouping | Same-payload and separate-webhook alerts with the same `ruleId` are grouped into one notification with separate instances. | `groups_incoming_alerts_by_rule_id_before_delivery`, `groups_separate_webhooks_by_rule_id_before_delivery`, `groups_separate_webhooks_by_group_labels_rule_id` |
 | TLS config | File/env TLS source validation remains accepted and rejects ambiguous config. | config module TLS tests |
-| Debug logging | Incoming/outgoing debug payload logging remains gated by `debug.log_alerts`; receiver webhook URLs are not included in outgoing debug logs. | docs contract plus existing debug code path |
+| Debug logging | Incoming/outgoing debug payload logging remains gated by `debug.log_alerts`; receiver webhook URLs are not included in outgoing debug logs. | `debug_webhook_logs_payload_with_bearer_token`, redaction and receiver tests |
+
+## Process And Container Coverage
+
+The binary system suite starts the production release binary over real HTTP and
+HTTPS sockets. It covers intake, auth, local-user sessions and CSRF, routing,
+SQLite persistence, receiver delivery, restart recovery, retry/dead-letter,
+replay, health, invalid startup config, and graceful shutdown.
+
+The container suite builds and runs the production image with Podman. It checks
+the non-root runtime user, mounted config/data/TLS files, image health, receiver
+delivery, persistence across replacement containers, invalid config, and signal
+handling. These suites complement the in-process compatibility tests; they do
+not contact public receiver services.
+
+Issue #86 tracks a future readable BDD layer for business scenarios at the
+in-process application boundary. It does not replace the process/container
+coverage above.

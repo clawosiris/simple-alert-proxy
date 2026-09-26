@@ -65,6 +65,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           image="$(echo "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
           sudo podman build \
+            --format docker \
             --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=${version}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \

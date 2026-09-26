@@ -20,6 +20,14 @@ operate. It should avoid becoming a broad AIOps workbench like Keep.
 For a phased implementation plan, see
 [ALERT_WEBHOOK_GATEWAY_OPENSPEC.md](ALERT_WEBHOOK_GATEWAY_OPENSPEC.md).
 
+> **Status (2026-09-26):** This PRD records the accepted product direction and
+> design history. It is not the exact API/configuration contract; use
+> [SPEC.md](SPEC.md) and the root [README](../README.md) for that. The core
+> gateway, lifecycle, UI, chat/webhook receivers, static escalation, local
+> users/teams, and black-box process/container tests are implemented. Ticketing
+> targets, external schedules, provider-backed intelligence, and multi-node
+> storage remain future work.
+
 ## Problem
 
 Teams use multiple systems that can generate alerts through webhooks, for
@@ -207,7 +215,8 @@ Routes should support matching on:
 - raw payload fields
 - alert group state
 - time windows
-- future user/group/on-duty state
+- user/team ownership
+- future on-duty state and maintenance windows
 
 ### Target
 
@@ -219,7 +228,9 @@ Initial targets:
 - Slack
 - Mattermost
 - Discord
+- Matrix
 - generic webhook
+- CloudEvents 1.0 webhook
 
 Later targets:
 
@@ -252,7 +263,7 @@ Expected fields:
 
 ### Escalation Policy
 
-A future ordered set of notification steps with delays and stop conditions.
+An ordered set of notification steps with delays and per-step stop conditions.
 
 Example concepts:
 
@@ -263,16 +274,17 @@ Example concepts:
 
 ### Schedule
 
-A future user/group availability source.
+A user/group availability source. Static YAML schedules are implemented;
+external schedule sources remain future work.
 
-The first implementation should prefer external calendars or existing schedule
-systems rather than owning a complete scheduling product. Possible sources:
+Static YAML is the first implementation. The project should prefer external
+calendars or existing schedule systems over owning a complete scheduling
+product. Possible future sources include:
 
 - iCalendar feeds
 - Google Calendar
 - CalDAV
 - GoAlert
-- static YAML schedule for development and small teams
 
 ## Alert Lifecycle
 
@@ -314,33 +326,33 @@ Ack side effects:
 Mapping support is a core feature and should be available before adding many
 hardcoded source integrations.
 
-The first mapping implementation should be declarative and config-driven.
-Templates can be based on a small, well-supported expression/template engine.
-Avoid making users write Rust for simple payload transformations.
+The mapping implementation is declarative and config-driven. It uses dotted
+paths or JSON pointers rather than a general expression language. Outbound
+notification formatting separately uses guarded MiniJinja templates. Avoid
+making users write Rust for simple payload transformations.
 
 Example:
 
 ```yaml
 integrations:
   openobserve-prod:
-    type: webhook
+    type: generic_json
     path: /webhooks/openobserve/prod
     auth:
-      bearer_token: ${OPENOBSERVE_WEBHOOK_TOKEN}
-    mapping:
-      source: openobserve
-      title: "{{ body.alert_name }}"
-      body: "{{ body.message }}"
-      severity: "{{ body.severity | lower }}"
-      status: "{{ body.status | lower }}"
-      starts_at: "{{ body.starts_at }}"
-      fingerprint: "{{ body.org }}/{{ body.stream }}/{{ body.alert_name }}/{{ body.labels.instance }}"
-      labels:
-        service: "{{ body.labels.service }}"
-        environment: "{{ body.labels.env }}"
-        instance: "{{ body.labels.instance }}"
-      annotations:
-        runbook_url: "{{ body.annotations.runbook_url }}"
+      bearer_token: replace-me
+    source: openobserve
+    title: "alert_name"
+    body: "message"
+    severity: "severity"
+    status: "status"
+    starts_at: "starts_at"
+    fingerprint: "fingerprint"
+    labels:
+      service: "labels.service"
+      environment: "labels.env"
+      instance: "labels.instance"
+    annotations:
+      runbook_url: "annotations.runbook_url"
 ```
 
 Later, add plugin mappers for complex cases:
@@ -363,12 +375,16 @@ MVP routing:
 - send to one or more targets
 - route by normalized fields and raw payload fields
 
-Future routing:
+Implemented extensions:
 
 - route to escalation policy
-- route based on group state, such as unacknowledged duration
 - route based on user/group ownership
-- route based on schedule or external calendar
+- route escalation steps through a static schedule
+
+Future routing:
+
+- route based on group state, such as unacknowledged duration
+- route based on an external calendar
 - route based on maintenance windows
 - route state-change events, not only new alerts
 
@@ -387,8 +403,9 @@ Requirements:
 - avoid logging full secrets or webhook URLs
 - keep target-specific response summaries for troubleshooting
 
-SQLite is acceptable for an early single-node deployment. Postgres should be
-available before positioning this as production-ready for teams.
+SQLite is the supported durable store for production single-node deployments.
+A networked store such as Postgres would be required before multi-node or
+high-availability deployment is supported.
 
 ## Dedupe
 
@@ -446,21 +463,28 @@ Later views:
 
 ## API Requirements
 
-Initial API:
+Current API families:
 
 - `GET /healthz`
 - `POST /webhooks/{integration}`
-- `GET /api/alerts`
-- `GET /api/alerts/{group_id}`
-- `POST /api/alerts/{group_id}/ack`
-- `POST /api/alerts/{group_id}/resolve`
-- `POST /api/alerts/{group_id}/silence`
+- `POST /auth/login`
+- `POST /auth/logout`
+- `GET /api/alert-groups`
+- `GET /api/alert-events`
+- `POST /api/alert-groups/{group_id}/ack`
+- `POST /api/alert-groups/{group_id}/resolve`
+- `POST /api/alert-groups/{group_id}/silence`
 - `POST /api/deliveries/{delivery_id}/replay`
 - `GET /api/deliveries`
 - `GET /api/integrations`
 - `GET /api/routes`
+- `GET /api/advisories`
+- `GET /api/me`
+- user, team, and membership administration under `/api/users`, `/api/teams`,
+  and `/api/team-memberships`
 
-Administrative write APIs can come after config-file workflows are stable.
+Routing, integrations, receivers, schedules, and escalation policies remain
+config-file workflows.
 
 ## Security Requirements
 
@@ -496,38 +520,14 @@ Non-requirements:
 
 ## Roadmap
 
-### Phase 0: Current Product
+### Phases 0–2: Implemented Core
 
-Current `simple-alert-proxy` behavior:
+- SigNoz, Alertmanager-compatible, Grafana, generic JSON, and CloudEvents input.
+- Canonical events, routing, durable SQLite storage, grouping, batching, retry,
+  dead-letter, replay, and restart recovery.
+- Ack, resolve, silence, audit history, management APIs, and operator UI.
 
-- accepts SigNoz alert webhooks
-- routes by configured matchers
-- groups SigNoz alerts by `ruleId`
-- sends Google Chat cards
-- supports YAML config, TLS, bearer auth, body limits, and debug logging
-
-### Phase 1: Gateway Foundation
-
-- Introduce integration abstraction.
-- Preserve existing SigNoz path as a compatibility integration.
-- Add canonical alert event model.
-- Add generic webhook integration with declarative mapping.
-- Add durable event storage with SQLite.
-- Add delivery queue and delivery attempt table.
-- Add retry policy and dead-letter state.
-- Add generic webhook output target.
-- Keep Google Chat target working.
-
-### Phase 2: Alert Groups And Acknowledgement
-
-- Add fingerprint-based alert groups.
-- Add alert group lifecycle state.
-- Add ack, resolve, silence, and replay APIs.
-- Add delivery history API.
-- Add a minimal web UI for alert list/detail/action flows.
-- Add audit/history entries for lifecycle changes.
-
-### Phase 3: More Sources And Targets
+### Phase 3: Sources And Targets (Partially Complete)
 
 Sources:
 
@@ -542,41 +542,43 @@ Targets:
 - Slack
 - Mattermost
 - Discord
+- Matrix
+- generic webhook
+- CloudEvents 1.0 webhook
 - Google Chat improvements
+
+Remaining targets:
+
 - Jira
 - ServiceNow
 - Otobo
 
-### Phase 4: Escalation And On-Duty Routing
+### Phase 4: Escalation And On-Duty Routing (Partially Complete)
 
-- Add users and groups.
-- Add ownership metadata on routes and alert groups.
-- Add external schedule support, starting with iCalendar.
-- Add escalation policies with delayed steps.
-- Stop escalation on acknowledgement or resolution.
-- Add schedule-aware routing expressions.
+- Implemented: local users, teams, ownership metadata, static YAML schedules,
+  and delayed escalation steps with configurable ack/resolve stop conditions.
+- Remaining: external schedule sources, personal notification policies, and
+  richer schedule-aware routing expressions.
 
-### Phase 5: Optional Intelligence
+### Phase 5: Optional Intelligence (Scaffolding Only)
 
-- Add optional LLM provider abstraction.
-- Add alert summarization.
-- Add suggested fingerprints and route labels.
-- Add operator-reviewed correlation suggestions.
+- Implemented: disabled-by-default config, advisory storage/API, and separate UI
+  presentation.
+- Remaining: provider execution, alert summarization, suggested fingerprints
+  and route labels, and operator-reviewed correlation generation.
 
 ## Open Questions
 
-- Should SQLite remain supported indefinitely, or should Postgres become the
-  only production datastore?
-- Which template/expression language should be used for mapping?
-- Should routes and mappings share one expression language?
-- Should the UI be served by the Rust binary or built as a separate static app?
+- What networked datastore and coordination model should support a future
+  multi-node deployment while SQLite remains the single-node default?
+- Should routing gain an expression language beyond the current deterministic
+  matcher model?
 - Should WASM plugins be part of the first plugin design, or postponed until
   declarative mapping hits real limits?
 - How much bidirectional sync should be attempted with source systems?
 - Should acknowledgement links be supported for all targets through signed URLs,
   even when the target has no native button/callback support?
-- Should on-duty schedules be internal eventually, or should the project stay
-  calendar/external-schedule backed?
+- Which external schedule source should follow static YAML first?
 
 ## Success Criteria
 

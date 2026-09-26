@@ -29,6 +29,31 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  system-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Build production binary
+        run: cargo build --release --locked
+      - name: Run release-binary system tests
+        env:
+          SYSTEM_E2E_BIN: target/release/simple-alert-proxy
+          SYSTEM_E2E_ARTIFACT_DIR: target/system-e2e-artifacts
+        run: python3 -m unittest -v tests.system.test_binary_e2e
+      - name: Upload redacted system-test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: system-e2e-diagnostics
+          path: target/system-e2e-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
   container:
     runs-on: ubuntu-latest
     steps:
@@ -40,4 +65,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y podman
       - name: Build image with Podman
-        run: sudo podman build -t simple-alert-proxy:ci .
+        run: sudo podman build --format docker -t simple-alert-proxy:ci .
+
+  container-e2e:
+    needs: container
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: Build production image
+        run: sudo podman build --format docker -t simple-alert-proxy:e2e .
+      - name: Run container system tests
+        env:
+          CONTAINER_ENGINE: sudo podman
+          CONTAINER_E2E_IMAGE: simple-alert-proxy:e2e
+          SYSTEM_E2E_ARTIFACT_DIR: target/container-e2e-artifacts
+        run: python3 -m unittest -v tests.container.test_container_e2e
+      - name: Upload redacted container-test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: container-e2e-diagnostics
+          path: target/container-e2e-artifacts
+          if-no-files-found: ignore
+          retention-days: 7
