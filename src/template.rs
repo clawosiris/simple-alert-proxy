@@ -20,6 +20,7 @@ const MAX_RECURSION_DEPTH: usize = 32;
 pub enum PayloadKind {
     GoogleChat,
     GenericWebhook,
+    CloudEventsWebhook,
     Slack,
     Mattermost,
     Discord,
@@ -33,7 +34,7 @@ impl PayloadKind {
             Self::Slack | Self::Mattermost => 40 * 1024,
             Self::Discord => 16 * 1024,
             Self::Matrix => 64 * 1024,
-            Self::GenericWebhook => 256 * 1024,
+            Self::GenericWebhook | Self::CloudEventsWebhook => 256 * 1024,
         }
     }
 }
@@ -43,6 +44,7 @@ impl fmt::Display for PayloadKind {
         formatter.write_str(match self {
             Self::GoogleChat => "google_chat",
             Self::GenericWebhook => "generic_webhook",
+            Self::CloudEventsWebhook => "cloudevents_webhook",
             Self::Slack => "slack",
             Self::Mattermost => "mattermost",
             Self::Discord => "discord",
@@ -289,6 +291,7 @@ fn receiver_payload_kind(receiver: &ReceiverConfig) -> PayloadKind {
     match receiver {
         ReceiverConfig::GoogleChat(_) => PayloadKind::GoogleChat,
         ReceiverConfig::GenericWebhook(_) => PayloadKind::GenericWebhook,
+        ReceiverConfig::CloudEventsWebhook(_) => PayloadKind::CloudEventsWebhook,
         ReceiverConfig::Slack(_) => PayloadKind::Slack,
         ReceiverConfig::Mattermost(_) => PayloadKind::Mattermost,
         ReceiverConfig::Discord(_) => PayloadKind::Discord,
@@ -335,7 +338,7 @@ fn validate_payload_shape(
         });
     };
     let valid = match target {
-        PayloadKind::GenericWebhook => true,
+        PayloadKind::GenericWebhook | PayloadKind::CloudEventsWebhook => true,
         PayloadKind::GoogleChat => {
             object.get("text").is_some_and(Value::is_string)
                 || object.get("cardsV2").is_some_and(Value::is_array)
@@ -366,7 +369,7 @@ fn validate_payload_shape(
                 }
                 PayloadKind::Discord => "expected string content or array embeds",
                 PayloadKind::Matrix => "expected string msgtype and body",
-                PayloadKind::GenericWebhook => unreachable!(),
+                PayloadKind::GenericWebhook | PayloadKind::CloudEventsWebhook => unreachable!(),
             },
         })
     }
@@ -503,7 +506,10 @@ impl io::Write for BoundedWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{GenericWebhookReceiverConfig, NotificationTemplateConfig};
+    use crate::config::{
+        CloudEventsWebhookMode, CloudEventsWebhookReceiverConfig, GenericWebhookReceiverConfig,
+        NotificationTemplateConfig,
+    };
     use serde_json::json;
 
     fn event() -> AlertEvent {
@@ -543,6 +549,23 @@ mod tests {
             "target".to_string(),
             ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
                 webhook_url: "https://example.test/hook".to_string(),
+                owner_team: None,
+                timeout_secs: 10,
+                template: Some(config),
+            }),
+        )]))
+        .unwrap()
+    }
+
+    fn cloudevents_engine(config: NotificationTemplateConfig) -> Arc<NotificationTemplateEngine> {
+        NotificationTemplateEngine::compile(&BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::CloudEventsWebhook(CloudEventsWebhookReceiverConfig {
+                webhook_url: "https://events.example.test/hook".to_string(),
+                source: "urn:simple-alert-proxy:test".to_string(),
+                mode: CloudEventsWebhookMode::Structured,
+                event_type: "io.example.alert.v1".to_string(),
+                batch_type: "io.example.batch.v1".to_string(),
                 owner_team: None,
                 timeout_secs: 10,
                 template: Some(config),
@@ -692,6 +715,7 @@ mod tests {
         for (target, source) in [
             (PayloadKind::GoogleChat, r#"{"text":"ok"}"#),
             (PayloadKind::GenericWebhook, r#"{"anything":true}"#),
+            (PayloadKind::CloudEventsWebhook, r#"{"anything":true}"#),
             (PayloadKind::Slack, r#"{"text":"ok"}"#),
             (PayloadKind::Mattermost, r#"{"text":"ok"}"#),
             (PayloadKind::Discord, r#"{"content":"ok"}"#),
@@ -728,5 +752,34 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("invalid static JSON"));
+    }
+
+    #[test]
+    fn cloudevents_template_renders_only_normalized_data() {
+        let engine = cloudevents_engine(NotificationTemplateConfig {
+            payload: Some(
+                r#"{"summary": {{ alert.title | tojson }}, "route": {{ delivery.route | tojson }}}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+
+        let rendered = engine
+            .render_event(
+                "target",
+                &event(),
+                &delivery(),
+                PayloadKind::CloudEventsWebhook,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            rendered.payload.unwrap(),
+            json!({
+                "summary": "Disk full",
+                "route": "ops"
+            })
+        );
     }
 }
