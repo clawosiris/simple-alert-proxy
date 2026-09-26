@@ -369,6 +369,7 @@ dependencies = [
  "futures 0.3.32",
  "hostname",
  "http",
+ "reqwest",
  "serde",
  "serde_json",
  "snafu",

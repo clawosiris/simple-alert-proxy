@@ -150,6 +150,11 @@ impl AppConfig {
                     bail!("receiver {name} timeout_secs must be greater than zero")
                 }
                 ReceiverConfig::GenericWebhook(_) => {}
+                ReceiverConfig::CloudEventsWebhook(receiver) => {
+                    receiver.validate().with_context(|| {
+                        format!("receiver {name} cloudevents_webhook config is invalid")
+                    })?
+                }
                 ReceiverConfig::Slack(receiver) if receiver.timeout_secs == 0 => {
                     bail!("receiver {name} timeout_secs must be greater than zero")
                 }
@@ -916,6 +921,8 @@ pub struct MatcherConfig {
 pub enum ReceiverConfig {
     GoogleChat(GoogleChatReceiverConfig),
     GenericWebhook(GenericWebhookReceiverConfig),
+    #[serde(rename = "cloudevents_webhook")]
+    CloudEventsWebhook(CloudEventsWebhookReceiverConfig),
     Slack(ChatWebhookReceiverConfig),
     Mattermost(ChatWebhookReceiverConfig),
     Discord(ChatWebhookReceiverConfig),
@@ -927,6 +934,7 @@ impl ReceiverConfig {
         match self {
             Self::GoogleChat(receiver) => receiver.owner_team.as_deref(),
             Self::GenericWebhook(receiver) => receiver.owner_team.as_deref(),
+            Self::CloudEventsWebhook(receiver) => receiver.owner_team.as_deref(),
             Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
                 receiver.owner_team.as_deref()
             }
@@ -938,6 +946,7 @@ impl ReceiverConfig {
         match self {
             Self::GoogleChat(receiver) => receiver.template.as_ref(),
             Self::GenericWebhook(receiver) => receiver.template.as_ref(),
+            Self::CloudEventsWebhook(receiver) => receiver.template.as_ref(),
             Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
                 receiver.template.as_ref()
             }
@@ -952,7 +961,7 @@ impl ReceiverConfig {
                 receiver.title_template.as_deref()
             }
             Self::Matrix(receiver) => receiver.title_template.as_deref(),
-            Self::GenericWebhook(_) => None,
+            Self::GenericWebhook(_) | Self::CloudEventsWebhook(_) => None,
         }
     }
 
@@ -962,7 +971,12 @@ impl ReceiverConfig {
             bail!("receiver {name} cannot combine title_template with the template block");
         }
         if let Some(template) = template {
-            template.validate(name, matches!(self, Self::GenericWebhook(_)))?;
+            let payload_only = match self {
+                Self::GenericWebhook(_) => Some("generic_webhook"),
+                Self::CloudEventsWebhook(_) => Some("cloudevents_webhook"),
+                _ => None,
+            };
+            template.validate(name, payload_only)?;
         }
         Ok(())
     }
@@ -977,7 +991,11 @@ pub struct NotificationTemplateConfig {
 }
 
 impl NotificationTemplateConfig {
-    fn validate(&self, receiver_name: &str, payload_only: bool) -> anyhow::Result<()> {
+    fn validate(
+        &self,
+        receiver_name: &str,
+        payload_only_receiver_type: Option<&str>,
+    ) -> anyhow::Result<()> {
         if self.title.is_none() && self.body.is_none() && self.payload.is_none() {
             bail!("receiver {receiver_name} template block must configure title, body, or payload");
         }
@@ -986,9 +1004,11 @@ impl NotificationTemplateConfig {
                 "receiver {receiver_name} template.payload is mutually exclusive with template.title and template.body"
             );
         }
-        if payload_only && (self.title.is_some() || self.body.is_some()) {
+        if let Some(receiver_type) = payload_only_receiver_type
+            && (self.title.is_some() || self.body.is_some())
+        {
             bail!(
-                "receiver {receiver_name} generic_webhook templates support template.payload only"
+                "receiver {receiver_name} {receiver_type} templates support template.payload only"
             );
         }
         for (field, source) in [
@@ -1031,6 +1051,116 @@ pub struct GenericWebhookReceiverConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub template: Option<NotificationTemplateConfig>,
+}
+
+pub const DEFAULT_CLOUDEVENTS_ALERT_TYPE: &str = "io.github.clawosiris.simple-alert-proxy.alert.v1";
+pub const DEFAULT_CLOUDEVENTS_BATCH_TYPE: &str =
+    "io.github.clawosiris.simple-alert-proxy.notification-batch.v1";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudEventsWebhookMode {
+    #[default]
+    Structured,
+    Binary,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudEventsWebhookReceiverConfig {
+    pub webhook_url: String,
+    pub source: String,
+    #[serde(default)]
+    pub mode: CloudEventsWebhookMode,
+    #[serde(default = "default_cloudevents_alert_type")]
+    pub event_type: String,
+    #[serde(default = "default_cloudevents_batch_type")]
+    pub batch_type: String,
+    #[serde(default, alias = "team")]
+    pub owner_team: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub template: Option<NotificationTemplateConfig>,
+}
+
+impl CloudEventsWebhookReceiverConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let webhook_url = self.webhook_url.trim();
+        let url =
+            reqwest::Url::parse(webhook_url).context("webhook_url must be a valid absolute URL")?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            bail!("webhook_url must use http or https and include a host");
+        }
+        if self.timeout_secs == 0 {
+            bail!("timeout_secs must be greater than zero");
+        }
+        validate_uri_reference(&self.source).context("source must be a valid URI-reference")?;
+        validate_cloudevents_type(&self.event_type, "event_type")?;
+        validate_cloudevents_type(&self.batch_type, "batch_type")?;
+        Ok(())
+    }
+}
+
+fn validate_uri_reference(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() || value.trim() != value || !value.is_ascii() {
+        bail!("URI-reference must be non-empty ASCII without surrounding whitespace");
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b':'
+                    | b'/'
+                    | b'?'
+                    | b'#'
+                    | b'['
+                    | b']'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b'%'
+            )
+    }) {
+        bail!("URI-reference contains an invalid character");
+    }
+    for (index, byte) in value.bytes().enumerate() {
+        if byte == b'%'
+            && value
+                .as_bytes()
+                .get(index + 1..index + 3)
+                .is_none_or(|escape| !escape.iter().all(u8::is_ascii_hexdigit))
+        {
+            bail!("URI-reference contains an invalid percent escape");
+        }
+    }
+    let base = reqwest::Url::parse("https://simple-alert-proxy.invalid/")
+        .expect("static URI-reference validation base is valid");
+    reqwest::Url::options()
+        .base_url(Some(&base))
+        .parse(value)
+        .context("URI-reference could not be parsed")?;
+    Ok(())
+}
+
+fn validate_cloudevents_type(value: &str, field: &str) -> anyhow::Result<()> {
+    if value.trim().is_empty() {
+        bail!("{field} must not be empty");
+    }
+    reqwest::header::HeaderValue::from_str(value)
+        .with_context(|| format!("{field} must be representable in an HTTP header"))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1213,6 +1343,14 @@ pub fn default_title_template() -> &'static str {
 
 fn default_timeout_secs() -> u64 {
     10
+}
+
+fn default_cloudevents_alert_type() -> String {
+    DEFAULT_CLOUDEVENTS_ALERT_TYPE.to_string()
+}
+
+fn default_cloudevents_batch_type() -> String {
+    DEFAULT_CLOUDEVENTS_BATCH_TYPE.to_string()
 }
 
 fn validate_integration_name(name: &str) -> anyhow::Result<()> {
@@ -1403,6 +1541,124 @@ mod tests {
             error
                 .to_string()
                 .contains("integration platform-events fingerprint field must not be empty")
+        );
+    }
+
+    #[test]
+    fn cloudevents_webhook_receiver_defaults_and_validation() {
+        let receiver: ReceiverConfig = serde_yaml::from_str(
+            r#"
+type: cloudevents_webhook
+webhook_url: https://events.example.test/alerts
+source: urn:simple-alert-proxy:production
+"#,
+        )
+        .unwrap();
+        let ReceiverConfig::CloudEventsWebhook(receiver) = receiver else {
+            panic!("expected CloudEvents webhook receiver")
+        };
+
+        assert_eq!(receiver.mode, CloudEventsWebhookMode::Structured);
+        assert_eq!(receiver.event_type, DEFAULT_CLOUDEVENTS_ALERT_TYPE);
+        assert_eq!(receiver.batch_type, DEFAULT_CLOUDEVENTS_BATCH_TYPE);
+        assert_eq!(receiver.timeout_secs, 10);
+        receiver.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_cloudevents_webhook_receiver_fields() {
+        let valid = CloudEventsWebhookReceiverConfig {
+            webhook_url: "https://events.example.test/alerts".to_string(),
+            source: "../simple-alert-proxy/production?tenant=platform#alerts".to_string(),
+            mode: CloudEventsWebhookMode::Binary,
+            event_type: "io.example.alert.v1".to_string(),
+            batch_type: "io.example.batch.v1".to_string(),
+            owner_team: None,
+            timeout_secs: 10,
+            template: None,
+        };
+        valid.validate().unwrap();
+
+        for (receiver, expected) in [
+            (
+                CloudEventsWebhookReceiverConfig {
+                    webhook_url: "events.example.test".to_string(),
+                    ..valid.clone()
+                },
+                "valid absolute URL",
+            ),
+            (
+                CloudEventsWebhookReceiverConfig {
+                    source: "urn:test bad".to_string(),
+                    ..valid.clone()
+                },
+                "valid URI-reference",
+            ),
+            (
+                CloudEventsWebhookReceiverConfig {
+                    source: "urn:test:%zz".to_string(),
+                    ..valid.clone()
+                },
+                "valid URI-reference",
+            ),
+            (
+                CloudEventsWebhookReceiverConfig {
+                    event_type: " ".to_string(),
+                    ..valid.clone()
+                },
+                "event_type must not be empty",
+            ),
+            (
+                CloudEventsWebhookReceiverConfig {
+                    batch_type: "invalid\nvalue".to_string(),
+                    ..valid.clone()
+                },
+                "batch_type must be representable",
+            ),
+            (
+                CloudEventsWebhookReceiverConfig {
+                    timeout_secs: 0,
+                    ..valid.clone()
+                },
+                "timeout_secs must be greater than zero",
+            ),
+        ] {
+            let error = receiver.validate().unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_cloudevents_webhook_mode_and_non_payload_template() {
+        let error = serde_yaml::from_str::<ReceiverConfig>(
+            r#"
+type: cloudevents_webhook
+webhook_url: https://events.example.test/alerts
+source: urn:simple-alert-proxy:test
+mode: envelope
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant"));
+
+        let receiver = ReceiverConfig::CloudEventsWebhook(CloudEventsWebhookReceiverConfig {
+            webhook_url: "https://events.example.test/alerts".to_string(),
+            source: "urn:simple-alert-proxy:test".to_string(),
+            mode: CloudEventsWebhookMode::Structured,
+            event_type: DEFAULT_CLOUDEVENTS_ALERT_TYPE.to_string(),
+            batch_type: DEFAULT_CLOUDEVENTS_BATCH_TYPE.to_string(),
+            owner_team: None,
+            timeout_secs: 10,
+            template: Some(NotificationTemplateConfig {
+                title: Some("{{ alert.title }}".to_string()),
+                ..Default::default()
+            }),
+        });
+        let error = receiver.validate_template("event-bus").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cloudevents_webhook templates support template.payload only")
         );
     }
 

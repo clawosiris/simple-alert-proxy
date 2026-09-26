@@ -15,7 +15,7 @@ scheduling, and optional advisory intelligence scaffolding.
 
 - SigNoz compatibility endpoint at `POST /webhooks/signoz`
 - First-class Grafana webhook endpoint support through configured integrations
-- CloudEvents 1.0 structured and binary JSON input
+- CloudEvents 1.0 structured and binary JSON input and outbound delivery
 - Generic JSON integrations at `POST /webhooks/{integration}`
 - Config-only mapping into canonical alert events
 - Routing by status, labels, annotations, or JSON payload fields
@@ -319,6 +319,12 @@ receivers:
     type: "generic_webhook"
     webhook_url: "https://alerts.example.test/webhook"
 
+  event-bus:
+    type: "cloudevents_webhook"
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    mode: "structured"
+
   slack-alerts:
     type: "slack"
     webhook_url: "https://hooks.slack.com/services/example"
@@ -346,13 +352,108 @@ and can send messages there. Prefer `access_token_env` over inline
 use the canonical `!room:server` form; room aliases such as `#alerts:server`
 are not resolved.
 
+### Outbound CloudEvents 1.0
+
+Use a distinct `cloudevents_webhook` receiver when the downstream service
+accepts CloudEvents. This does not change the existing `generic_webhook` media
+type or payload contract.
+
+```yaml
+receivers:
+  event-bus:
+    type: cloudevents_webhook
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    mode: structured # structured (default) or binary
+    event_type: "io.github.clawosiris.simple-alert-proxy.alert.v1"
+    batch_type: "io.github.clawosiris.simple-alert-proxy.notification-batch.v1"
+    timeout_secs: 10
+```
+
+`webhook_url` must be an absolute HTTP(S) URL. `source` is required and must be
+a valid URI-reference. The two versioned event types shown above are the
+defaults. Structured mode sends `application/cloudevents+json`; binary mode
+sends the JSON `data` as `application/json` with `ce-*` context headers. Both
+modes represent the same CloudEvent.
+
+For a single alert, the default `data` schema is:
+
+```json
+{
+  "event": {
+    "event_id": "source occurrence identity",
+    "integration": "openvas",
+    "group_namespace": "integration/openvas",
+    "source": "openvas",
+    "received_at": "2026-09-25T18:00:00Z",
+    "status": "firing",
+    "severity": "critical",
+    "title": "TLS certificate expired",
+    "body": null,
+    "labels": {},
+    "annotations": {},
+    "links": [],
+    "starts_at": null,
+    "ends_at": null,
+    "fingerprint": "finding-42",
+    "notification_group_key": null,
+    "instances": []
+  },
+  "delivery": {
+    "route": "default",
+    "receiver": "event-bus",
+    "owner_team": "platform"
+  }
+}
+```
+
+Raw source payloads are deliberately excluded. A durable notification batch is
+one `notification-batch.v1` CloudEvent—not CloudEvents batch format and not one
+request per member—with `data` shaped as
+`{batch: {group_key, count, severity_counts}, events: [...], delivery: {...}}`.
+The `events` entries use the same normalized, raw-free fields shown above. Even
+a one-member durable batch uses the batch event type and schema.
+
+The CloudEvents `id` identifies the outbound delivery. It stays stable across
+automatic retries and durable batch recovery, differs across routes/receivers,
+and is renewed by an explicit replay. Source occurrence `event_id` remains in
+`data`; lifecycle identity is carried by `subject` as the percent-encoded
+`group_namespace` plus `fingerprint`. Batch `subject` carries the persisted
+notification `group_key`. `time` uses the stable canonical `received_at` value
+(the primary member for a batch) when present. Extensions expose `route`,
+`receiver`, `status`, `severity`, `integration`, and string `batched` metadata.
+
+`template.payload` on this receiver replaces only `data`; `specversion`, `id`,
+`source`, `type`, `subject`, `time`, and extensions remain controlled by the
+delivery system:
+
+```yaml
+receivers:
+  event-bus:
+    type: cloudevents_webhook
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    template:
+      payload: |-
+        {
+          "summary": {{ alert.title | tojson }},
+          "severity": {{ alert.severity | tojson }},
+          "route": {{ delivery.route | tojson }}
+        }
+```
+
+CloudEvents JSON batch format, the separate HTTP Webhook profile, arbitrary
+headers/auth, request signing, and inbound-to-outbound envelope mirroring are
+not supported by this receiver.
+
 ### Notification templates
 
 All receivers support guarded MiniJinja 2.x templates. Google Chat, Slack,
 Mattermost, Discord, and Matrix accept a standard `template.title` /
-`template.body` mode. Generic webhooks accept `template.payload`; every other
-receiver can also use payload mode when its complete platform JSON body must be
-controlled.
+`template.body` mode. Generic webhooks accept `template.payload` as their
+complete body. CloudEvents webhooks accept `template.payload` as event `data`
+only; every other receiver can use payload mode to control its complete
+platform JSON body.
 
 ```yaml
 receivers:
@@ -404,8 +505,9 @@ Templates are compiled once at startup with strict undefined values, a 64 KiB
 source limit, a fixed recursion limit, and a per-render instruction budget.
 Rendered titles are limited to 4 KiB. Final payload limits are 32 KiB for
 Google Chat, 40 KiB for Slack/Mattermost, 16 KiB for Discord, 64 KiB for
-Matrix, and 256 KiB for generic webhooks. Standard Google Chat and Matrix modes
-escape alert-controlled text before placing it in HTML-bearing fields.
+Matrix, and 256 KiB for generic-webhook bodies and complete encoded CloudEvents.
+Standard Google Chat and Matrix modes escape alert-controlled text before
+placing it in HTML-bearing fields.
 
 Payload templates must render a JSON object. Minimal target-shape validation
 requires `text` or `cardsV2` for Google Chat, `text` or `blocks` for
@@ -720,7 +822,9 @@ letters are applied to every member.
 
 `alert_grouping` and `debounce_millis` remain accepted as legacy aliases. A
 generic-webhook batch with one event keeps the existing `{event, delivery}`
-schema; multi-event batches use `{batch, events, delivery}`.
+schema; multi-event batches use `{batch, events, delivery}`. A CloudEvents
+receiver always preserves the durable boundary: any notification batch,
+including one member, is one `notification-batch.v1` CloudEvent.
 
 Notification batches are separate from lifecycle `AlertGroup` records. The
 latter remain keyed by canonical group namespace plus source fingerprint and

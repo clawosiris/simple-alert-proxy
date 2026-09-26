@@ -170,6 +170,15 @@ receivers:
     webhook_url: "https://alerts.example.test/webhook"
     timeout_secs: 10
 
+  cloud-events:
+    type: "cloudevents_webhook"
+    webhook_url: "https://events.example.test/alerts"
+    source: "urn:simple-alert-proxy:production"
+    mode: "structured"
+    # event_type: "io.github.clawosiris.simple-alert-proxy.alert.v1"
+    # batch_type: "io.github.clawosiris.simple-alert-proxy.notification-batch.v1"
+    timeout_secs: 10
+
   slack-alerts:
     type: "slack"
     webhook_url: "https://hooks.slack.com/services/example"
