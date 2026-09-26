@@ -62,6 +62,7 @@ jobs:
           date_tag="${{ steps.image.outputs.date_tag }}"
           short_sha="${{ steps.image.outputs.short_sha }}"
           sudo podman build \
+            --format docker \
             --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=nightly" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
