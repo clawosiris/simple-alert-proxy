@@ -29,6 +29,7 @@ new configs should represent SigNoz under `integrations`.
 | --- | --- | --- |
 | Health check | `GET /healthz` returns `204 No Content`. | `healthz_returns_no_content` |
 | SigNoz endpoint | Existing `POST /webhooks/signoz` path accepts fixture payloads. | `default_signoz_webhook_path_accepts_existing_payload` |
+| gvmd Generic v1 | Official task, new/updated SecInfo, and SecInfo test fixtures normalize without reshaping; authenticated intake persists and routes before `202`. | gvmd module tests, `gvmd_builtin_authenticates_persists_routes_and_delivers_task_and_secinfo` |
 | YAML config | Existing route and `google_chat` receiver config loads and validates unchanged. | `example_config_loads_without_migration` |
 | Bearer auth | Missing, wrong, or non-bearer auth is rejected; disabled auth accepts requests. | `rejects_missing_bearer_token`, `rejects_wrong_bearer_token`, `rejects_non_bearer_authorization_scheme`, `accepts_webhook_without_auth_when_auth_disabled` |
 | Body limit | Requests over `server.max_body_bytes` are rejected by the HTTP layer. | `rejects_request_bodies_over_configured_limit` |

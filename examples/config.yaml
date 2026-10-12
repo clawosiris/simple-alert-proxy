@@ -48,6 +48,14 @@ integrations:
   #   auth:
   #     bearer_token: "replace-me"
 
+  # gvmd Generic Webhook v1 task and SecInfo payloads.
+  # greenbone:
+  #   type: "builtin"
+  #   preset: "gvmd"
+  #   path: "/webhooks/gvmd"
+  #   auth:
+  #     bearer_token: "replace-me"
+
   openvas-example:
     type: "generic_json"
     preset: "openvas_scan"

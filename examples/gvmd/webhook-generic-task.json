@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "test": false,
+  "alert": {
+    "id": "8d4bb6b2-6a19-4de2-8d8e-e5a392b5e71f",
+    "name": "Completed scan",
+    "method": "Webhook"
+  },
+  "event": {
+    "name": "Task run status changed",
+    "description": "Task status changed to 'Done'",
+    "status": "Done"
+  },
+  "condition": {
+    "name": "Always",
+    "description": "Always"
+  },
+  "task": {
+    "id": "a7640b63-9dce-4718-b6e3-c9b5c98732df",
+    "name": "Nightly scan"
+  },
+  "report": {
+    "id": "735bb487-d6d4-4f45-aabb-fc5915f44996",
+    "format": null,
+    "content": null
+  }
+}

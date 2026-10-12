@@ -2,10 +2,11 @@
 
 ## Goal
 
-Provide a compact Rust alert webhook gateway that accepts SigNoz, Grafana, n8n,
-CloudEvents 1.0, and generic JSON inputs; normalizes and groups alert events;
-persists lifecycle and delivery state; routes to chat or webhook receivers; and
-gives operators a small authenticated API and UI.
+Provide a compact Rust alert webhook gateway that accepts SigNoz, Grafana,
+gvmd Generic Webhook v1, n8n, CloudEvents 1.0, and generic JSON inputs;
+normalizes and groups alert events; persists lifecycle and delivery state;
+routes to chat or webhook receivers; and gives operators a small authenticated
+API and UI.
 
 ## Non-Goals
 
@@ -152,6 +153,13 @@ integrations:
     auth:
       bearer_token: "replace-me"
 
+  greenbone:
+    type: builtin
+    preset: gvmd
+    path: "/webhooks/gvmd"
+    auth:
+      bearer_token: "replace-me"
+
   openvas-example:
     type: generic_json
     path: "/webhooks/openvas-example"
@@ -225,6 +233,22 @@ explicit `{ "events": [...] }` batch. Every member requires non-empty `status`,
 timestamps, severity, body, and notification `group_key` are preserved. Batch
 members are persisted, routed, and delivered independently. Malformed or empty
 contracts return `400`; valid requests are persisted before `202`.
+
+The built-in gvmd preset accepts `application/json` Greenbone data contract
+`version: 1` payloads for task run-status, new SecInfo, and updated SecInfo
+events, including explicit `test: true` deliveries. It validates the required
+common objects and variant-specific structure. All variants normalize to the
+point-in-time lifecycle status `firing` and severity `unknown`; task
+`event.status` is retained as `label.gvmd_task_status` rather than interpreted
+as the proxy lifecycle. The configured integration name defines the group
+namespace and canonical source is `gvmd`. Fingerprints isolate test/live scope,
+alert identity, event kind, and task/report or SecInfo identity. Notification
+group hints omit the task report ID so reports for the same configured alert,
+event kind, and task can batch while remaining separate lifecycle groups.
+Unsupported versions and malformed/unknown variants return `400`; missing or
+non-JSON media types return `415`. Valid requests use ordinary auth, routing,
+persistence-before-acceptance, retry, batching, replay, and management paths.
+See `docs/GVMD.md` for the complete mapping and upstream contract pin.
 
 ## SigNoz Integration
 

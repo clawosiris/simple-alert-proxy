@@ -1476,7 +1476,7 @@ fn validate_source_preset(integration_name: &str, preset: &str) -> anyhow::Resul
 
 fn validate_builtin_preset(integration_name: &str, preset: &str) -> anyhow::Result<()> {
     match preset {
-        "signoz" | "alertmanager" | "grafana" | "n8n" => Ok(()),
+        "signoz" | "alertmanager" | "grafana" | "gvmd" | "n8n" => Ok(()),
         _ => bail!("integration {integration_name} builtin preset {preset} is not supported"),
     }
 }

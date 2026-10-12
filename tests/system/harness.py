@@ -103,11 +103,14 @@ def request(
                 response.read(),
             )
     except urllib.error.HTTPError as error:
-        return HttpResponse(
-            error.code,
-            {name.lower(): value for name, value in error.headers.items()},
-            error.read(),
-        )
+        try:
+            return HttpResponse(
+                error.code,
+                {name.lower(): value for name, value in error.headers.items()},
+                error.read(),
+            )
+        finally:
+            error.close()
 
 
 @dataclass(frozen=True)
@@ -353,6 +356,7 @@ def write_config(
     local_users: bool = True,
     receiver_kind: str = "generic_webhook",
     include_n8n: bool = False,
+    include_gvmd: bool = False,
 ) -> None:
     def quoted(value: str) -> str:
         return json.dumps(value)
@@ -388,6 +392,16 @@ def write_config(
     type: "builtin"
     preset: "n8n"
     path: "/webhooks/n8n"
+    auth:
+      bearer_token: {quoted(INBOUND_TOKEN)}
+"""
+    gvmd_integration = ""
+    if include_gvmd:
+        gvmd_integration = f"""
+  greenbone:
+    type: "builtin"
+    preset: "gvmd"
+    path: "/webhooks/gvmd"
     auth:
       bearer_token: {quoted(INBOUND_TOKEN)}
 """
@@ -434,6 +448,7 @@ integrations:
     labels:
       environment: "environment"
 {n8n_integration}
+{gvmd_integration}
 
 storage:
   type: "sqlite"
@@ -513,7 +528,10 @@ def generate_certificate(directory: Path) -> tuple[Path, Path, Path]:
     signing_request = directory / "server.csr"
     extensions = directory / "server.ext"
     extensions.write_text(
-        "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n"
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature,keyEncipherment\n"
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\n"
+        "extendedKeyUsage=serverAuth\n"
     )
     commands = [
         [
@@ -527,6 +545,10 @@ def generate_certificate(directory: Path) -> tuple[Path, Path, Path]:
             "1",
             "-subj",
             "/CN=Simple Alert System Test CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
             "-keyout",
             str(ca_private_key),
             "-out",
