@@ -25,7 +25,8 @@ INBOUND_TOKEN = "system-inbound-token"
 MANAGEMENT_TOKEN = "system-management-token"
 ADMIN_PASSWORD = "system-admin-password"
 MATRIX_TOKEN = "system-matrix-token"
-REDACTIONS = (INBOUND_TOKEN, MANAGEMENT_TOKEN, ADMIN_PASSWORD, MATRIX_TOKEN)
+N8N_TOKEN = "system-n8n-token"
+REDACTIONS = (INBOUND_TOKEN, MANAGEMENT_TOKEN, ADMIN_PASSWORD, MATRIX_TOKEN, N8N_TOKEN)
 
 
 def reserve_port() -> int:
@@ -351,6 +352,7 @@ def write_config(
     tls: dict[str, str] | None = None,
     local_users: bool = True,
     receiver_kind: str = "generic_webhook",
+    include_n8n: bool = False,
 ) -> None:
     def quoted(value: str) -> str:
         return json.dumps(value)
@@ -369,8 +371,26 @@ def write_config(
     room_id: "!system:example.test"
     access_token: {quoted(MATRIX_TOKEN)}
     timeout_secs: 10"""
+    elif receiver_kind == "n8n_webhook":
+        receiver_block = f"""type: "n8n_webhook"
+    webhook_url: {quoted(receiver_url)}
+    auth:
+      type: "header"
+      header_name: "X-N8N-Webhook-Token"
+      value_env: "SYSTEM_E2E_N8N_TOKEN"
+    timeout_secs: 10"""
     else:
         raise ValueError(f"unsupported test receiver kind {receiver_kind}")
+    n8n_integration = ""
+    if include_n8n:
+        n8n_integration = f"""
+  n8n:
+    type: "builtin"
+    preset: "n8n"
+    path: "/webhooks/n8n"
+    auth:
+      bearer_token: {quoted(INBOUND_TOKEN)}
+"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"""server:
@@ -413,6 +433,7 @@ integrations:
     notification_group_key: "group"
     labels:
       environment: "environment"
+{n8n_integration}
 
 storage:
   type: "sqlite"

@@ -15,6 +15,7 @@ from typing import Any
 from tests.system.harness import (
     INBOUND_TOKEN,
     MANAGEMENT_TOKEN,
+    N8N_TOKEN,
     ScriptedReceiver,
     TestWorkspace,
     eventually,
@@ -94,6 +95,7 @@ class ContainerEndToEndTests(unittest.TestCase):
         container_port: int = 8080,
         tls_mounts: tuple[Path, Path] | None = None,
         health_command: str | None = None,
+        environment: dict[str, str] | None = None,
     ) -> None:
         arguments = [
             "run",
@@ -131,6 +133,8 @@ class ContainerEndToEndTests(unittest.TestCase):
             )
         if health_command:
             arguments.extend(["--health-cmd", health_command])
+        for env_name, value in (environment or {}).items():
+            arguments.extend(["--env", f"{env_name}={value}"])
         arguments.append(self.image)
         self.containers.append(name)
         result = self.run_engine(*arguments)
@@ -173,9 +177,15 @@ class ContainerEndToEndTests(unittest.TestCase):
             database="/var/lib/simple-alert-proxy/data/simple-alert-proxy.db",
             receiver_url=f"http://host.containers.internal:{self.receiver.port}/receiver",
             local_users=False,
+            receiver_kind="n8n_webhook",
+            include_n8n=True,
         )
         first = f"sap-http-{uuid.uuid4().hex[:8]}"
-        self.start_container(first, host_port)
+        self.start_container(
+            first,
+            host_port,
+            environment={"SYSTEM_E2E_N8N_TOKEN": N8N_TOKEN},
+        )
         wait_for_container_http("127.0.0.1", host_port)
         self.assert_healthy(first)
         self.assertEqual(self.inspect(first, "{{.Config.User}}"), "simple-alert-proxy")
@@ -183,8 +193,14 @@ class ContainerEndToEndTests(unittest.TestCase):
         intake = request(
             base_url,
             "POST",
-            "/webhooks/synthetic",
-            payload=synthetic_payload("container-http"),
+            "/webhooks/n8n",
+            payload={
+                "status": "firing",
+                "severity": "critical",
+                "title": "Container n8n alert",
+                "fingerprint": "container-http",
+                "labels": {"environment": "production"},
+            },
             headers={"authorization": f"Bearer {INBOUND_TOKEN}"},
         )
         self.assertEqual(intake.status, 202, intake.body)
@@ -200,7 +216,11 @@ class ContainerEndToEndTests(unittest.TestCase):
         self.run_engine("rm", first)
         self.containers.remove(first)
         restarted = f"sap-restart-{uuid.uuid4().hex[:8]}"
-        self.start_container(restarted, host_port)
+        self.start_container(
+            restarted,
+            host_port,
+            environment={"SYSTEM_E2E_N8N_TOKEN": N8N_TOKEN},
+        )
         wait_for_container_http("127.0.0.1", host_port)
         persisted = self.api_json(base_url, "/api/alert-events")
         self.assertEqual([event["fingerprint"] for event in persisted], ["container-http"])

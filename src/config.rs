@@ -150,6 +150,9 @@ impl AppConfig {
                     bail!("receiver {name} timeout_secs must be greater than zero")
                 }
                 ReceiverConfig::GenericWebhook(_) => {}
+                ReceiverConfig::N8nWebhook(receiver) => receiver
+                    .validate()
+                    .with_context(|| format!("receiver {name} n8n_webhook config is invalid"))?,
                 ReceiverConfig::CloudEventsWebhook(receiver) => {
                     receiver.validate().with_context(|| {
                         format!("receiver {name} cloudevents_webhook config is invalid")
@@ -921,6 +924,7 @@ pub struct MatcherConfig {
 pub enum ReceiverConfig {
     GoogleChat(GoogleChatReceiverConfig),
     GenericWebhook(GenericWebhookReceiverConfig),
+    N8nWebhook(N8nWebhookReceiverConfig),
     #[serde(rename = "cloudevents_webhook")]
     CloudEventsWebhook(CloudEventsWebhookReceiverConfig),
     Slack(ChatWebhookReceiverConfig),
@@ -934,6 +938,7 @@ impl ReceiverConfig {
         match self {
             Self::GoogleChat(receiver) => receiver.owner_team.as_deref(),
             Self::GenericWebhook(receiver) => receiver.owner_team.as_deref(),
+            Self::N8nWebhook(receiver) => receiver.owner_team.as_deref(),
             Self::CloudEventsWebhook(receiver) => receiver.owner_team.as_deref(),
             Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
                 receiver.owner_team.as_deref()
@@ -946,6 +951,7 @@ impl ReceiverConfig {
         match self {
             Self::GoogleChat(receiver) => receiver.template.as_ref(),
             Self::GenericWebhook(receiver) => receiver.template.as_ref(),
+            Self::N8nWebhook(receiver) => receiver.template.as_ref(),
             Self::CloudEventsWebhook(receiver) => receiver.template.as_ref(),
             Self::Slack(receiver) | Self::Mattermost(receiver) | Self::Discord(receiver) => {
                 receiver.template.as_ref()
@@ -961,7 +967,7 @@ impl ReceiverConfig {
                 receiver.title_template.as_deref()
             }
             Self::Matrix(receiver) => receiver.title_template.as_deref(),
-            Self::GenericWebhook(_) | Self::CloudEventsWebhook(_) => None,
+            Self::GenericWebhook(_) | Self::N8nWebhook(_) | Self::CloudEventsWebhook(_) => None,
         }
     }
 
@@ -973,6 +979,7 @@ impl ReceiverConfig {
         if let Some(template) = template {
             let payload_only = match self {
                 Self::GenericWebhook(_) => Some("generic_webhook"),
+                Self::N8nWebhook(_) => Some("n8n_webhook"),
                 Self::CloudEventsWebhook(_) => Some("cloudevents_webhook"),
                 _ => None,
             };
@@ -1051,6 +1058,98 @@ pub struct GenericWebhookReceiverConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub template: Option<NotificationTemplateConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct N8nWebhookReceiverConfig {
+    pub webhook_url: String,
+    pub auth: Option<N8nWebhookAuthConfig>,
+    #[serde(default, alias = "team")]
+    pub owner_team: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub template: Option<NotificationTemplateConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum N8nWebhookAuthConfig {
+    Header {
+        header_name: String,
+        value_env: String,
+    },
+}
+
+impl N8nWebhookReceiverConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let webhook_url = self.webhook_url.trim();
+        let url =
+            reqwest::Url::parse(webhook_url).context("webhook_url must be a valid absolute URL")?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            bail!("webhook_url must use http or https and include a host");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!("webhook_url must not include credentials");
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            bail!("webhook_url must not include a query or fragment");
+        }
+        if self.timeout_secs == 0 {
+            bail!("timeout_secs must be greater than zero");
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl N8nWebhookAuthConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Header {
+                header_name,
+                value_env,
+            } => {
+                let name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
+                    .context("header_name must be a valid HTTP header name")?;
+                if matches!(
+                    name.as_str(),
+                    "host" | "content-length" | "content-type" | "idempotency-key"
+                ) {
+                    bail!("header_name is reserved by the n8n webhook transport");
+                }
+                if value_env.trim().is_empty() {
+                    bail!("value_env must not be empty");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn resolved_header(
+        &self,
+    ) -> anyhow::Result<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
+        match self {
+            Self::Header {
+                header_name,
+                value_env,
+            } => {
+                let name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
+                    .context("configured n8n auth header name is invalid")?;
+                let value = env::var(value_env)
+                    .with_context(|| format!("environment variable {value_env} is not set"))?;
+                if value.is_empty() {
+                    bail!("environment variable {value_env} must not be empty");
+                }
+                let value = reqwest::header::HeaderValue::from_str(&value).with_context(|| {
+                    format!("environment variable {value_env} is not a valid HTTP header value")
+                })?;
+                Ok((name, value))
+            }
+        }
+    }
 }
 
 pub const DEFAULT_CLOUDEVENTS_ALERT_TYPE: &str = "io.github.clawosiris.simple-alert-proxy.alert.v1";
@@ -1377,7 +1476,7 @@ fn validate_source_preset(integration_name: &str, preset: &str) -> anyhow::Resul
 
 fn validate_builtin_preset(integration_name: &str, preset: &str) -> anyhow::Result<()> {
     match preset {
-        "signoz" | "alertmanager" | "grafana" => Ok(()),
+        "signoz" | "alertmanager" | "grafana" | "n8n" => Ok(()),
         _ => bail!("integration {integration_name} builtin preset {preset} is not supported"),
     }
 }
@@ -1563,6 +1662,62 @@ source: urn:simple-alert-proxy:production
         assert_eq!(receiver.batch_type, DEFAULT_CLOUDEVENTS_BATCH_TYPE);
         assert_eq!(receiver.timeout_secs, 10);
         receiver.validate().unwrap();
+    }
+
+    #[test]
+    fn n8n_webhook_receiver_parses_and_validates_header_auth() {
+        let receiver: ReceiverConfig = serde_yaml::from_str(
+            r#"
+type: n8n_webhook
+webhook_url: https://n8n.example.test/webhook/alerts
+auth:
+  type: header
+  header_name: X-N8N-Webhook-Token
+  value_env: SIMPLE_ALERT_PROXY_N8N_TOKEN
+"#,
+        )
+        .unwrap();
+        let ReceiverConfig::N8nWebhook(receiver) = receiver else {
+            panic!("expected n8n webhook receiver")
+        };
+
+        assert_eq!(receiver.timeout_secs, 10);
+        receiver.validate().unwrap();
+    }
+
+    #[test]
+    fn n8n_webhook_receiver_rejects_secret_bearing_urls_and_reserved_headers() {
+        for (webhook_url, header_name, expected) in [
+            (
+                "https://user:secret@n8n.example.test/webhook/alerts",
+                "X-N8N-Token",
+                "must not include credentials",
+            ),
+            (
+                "https://n8n.example.test/webhook/alerts?token=secret",
+                "X-N8N-Token",
+                "must not include a query",
+            ),
+            (
+                "https://n8n.example.test/webhook/alerts",
+                "Idempotency-Key",
+                "reserved",
+            ),
+        ] {
+            let receiver = N8nWebhookReceiverConfig {
+                webhook_url: webhook_url.to_string(),
+                auth: Some(N8nWebhookAuthConfig::Header {
+                    header_name: header_name.to_string(),
+                    value_env: "SIMPLE_ALERT_PROXY_N8N_TOKEN".to_string(),
+                }),
+                owner_team: None,
+                timeout_secs: 10,
+                template: None,
+            };
+
+            let error = receiver.validate().unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

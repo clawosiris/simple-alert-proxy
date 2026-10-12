@@ -20,6 +20,7 @@ const MAX_RECURSION_DEPTH: usize = 32;
 pub enum PayloadKind {
     GoogleChat,
     GenericWebhook,
+    N8nWebhook,
     CloudEventsWebhook,
     Slack,
     Mattermost,
@@ -34,7 +35,7 @@ impl PayloadKind {
             Self::Slack | Self::Mattermost => 40 * 1024,
             Self::Discord => 16 * 1024,
             Self::Matrix => 64 * 1024,
-            Self::GenericWebhook | Self::CloudEventsWebhook => 256 * 1024,
+            Self::GenericWebhook | Self::N8nWebhook | Self::CloudEventsWebhook => 256 * 1024,
         }
     }
 }
@@ -44,6 +45,7 @@ impl fmt::Display for PayloadKind {
         formatter.write_str(match self {
             Self::GoogleChat => "google_chat",
             Self::GenericWebhook => "generic_webhook",
+            Self::N8nWebhook => "n8n_webhook",
             Self::CloudEventsWebhook => "cloudevents_webhook",
             Self::Slack => "slack",
             Self::Mattermost => "mattermost",
@@ -291,6 +293,7 @@ fn receiver_payload_kind(receiver: &ReceiverConfig) -> PayloadKind {
     match receiver {
         ReceiverConfig::GoogleChat(_) => PayloadKind::GoogleChat,
         ReceiverConfig::GenericWebhook(_) => PayloadKind::GenericWebhook,
+        ReceiverConfig::N8nWebhook(_) => PayloadKind::N8nWebhook,
         ReceiverConfig::CloudEventsWebhook(_) => PayloadKind::CloudEventsWebhook,
         ReceiverConfig::Slack(_) => PayloadKind::Slack,
         ReceiverConfig::Mattermost(_) => PayloadKind::Mattermost,
@@ -338,7 +341,9 @@ fn validate_payload_shape(
         });
     };
     let valid = match target {
-        PayloadKind::GenericWebhook | PayloadKind::CloudEventsWebhook => true,
+        PayloadKind::GenericWebhook | PayloadKind::N8nWebhook | PayloadKind::CloudEventsWebhook => {
+            true
+        }
         PayloadKind::GoogleChat => {
             object.get("text").is_some_and(Value::is_string)
                 || object.get("cardsV2").is_some_and(Value::is_array)
@@ -369,7 +374,9 @@ fn validate_payload_shape(
                 }
                 PayloadKind::Discord => "expected string content or array embeds",
                 PayloadKind::Matrix => "expected string msgtype and body",
-                PayloadKind::GenericWebhook | PayloadKind::CloudEventsWebhook => unreachable!(),
+                PayloadKind::GenericWebhook
+                | PayloadKind::N8nWebhook
+                | PayloadKind::CloudEventsWebhook => unreachable!(),
             },
         })
     }
@@ -715,6 +722,7 @@ mod tests {
         for (target, source) in [
             (PayloadKind::GoogleChat, r#"{"text":"ok"}"#),
             (PayloadKind::GenericWebhook, r#"{"anything":true}"#),
+            (PayloadKind::N8nWebhook, r#"{"anything":true}"#),
             (PayloadKind::CloudEventsWebhook, r#"{"anything":true}"#),
             (PayloadKind::Slack, r#"{"text":"ok"}"#),
             (PayloadKind::Mattermost, r#"{"text":"ok"}"#),

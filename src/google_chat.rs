@@ -3,8 +3,9 @@ use crate::{
     cloudevents_outbound::{self, OutboundCloudEventsError},
     config::{
         ChatWebhookReceiverConfig, CloudEventsWebhookReceiverConfig, GenericWebhookReceiverConfig,
-        GoogleChatReceiverConfig, MatrixReceiverConfig, ReceiverConfig,
+        GoogleChatReceiverConfig, MatrixReceiverConfig, N8nWebhookReceiverConfig, ReceiverConfig,
     },
+    n8n,
     notification::NotificationBatch,
     redaction,
     routing::Delivery,
@@ -107,6 +108,10 @@ impl GoogleChatClient {
                 self.send_generic_webhook(receiver, event, delivery, debug)
                     .await
             }
+            ReceiverConfig::N8nWebhook(receiver) => {
+                self.send_n8n_webhook(receiver, event, delivery, delivery_idempotency_key, debug)
+                    .await
+            }
             ReceiverConfig::CloudEventsWebhook(receiver) => {
                 self.send_cloudevents_webhook(
                     receiver,
@@ -192,6 +197,10 @@ impl GoogleChatClient {
                 )
                 .await
             }
+            ReceiverConfig::N8nWebhook(receiver) => {
+                self.send_n8n_batch(receiver, batch, delivery, delivery_idempotency_key, debug)
+                    .await
+            }
             ReceiverConfig::CloudEventsWebhook(receiver) => {
                 self.send_cloudevents_batch(
                     receiver,
@@ -254,6 +263,80 @@ impl GoogleChatClient {
             debug,
         )
         .await
+    }
+
+    async fn send_n8n_webhook(
+        &self,
+        receiver: &N8nWebhookReceiverConfig,
+        event: &AlertEvent,
+        delivery: &Delivery,
+        delivery_idempotency_key: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let target = PayloadKind::N8nWebhook;
+        let rendered = self
+            .templates
+            .render_event(&delivery.receiver, event, delivery, target)?;
+        let message = rendered
+            .as_ref()
+            .and_then(|rendered| rendered.payload.clone())
+            .unwrap_or_else(|| n8n::build_event_payload(event, delivery, delivery_idempotency_key));
+        validate_payload_size(&delivery.receiver, target, &message)?;
+        self.post_n8n(receiver, &message, delivery_idempotency_key, debug)
+            .await
+    }
+
+    async fn send_n8n_batch(
+        &self,
+        receiver: &N8nWebhookReceiverConfig,
+        batch: &NotificationBatch,
+        delivery: &Delivery,
+        delivery_idempotency_key: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        let target = PayloadKind::N8nWebhook;
+        let rendered = self
+            .templates
+            .render_batch(&delivery.receiver, batch, delivery, target)?;
+        let message = rendered
+            .as_ref()
+            .and_then(|rendered| rendered.payload.clone())
+            .unwrap_or_else(|| n8n::build_batch_payload(batch, delivery, delivery_idempotency_key));
+        validate_payload_size(&delivery.receiver, target, &message)?;
+        self.post_n8n(receiver, &message, delivery_idempotency_key, debug)
+            .await
+    }
+
+    async fn post_n8n(
+        &self,
+        receiver: &N8nWebhookReceiverConfig,
+        message: &serde_json::Value,
+        delivery_idempotency_key: &str,
+        debug: Option<DebugDeliveryLog<'_>>,
+    ) -> Result<(), GoogleChatError> {
+        if let Some(debug) = debug {
+            log_outgoing_alert(message, debug);
+        }
+
+        let mut request = self
+            .http
+            .post(&receiver.webhook_url)
+            .header("idempotency-key", delivery_idempotency_key)
+            .timeout(Duration::from_secs(receiver.timeout_secs))
+            .json(message);
+        if let Some(auth) = &receiver.auth {
+            let (name, value) = auth
+                .resolved_header()
+                .map_err(|error| GoogleChatError::Config(error.to_string()))?;
+            request = request.header(name, value);
+        }
+        let response = request.send().await?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(GoogleChatError::Rejected(response.status()))
+        }
     }
 
     async fn send_cloudevents_webhook(

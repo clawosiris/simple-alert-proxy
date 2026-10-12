@@ -1,0 +1,65 @@
+{
+  "name": "Send alert to Simple Alert Proxy",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "ec9d7960-c825-4f5b-b8f4-ad8eea8d9e6b",
+      "name": "When clicking Execute workflow",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [260, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { status: 'firing', severity: 'critical', title: 'Checkout error rate is high', body: 'Error rate exceeded 5% for ten minutes', fingerprint: 'checkout-error-rate', group_key: 'checkout-production', starts_at: new Date().toISOString(), ends_at: null, labels: { service: 'checkout', environment: 'production' }, annotations: { runbook: 'Investigate recent checkout deploys' }, links: { source: $execution.resumeUrl ?? 'https://n8n.example.com/' } } }];"
+      },
+      "id": "53225365-a264-46fa-9399-0b8c11afccbe",
+      "name": "Build canonical alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SIMPLE_ALERT_PROXY_URL + '/webhooks/n8n' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.N8N_TO_ALERT_PROXY_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "c6ad9d84-27cf-42e4-950c-93a35c595bd9",
+      "name": "POST alert to proxy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [760, 300]
+    }
+  ],
+  "connections": {
+    "When clicking Execute workflow": {
+      "main": [[{"node": "Build canonical alert", "type": "main", "index": 0}]]
+    },
+    "Build canonical alert": {
+      "main": [[{"node": "POST alert to proxy", "type": "main", "index": 0}]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "versionId": "b262a0dc-f6f4-410f-a872-f30423c68155",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

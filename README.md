@@ -287,6 +287,7 @@ are:
 - `signoz`
 - `alertmanager`
 - `grafana`
+- `n8n`
 
 Generic JSON integrations use dotted paths or JSON pointers to map payload
 fields. Supported generic JSON presets are:
@@ -353,6 +354,14 @@ receivers:
     webhook_url: "https://events.example.test/alerts"
     source: "urn:simple-alert-proxy:production"
     mode: "structured"
+
+  n8n-automation:
+    type: "n8n_webhook"
+    webhook_url: "https://n8n.example.com/webhook/alert-automation"
+    auth:
+      type: "header"
+      header_name: "X-N8N-Webhook-Token"
+      value_env: "SIMPLE_ALERT_PROXY_N8N_TOKEN"
 
   slack-alerts:
     type: "slack"
@@ -479,9 +488,9 @@ not supported by this receiver.
 
 All receivers support guarded MiniJinja 2.x templates. Google Chat, Slack,
 Mattermost, Discord, and Matrix accept a standard `template.title` /
-`template.body` mode. Generic webhooks accept `template.payload` as their
-complete body. CloudEvents webhooks accept `template.payload` as event `data`
-only; every other receiver can use payload mode to control its complete
+`template.body` mode. Generic and n8n webhooks accept `template.payload` as
+their complete body. CloudEvents webhooks accept `template.payload` as event
+`data` only; every other receiver can use payload mode to control its complete
 platform JSON body.
 
 ```yaml
@@ -666,6 +675,37 @@ curl -X POST http://127.0.0.1:8080/webhooks/openvas-example \
   -H 'authorization: Bearer replace-me' \
   --data @examples/generic-json-webhook.json
 ```
+
+### n8n
+
+The built-in `n8n` integration accepts a documented canonical single-event
+body or an explicit `events[]` envelope. The distinct `n8n_webhook` receiver
+posts versioned, raw-free event or notification-batch JSON to an active n8n
+Webhook workflow, supports environment-backed Header Auth, and sends a stable
+`Idempotency-Key` across retries/recovery with a new value on explicit replay.
+
+```yaml
+integrations:
+  n8n-alerts:
+    type: builtin
+    preset: n8n
+    path: /webhooks/n8n
+    auth:
+      bearer_token: replace-me
+
+receivers:
+  n8n-automation:
+    type: n8n_webhook
+    webhook_url: https://n8n.example.com/webhook/alert-automation
+    auth:
+      type: header
+      header_name: X-N8N-Webhook-Token
+      value_env: SIMPLE_ALERT_PROXY_N8N_TOKEN
+```
+
+See [n8n Integration](docs/N8N.md) for the complete contracts, importable
+workflow exports, authentication setup, production-versus-test URL guidance,
+retry/replay semantics, limits, and loop avoidance.
 
 ### CloudEvents 1.0
 

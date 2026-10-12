@@ -41,6 +41,13 @@ integrations:
     auth:
       bearer_token: "replace-me"
 
+  # n8n-alerts:
+  #   type: "builtin"
+  #   preset: "n8n"
+  #   path: "/webhooks/n8n"
+  #   auth:
+  #     bearer_token: "replace-me"
+
   openvas-example:
     type: "generic_json"
     preset: "openvas_scan"
@@ -171,6 +178,15 @@ receivers:
     type: "generic_webhook"
     webhook_url: "https://alerts.example.test/webhook"
     timeout_secs: 10
+
+  # n8n-automation:
+  #   type: "n8n_webhook"
+  #   webhook_url: "https://n8n.example.com/webhook/alert-automation"
+  #   auth:
+  #     type: "header"
+  #     header_name: "X-N8N-Webhook-Token"
+  #     value_env: "SIMPLE_ALERT_PROXY_N8N_TOKEN"
+  #   timeout_secs: 10
 
   cloud-events:
     type: "cloudevents_webhook"

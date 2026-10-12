@@ -1,0 +1,20 @@
+{
+  "status": "firing",
+  "severity": "critical",
+  "title": "Checkout error rate is high",
+  "body": "Error rate exceeded 5% for ten minutes",
+  "fingerprint": "checkout-error-rate",
+  "group_key": "checkout-production",
+  "starts_at": "2026-10-11T06:00:00Z",
+  "ends_at": null,
+  "labels": {
+    "service": "checkout",
+    "environment": "production"
+  },
+  "annotations": {
+    "runbook": "Investigate recent checkout deploys"
+  },
+  "links": {
+    "source": "https://n8n.example.com/workflow/example/executions/123"
+  }
+}

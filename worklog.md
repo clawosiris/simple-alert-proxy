@@ -106,3 +106,8 @@
 - Verified the refreshed docs/config with formatting, all 186 Rust tests, Clippy with warnings denied, diff checks, and a dry-run of Podman's Quadlet generator on the approved worker.
 - Started release `v0.0.13` from current `main` after merging the approved Rustls 0.23.45 security update: bumped Cargo package metadata, lockfile, and the README GHCR pull example.
 - Verified the `v0.0.13` release candidate with formatting, 186 Rust tests, Clippy with warnings denied, a clean RustSec audit, a locked release build, all six production-binary E2E journeys, and diff checks.
+
+2026-10-12
+
+- Started issue #121 on `feat/issue-121-n8n-integration`: first-class n8n single/batch intake, authenticated n8n webhook delivery with stable idempotency keys, importable workflows, fixtures, docs, and regression coverage.
+- Completed issue #121 locally: added the built-in n8n intake contract, environment-backed Header Auth for `n8n_webhook`, versioned raw-free single/batch payloads, retry/recovery-stable and replay-renewed idempotency keys, workflow exports, fixtures, docs, and unit/binary/container coverage. Verified formatting, 196 Rust tests, Clippy with warnings denied, diff checks, a locked release build, all seven production-binary journeys, and the full non-root Podman container journey on the approved worker.
