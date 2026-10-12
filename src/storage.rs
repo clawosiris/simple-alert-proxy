@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -49,8 +49,14 @@ impl Storage {
         Ok(storage)
     }
 
+    fn connection(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn migrate(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS alert_events (
@@ -247,7 +253,7 @@ impl Storage {
         let raw_payload = serde_json::to_string(&event.raw_payload)?;
         let normalized_event = serde_json::to_string(event)?;
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let team_id = owner_team
             .map(|team| team_id_by_name(&conn, team))
             .transpose()?
@@ -286,7 +292,7 @@ impl Storage {
             "receiver": delivery.receiver,
         })
         .to_string();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             INSERT INTO delivery_records (
@@ -321,7 +327,7 @@ impl Storage {
             "notification_batch": batch_key,
         })
         .to_string();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.connection();
         let tx = conn.transaction()?;
         tx.execute(
             r#"
@@ -428,7 +434,7 @@ impl Storage {
 
     pub fn recover_notification_batches(&self) -> anyhow::Result<usize> {
         let now = now_epoch_millis();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.connection();
         let tx = conn.transaction()?;
         let recovered = tx.execute(
             r#"
@@ -458,7 +464,7 @@ impl Storage {
 
     pub fn recover_deliveries(&self) -> anyhow::Result<Vec<RecoveredDelivery>> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT delivery_records.id, delivery_records.status,
@@ -511,7 +517,7 @@ impl Storage {
 
     pub fn claim_due_notification_batch(&self) -> anyhow::Result<Option<ClaimedNotificationBatch>> {
         let now = now_epoch_millis();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.connection();
         let tx = conn.transaction()?;
         let Some((
             batch_id,
@@ -638,7 +644,7 @@ impl Storage {
         error: Option<&str>,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.connection();
         let tx = conn.transaction()?;
         tx.execute(
             r#"
@@ -676,7 +682,7 @@ impl Storage {
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let due_at = now + delay_millis as i64;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let alert_group_id: i64 = conn.query_row(
             r#"
             SELECT alert_group_id
@@ -713,7 +719,7 @@ impl Storage {
 
     pub fn claim_due_escalation(&self) -> anyhow::Result<Option<EscalationTaskRecord>> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let Some((task_id, alert_group_id, policy, step_index)) = conn
             .query_row(
                 r#"
@@ -774,7 +780,7 @@ impl Storage {
         detail: &str,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             UPDATE escalation_tasks
@@ -829,7 +835,7 @@ impl Storage {
 
     pub fn fail_escalation_task(&self, task_id: i64, detail: &str) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let alert_group_id: i64 = conn.query_row(
             "SELECT alert_group_id FROM escalation_tasks WHERE id = ?1",
             params![task_id],
@@ -858,7 +864,7 @@ impl Storage {
 
     pub fn mark_attempt(&self, delivery_id: i64, attempt: u32) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             UPDATE delivery_records
@@ -875,7 +881,7 @@ impl Storage {
 
     pub fn mark_succeeded(&self, delivery_id: i64, response_summary: &str) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             UPDATE delivery_records
@@ -898,7 +904,7 @@ impl Storage {
         error: &str,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             UPDATE delivery_records
@@ -915,7 +921,7 @@ impl Storage {
 
     pub fn mark_dead_letter(&self, delivery_id: i64, error: &str) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             UPDATE delivery_records
@@ -931,7 +937,7 @@ impl Storage {
     }
 
     pub fn list_alert_groups(&self) -> anyhow::Result<Vec<AlertGroupRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT alert_groups.id, group_namespace, fingerprint, team_id, teams.name,
@@ -965,7 +971,7 @@ impl Storage {
     }
 
     pub fn list_alert_events(&self) -> anyhow::Result<Vec<AlertEventRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, alert_group_id, event_id, integration, group_namespace, source, status,
@@ -997,7 +1003,7 @@ impl Storage {
     }
 
     pub fn list_deliveries(&self) -> anyhow::Result<Vec<DeliveryRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT delivery_records.id, alert_event_id, alert_events.alert_group_id,
@@ -1042,7 +1048,7 @@ impl Storage {
         actor: AuditActor,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         update_group_exists(&conn, alert_group_id)?;
         conn.execute(
             "UPDATE alert_groups SET acknowledged_at = ?2, updated_at = ?2 WHERE id = ?1",
@@ -1068,7 +1074,7 @@ impl Storage {
 
     pub fn resolve_group_as(&self, alert_group_id: i64, actor: AuditActor) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         update_group_exists(&conn, alert_group_id)?;
         conn.execute(
             "UPDATE alert_groups SET status = 'resolved', updated_at = ?2 WHERE id = ?1",
@@ -1095,7 +1101,7 @@ impl Storage {
     pub fn silence_group_as(&self, alert_group_id: i64, actor: AuditActor) -> anyhow::Result<()> {
         let now = now_epoch_millis();
         let silenced_until = now + 60 * 60 * 1000;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         update_group_exists(&conn, alert_group_id)?;
         conn.execute(
             "UPDATE alert_groups SET silenced_until = ?2, updated_at = ?3 WHERE id = ?1",
@@ -1124,7 +1130,7 @@ impl Storage {
         actor: AuditActor,
     ) -> anyhow::Result<DeliveryReplayRecord> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         update_delivery_exists(&conn, delivery_id)?;
         let replay = delivery_replay_record(&conn, delivery_id)?;
         conn.execute(
@@ -1151,7 +1157,7 @@ impl Storage {
         value: &str,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             INSERT INTO advisory_enrichments (
@@ -1165,7 +1171,7 @@ impl Storage {
     }
 
     pub fn list_advisories(&self) -> anyhow::Result<Vec<AdvisoryRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, alert_group_id, provider, kind, value, created_at
@@ -1196,7 +1202,7 @@ impl Storage {
     }
 
     pub fn user_count(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let count = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))?;
         usize::try_from(count).context("user count overflowed usize")
     }
@@ -1219,7 +1225,7 @@ impl Storage {
         validate_global_role(global_role)?;
 
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             INSERT INTO users (
@@ -1234,7 +1240,7 @@ impl Storage {
     }
 
     pub fn list_users(&self) -> anyhow::Result<Vec<UserRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, username, display_name, global_role, status,
@@ -1253,7 +1259,7 @@ impl Storage {
         &self,
         username: &str,
     ) -> anyhow::Result<Option<UserCredentialRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.query_row(
             r#"
             SELECT id, username, display_name, password_hash, global_role, status,
@@ -1270,7 +1276,7 @@ impl Storage {
 
     pub fn update_last_login(&self, user_id: i64) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             "UPDATE users SET last_login_at = ?2, updated_at = ?2 WHERE id = ?1",
             params![user_id, now],
@@ -1285,7 +1291,7 @@ impl Storage {
         actor: AuditActor,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         update_user_exists(&conn, user_id)?;
         conn.execute(
             "UPDATE users SET password_hash = ?2, updated_at = ?3 WHERE id = ?1",
@@ -1313,7 +1319,7 @@ impl Storage {
         actor: AuditActor,
     ) -> anyhow::Result<DisableUserOutcome> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         update_user_exists(&conn, user_id)?;
         if is_active_admin(&conn, user_id)? && active_admin_count(&conn)? <= 1 {
             return Ok(DisableUserOutcome::LastActiveAdmin);
@@ -1346,7 +1352,7 @@ impl Storage {
         expires_at: i64,
     ) -> anyhow::Result<()> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             INSERT INTO auth_sessions (
@@ -1360,7 +1366,7 @@ impl Storage {
     }
 
     pub fn delete_expired_sessions(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let deleted = conn.execute(
             "DELETE FROM auth_sessions WHERE expires_at <= ?1",
             params![now_epoch_millis()],
@@ -1379,7 +1385,7 @@ impl Storage {
     }
 
     fn prune_alerts_before(&self, cutoff: i64) -> anyhow::Result<usize> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.connection();
         let tx = conn.transaction()?;
         let deleted_events = prune_alerts_before_tx(&tx, cutoff)?;
         tx.commit()?;
@@ -1388,7 +1394,7 @@ impl Storage {
 
     pub fn session_user(&self, token_hash: &str) -> anyhow::Result<Option<SessionUserRecord>> {
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let record = conn
             .query_row(
                 r#"
@@ -1423,7 +1429,7 @@ impl Storage {
     }
 
     pub fn delete_session(&self, token_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             "DELETE FROM auth_sessions WHERE token_hash = ?1",
             params![token_hash],
@@ -1437,7 +1443,7 @@ impl Storage {
             anyhow::bail!("team name must not be empty");
         }
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             r#"
             INSERT INTO teams (name, description, created_at, updated_at)
@@ -1449,7 +1455,7 @@ impl Storage {
     }
 
     pub fn list_teams(&self) -> anyhow::Result<Vec<TeamRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, name, description, created_at, updated_at
@@ -1464,7 +1470,7 @@ impl Storage {
     }
 
     pub fn list_team_memberships(&self) -> anyhow::Result<Vec<TeamMembershipRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT team_memberships.user_id, users.username,
@@ -1486,7 +1492,7 @@ impl Storage {
         &self,
         user_id: i64,
     ) -> anyhow::Result<Vec<TeamMembershipRecord>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare(
             r#"
             SELECT team_memberships.user_id, users.username,
@@ -1513,7 +1519,7 @@ impl Storage {
     ) -> anyhow::Result<TeamMembershipRecord> {
         validate_team_role(team_role)?;
         let now = now_epoch_millis();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         update_team_exists(&conn, team_id)?;
         update_user_exists(&conn, user_id)?;
         conn.execute(
@@ -1541,7 +1547,7 @@ impl Storage {
     }
 
     pub fn remove_team_membership(&self, team_id: i64, user_id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.execute(
             "DELETE FROM team_memberships WHERE user_id = ?1 AND team_id = ?2",
             params![user_id, team_id],
@@ -1550,7 +1556,7 @@ impl Storage {
     }
 
     pub fn alert_group_team_id(&self, alert_group_id: i64) -> anyhow::Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.query_row(
             "SELECT team_id FROM alert_groups WHERE id = ?1",
             params![alert_group_id],
@@ -1560,7 +1566,7 @@ impl Storage {
     }
 
     pub fn delivery_alert_group_team_id(&self, delivery_id: i64) -> anyhow::Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         conn.query_row(
             r#"
             SELECT alert_groups.team_id
@@ -1577,7 +1583,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn audit_actions(&self) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare("SELECT action FROM audit_entries ORDER BY id")?;
         let actions = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -1587,7 +1593,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn audit_actor_user_ids(&self) -> anyhow::Result<Vec<Option<i64>>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare("SELECT actor_user_id FROM audit_entries ORDER BY id")?;
         let actors = stmt
             .query_map([], |row| row.get::<_, Option<i64>>(0))?
@@ -1597,7 +1603,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn session_count(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let count = conn.query_row("SELECT COUNT(*) FROM auth_sessions", [], |row| {
             row.get::<_, i64>(0)
         })?;
@@ -1606,7 +1612,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn escalation_statuses(&self) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare("SELECT status FROM escalation_tasks ORDER BY id")?;
         let statuses = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -1616,7 +1622,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn delivery_statuses(&self) -> anyhow::Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare("SELECT status FROM delivery_records ORDER BY id")?;
         let statuses = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -1626,7 +1632,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn delivery_attempts(&self) -> anyhow::Result<Vec<u32>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let mut stmt = conn.prepare("SELECT attempt_count FROM delivery_records ORDER BY id")?;
         let attempts = stmt
             .query_map([], |row| row.get::<_, u32>(0))?
@@ -1636,7 +1642,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn event_count(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let count = conn.query_row("SELECT COUNT(*) FROM alert_events", [], |row| {
             row.get::<_, i64>(0)
         })?;
@@ -1645,7 +1651,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn alert_group_count(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let count = conn.query_row("SELECT COUNT(*) FROM alert_groups", [], |row| {
             row.get::<_, i64>(0)
         })?;
@@ -1654,7 +1660,7 @@ impl Storage {
 
     #[cfg(test)]
     pub fn advisory_count(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.connection();
         let count = conn.query_row("SELECT COUNT(*) FROM advisory_enrichments", [], |row| {
             row.get::<_, i64>(0)
         })?;
@@ -2808,6 +2814,22 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn storage_recovers_from_poisoned_connection_lock() {
+        let storage = Storage::open(":memory:").unwrap();
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _conn = storage
+                .conn
+                .lock()
+                .expect("fresh storage lock should not be poisoned");
+            panic!("poison storage connection lock");
+        }));
+
+        assert!(poison_result.is_err());
+        assert_eq!(storage.user_count().unwrap(), 0);
+    }
+
+    #[test]
     fn group_namespaces_isolate_lifecycle_ownership_and_actions() {
         let storage = Storage::open(":memory:").unwrap();
         let team_a = storage.create_team("grafana-a", "").unwrap();
@@ -3018,7 +3040,7 @@ mod tests {
         assert_eq!(events[0].alert_group_id, Some(7));
         assert_eq!(events[0].group_namespace, groups[0].group_namespace);
 
-        let conn = storage.conn.lock().unwrap();
+        let conn = storage.connection();
         for (table, expected_id) in [
             ("delivery_records", 13_i64),
             ("audit_entries", 17),
@@ -3079,7 +3101,7 @@ mod tests {
         drop(legacy);
 
         let storage = Storage::open(database_path.to_str().unwrap()).unwrap();
-        let conn = storage.conn.lock().unwrap();
+        let conn = storage.connection();
         let stop_conditions: (bool, bool) = conn
             .query_row(
                 "SELECT stop_on_ack, stop_on_resolve FROM escalation_tasks WHERE policy = 'legacy'",
@@ -3338,7 +3360,7 @@ mod tests {
                 .unwrap();
         }
 
-        let conn = storage.conn.lock().unwrap();
+        let conn = storage.connection();
         let inconsistent_members: i64 = conn
             .query_row(
                 r#"
@@ -3581,7 +3603,7 @@ mod tests {
 
         let old = now_epoch_millis() - 3 * 24 * 60 * 60 * 1_000;
         {
-            let conn = storage.conn.lock().unwrap();
+            let conn = storage.connection();
             conn.execute(
                 "UPDATE alert_events SET created_at = ?2 WHERE id = ?1",
                 params![event_id, old],
@@ -3590,7 +3612,7 @@ mod tests {
         }
 
         assert_eq!(storage.prune_alerts_older_than_days(1).unwrap(), 1);
-        let conn = storage.conn.lock().unwrap();
+        let conn = storage.connection();
         for table in [
             "alert_events",
             "delivery_records",
@@ -3662,7 +3684,7 @@ mod tests {
             },
         )?;
 
-        let conn = storage.conn.lock().unwrap();
+        let conn = storage.connection();
         let group_id: i64 = conn.query_row(
             "SELECT alert_group_id FROM alert_events WHERE id = ?1",
             params![event_id],
