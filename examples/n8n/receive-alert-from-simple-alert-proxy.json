@@ -1,0 +1,44 @@
+{
+  "name": "Receive alert from Simple Alert Proxy",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "alert-automation",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "a60b3ad0-0ac0-43cf-ae3b-fe157304cbd4",
+      "name": "Alert webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [300, 300],
+      "webhookId": "b07403ef-03a2-4724-b32e-f2d6935df09a"
+    },
+    {
+      "parameters": {
+        "jsCode": "const payload = $json.body ?? $json;\nconst key = payload.delivery?.idempotency_key ?? $json.headers?.['idempotency-key'];\nif (!key) throw new Error('Missing Simple Alert Proxy idempotency key');\nconst seen = $getWorkflowStaticData('global');\nseen.deliveryKeys ??= {};\nif (seen.deliveryKeys[key]) return [{ json: { duplicate: true, idempotency_key: key } }];\nseen.deliveryKeys[key] = new Date().toISOString();\nreturn [{ json: { duplicate: false, idempotency_key: key, kind: payload.kind, event: payload.event ?? null, events: payload.events ?? [] } }];"
+      },
+      "id": "57b2a81f-ab06-421a-9691-df62451f95a8",
+      "name": "Deduplicate delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 300]
+    }
+  ],
+  "connections": {
+    "Alert webhook": {
+      "main": [[{"node": "Deduplicate delivery", "type": "main", "index": 0}]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "versionId": "dc1bf18a-e330-44f0-bf76-4bc64ba99bf0",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

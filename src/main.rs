@@ -38,6 +38,7 @@ mod config;
 mod google_chat;
 mod grafana;
 mod integration;
+mod n8n;
 mod notification;
 mod redaction;
 mod routing;
@@ -1234,6 +1235,11 @@ fn process_builtin_alerts(
             let events = integration::normalize_grafana(name, payload)?;
             process_generic_events(state, &events)
         }
+        "n8n" => {
+            let events =
+                n8n::normalize(name, payload).map_err(integration::IntegrationError::from)?;
+            process_generic_events(state, &events)
+        }
         _ => Err(integration::IntegrationError::Unknown(preset.to_string()).into()),
     }
 }
@@ -2179,9 +2185,9 @@ mod tests {
         DebugConfig, DeliveryConfig, EscalationConfig, EscalationPolicyConfig,
         EscalationStepConfig, GenericJsonIntegrationConfig, GenericWebhookReceiverConfig,
         GoogleChatReceiverConfig, IntegrationConfig, IntelligenceConfig, ManagementConfig,
-        MatrixReceiverConfig, NotificationBatchingConfig, NotificationTemplateConfig,
-        ReceiverConfig, RoutingConfig, ScheduleConfig, ServerConfig, ServerLimitsConfig,
-        StorageConfig,
+        MatrixReceiverConfig, N8nWebhookAuthConfig, N8nWebhookReceiverConfig,
+        NotificationBatchingConfig, NotificationTemplateConfig, ReceiverConfig, RoutingConfig,
+        ScheduleConfig, ServerConfig, ServerLimitsConfig, StorageConfig,
     };
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -3309,6 +3315,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn n8n_builtin_accepts_authenticated_single_and_batch_contracts() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.management.allow_unauthenticated = true;
+        config.notification_batching.enabled = false;
+        config.integrations = BTreeMap::from([(
+            "n8n-alerts".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "n8n".to_string(),
+                path: "/webhooks/n8n".to_string(),
+                auth: Some(AuthConfig {
+                    bearer_token: "n8n-inbound-token".to_string(),
+                }),
+            }),
+        )]);
+        config.routing.routes.clear();
+        config.routing.default_receiver = Some("target".to_string());
+        config.receivers.insert(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+                template: None,
+            }),
+        );
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        let event = serde_json::json!({
+            "status": "firing",
+            "severity": "critical",
+            "title": "Checkout error rate is high",
+            "body": "Error rate exceeded 5%",
+            "fingerprint": "checkout-error-rate",
+            "group_key": "checkout-production",
+            "starts_at": "2026-10-11T06:00:00Z",
+            "ends_at": null,
+            "labels": {"service": "checkout", "environment": "production"},
+            "annotations": {"runbook": "Investigate recent checkout deploys"},
+            "links": {"source": "https://n8n.example.test/executions/123"}
+        });
+        let request = |payload: Value, token: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/webhooks/n8n")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            builder.body(Body::from(payload.to_string())).unwrap()
+        };
+
+        let unauthorized = app
+            .clone()
+            .oneshot(request(event.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let single = app
+            .clone()
+            .oneshot(request(event.clone(), Some("n8n-inbound-token")))
+            .await
+            .unwrap();
+        let batch = app
+            .clone()
+            .oneshot(request(
+                serde_json::json!({
+                    "events": [event, {
+                        "status": "resolved",
+                        "title": "Worker backlog",
+                        "fingerprint": "worker-backlog"
+                    }]
+                }),
+                Some("n8n-inbound-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(single.status(), StatusCode::ACCEPTED);
+        assert_eq!(batch.status(), StatusCode::ACCEPTED);
+
+        let events = get_api_json(app.clone(), "/api/alert-events").await;
+        assert_eq!(events.as_array().unwrap().len(), 3);
+        assert!(events.as_array().unwrap().iter().all(|event| {
+            event["integration"] == "n8n-alerts"
+                && event["group_namespace"] == "integration/n8n-alerts"
+                && event["source"] == "n8n"
+        }));
+        wait_for_received_count(&received, 3).await;
+
+        let malformed = app
+            .oneshot(request(
+                serde_json::json!({
+                    "status": "firing",
+                    "title": "",
+                    "fingerprint": "invalid"
+                }),
+                Some("n8n-inbound-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn cloudevents_structured_and_binary_requests_share_lifecycle_group() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
@@ -3727,6 +3838,68 @@ mod tests {
         assert_eq!(received[0]["event"]["fingerprint"], "finding-1");
         assert!(received[0].get("batch").is_none());
         assert!(received[0].get("events").is_none());
+    }
+
+    #[tokio::test]
+    async fn n8n_webhook_sends_durable_batch_as_one_delivery() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.notification_batching.group_wait_millis = 10;
+        config.integrations = generic_test_integrations();
+        let IntegrationConfig::GenericJson(integration) =
+            config.integrations.get_mut("openvas").unwrap()
+        else {
+            panic!("expected generic integration")
+        };
+        integration.mapping.notification_group_key = Some("group.id".to_string());
+        config.routing.routes.clear();
+        config.routing.default_receiver = Some("n8n".to_string());
+        config.receivers = BTreeMap::from([(
+            "n8n".to_string(),
+            ReceiverConfig::N8nWebhook(N8nWebhookReceiverConfig {
+                webhook_url,
+                auth: None,
+                owner_team: None,
+                timeout_secs: 10,
+                template: None,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        for fingerprint in ["finding-1", "finding-2"] {
+            let response = app
+                .clone()
+                .oneshot(generic_request(serde_json::json!({
+                    "state": "firing",
+                    "group": { "id": "edge-certs" },
+                    "risk": { "level": "high" },
+                    "finding": {
+                        "id": fingerprint,
+                        "title": "TLS certificate expired",
+                        "plugin": "ssl-cert-check"
+                    }
+                })))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        wait_for_received_count(&received, 1).await;
+        wait_for_succeeded_deliveries(app, 2).await;
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0]["contract"], n8n::CONTRACT);
+        assert_eq!(received[0]["kind"], "notification_batch");
+        assert_eq!(received[0]["batch"]["count"], 2);
+        assert_eq!(received[0]["events"].as_array().unwrap().len(), 2);
+        assert!(
+            received[0]["delivery"]["idempotency_key"]
+                .as_str()
+                .unwrap()
+                .starts_with("simple-alert-proxy-batch-")
+        );
     }
 
     #[tokio::test]
@@ -5001,6 +5174,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn n8n_webhook_injects_header_auth_and_reuses_retry_key_but_renews_replay() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_retrying_mock_n8n(Arc::clone(&received)).await;
+        let env_name = format!("SIMPLE_ALERT_PROXY_N8N_TEST_{}", Uuid::new_v4());
+        let secret = "n8n-test-header-secret";
+        // SAFETY: this test uses a unique environment-variable name and removes it before return.
+        unsafe { env::set_var(&env_name, secret) };
+
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.management.allow_unauthenticated = true;
+        config.notification_batching.enabled = false;
+        config.delivery = DeliveryConfig {
+            max_attempts: 2,
+            initial_backoff_millis: 1,
+            max_backoff_millis: 1,
+        };
+        config.routing.default_receiver = Some("n8n-automation".to_string());
+        config.routing.routes.clear();
+        config.integrations = generic_test_integrations();
+        config.receivers.insert(
+            "n8n-automation".to_string(),
+            ReceiverConfig::N8nWebhook(N8nWebhookReceiverConfig {
+                webhook_url,
+                auth: Some(N8nWebhookAuthConfig::Header {
+                    header_name: "X-N8N-Webhook-Token".to_string(),
+                    value_env: env_name.clone(),
+                }),
+                owner_team: Some("platform".to_string()),
+                timeout_secs: 10,
+                template: None,
+            }),
+        );
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(generic_request(serde_json::json!({
+                "state": "firing",
+                "risk": { "level": "high" },
+                "finding": {
+                    "id": "n8n-retry",
+                    "title": "Run automation",
+                    "plugin": "test"
+                },
+                "secret": "must-not-leave-the-proxy"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 2).await;
+        wait_for_succeeded_deliveries(app.clone(), 1).await;
+
+        let deliveries = get_api_json(app.clone(), "/api/deliveries").await;
+        let delivery_id = deliveries[0]["id"].as_i64().unwrap();
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/deliveries/{delivery_id}/replay"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        wait_for_received_count(&received, 3).await;
+
+        let received = received.lock().unwrap();
+        let initial_key = received[0]["idempotency_key"].as_str().unwrap();
+        let retry_key = received[1]["idempotency_key"].as_str().unwrap();
+        let replay_key = received[2]["idempotency_key"].as_str().unwrap();
+        assert_eq!(received[0]["auth"], secret);
+        assert_eq!(initial_key, retry_key);
+        assert_eq!(
+            received[0]["payload"]["delivery"]["idempotency_key"],
+            initial_key
+        );
+        assert_eq!(received[0]["payload"]["delivery"]["route"], "default");
+        assert_eq!(
+            received[0]["payload"]["delivery"]["receiver"],
+            "n8n-automation"
+        );
+        assert_eq!(received[0]["payload"]["contract"], n8n::CONTRACT);
+        assert!(received[0]["payload"]["event"].get("raw_payload").is_none());
+        assert!(!received[0]["payload"].to_string().contains(secret));
+        assert!(
+            !received[0]["payload"]
+                .to_string()
+                .contains("must-not-leave-the-proxy")
+        );
+        assert_ne!(initial_key, replay_key);
+        assert!(replay_key.starts_with(&format!("simple-alert-proxy-{delivery_id}-replay-")));
+        drop(received);
+
+        // SAFETY: this removes the unique variable installed by this test.
+        unsafe { env::remove_var(env_name) };
+    }
+
+    #[tokio::test]
     async fn cloudevents_recovery_reuses_the_persisted_delivery_id() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let webhook_url = spawn_mock_cloudevents(Arc::clone(&received)).await;
@@ -6245,6 +6518,48 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}/events")
+    }
+
+    async fn spawn_retrying_mock_n8n(received: Arc<Mutex<Vec<Value>>>) -> String {
+        let app = Router::new()
+            .route(
+                "/n8n",
+                post(
+                    |State(received): State<Arc<Mutex<Vec<Value>>>>,
+                     headers: HeaderMap,
+                     Json(payload): Json<Value>| async move {
+                        let auth = headers
+                            .get("x-n8n-webhook-token")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default();
+                        let idempotency_key = headers
+                            .get("idempotency-key")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default();
+                        let attempt = {
+                            let mut received = received.lock().unwrap();
+                            received.push(serde_json::json!({
+                                "auth": auth,
+                                "idempotency_key": idempotency_key,
+                                "payload": payload,
+                            }));
+                            received.len()
+                        };
+                        if attempt == 1 {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::OK
+                        }
+                    },
+                ),
+            )
+            .with_state(received);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/n8n")
     }
 
     async fn spawn_mock_matrix(received: Arc<Mutex<Vec<Value>>>) -> String {

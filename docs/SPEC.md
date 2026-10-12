@@ -2,7 +2,7 @@
 
 ## Goal
 
-Provide a compact Rust alert webhook gateway that accepts SigNoz, Grafana,
+Provide a compact Rust alert webhook gateway that accepts SigNoz, Grafana, n8n,
 CloudEvents 1.0, and generic JSON inputs; normalizes and groups alert events;
 persists lifecycle and delivery state; routes to chat or webhook receivers; and
 gives operators a small authenticated API and UI.
@@ -145,6 +145,13 @@ integrations:
     auth:
       bearer_token: "replace-me"
 
+  n8n-alerts:
+    type: builtin
+    preset: n8n
+    path: "/webhooks/n8n"
+    auth:
+      bearer_token: "replace-me"
+
   openvas-example:
     type: generic_json
     path: "/webhooks/openvas-example"
@@ -211,6 +218,13 @@ single group-level event so Grafana contact-point tests still exercise routing
 and delivery. Per-instance raw payloads retain the top-level Grafana context but
 contain only the current item in `alerts[]`, preventing sibling instances from
 crossing independently routed receiver or team boundaries.
+
+The built-in n8n preset accepts either one canonical alert object or an
+explicit `{ "events": [...] }` batch. Every member requires non-empty `status`,
+`title`, and `fingerprint`; optional dynamic label, annotation, and link maps,
+timestamps, severity, body, and notification `group_key` are preserved. Batch
+members are persisted, routed, and delivered independently. Malformed or empty
+contracts return `400`; valid requests are persisted before `202`.
 
 ## SigNoz Integration
 
@@ -525,7 +539,8 @@ team `operator`/`owner` role.
 ## Receivers
 
 Receiver support includes Google Chat incoming webhooks, generic outbound
-webhooks, CloudEvents 1.0 webhooks, Slack, Mattermost, Discord, and Matrix.
+webhooks, n8n webhooks, CloudEvents 1.0 webhooks, Slack, Mattermost, Discord,
+and Matrix.
 
 ```yaml
 receivers:
@@ -539,6 +554,15 @@ receivers:
   generic-webhook:
     type: generic_webhook
     webhook_url: "https://alerts.example.test/webhook"
+    timeout_secs: 10
+
+  n8n-automation:
+    type: n8n_webhook
+    webhook_url: "https://n8n.example.com/webhook/alert-automation"
+    auth:
+      type: header
+      header_name: X-N8N-Webhook-Token
+      value_env: SIMPLE_ALERT_PROXY_N8N_TOKEN
     timeout_secs: 10
 
   event-bus:
@@ -581,6 +605,14 @@ All receiver types consume the same canonical single-event or durable
 `NotificationBatch` input. Generic, CloudEvents, and chat-style targets use the
 same durable delivery queue, retry, redaction, and replay behavior as Google
 Chat.
+
+`n8n_webhook` sends `simple-alert-proxy.n8n.v1` JSON to an active n8n Webhook
+production URL. Its environment-backed Header Auth value is added only to the
+request, and the receiver rejects credential-bearing or query-bearing URLs.
+The default body is a raw-free `{contract, kind, event, delivery}` or
+`{contract, kind, batch, events, delivery}` object. `delivery.idempotency_key`
+is also sent as `Idempotency-Key`; it is stable across retries/recovery and
+renewed by replay. See `docs/N8N.md` for the complete contract and workflows.
 
 ### Outbound CloudEvents contract
 
@@ -632,9 +664,9 @@ Receivers may define a runtime MiniJinja 2.x `template` block. Google Chat,
 Slack, Mattermost, Discord, and Matrix support `title` and `body` in their
 standard layouts. All receiver families support a mutually exclusive `payload`
 field. It renders the complete outbound JSON object except for CloudEvents,
-where it renders only `data`; generic and CloudEvents webhooks support payload
-mode only. Legacy `title_template` remains unchanged when `template` is absent
-and cannot be combined with the new block.
+where it renders only `data`; generic, n8n, and CloudEvents webhooks support
+payload mode only. Legacy `title_template` remains unchanged when `template` is
+absent and cannot be combined with the new block.
 
 ```yaml
 receivers:

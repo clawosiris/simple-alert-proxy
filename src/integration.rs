@@ -140,6 +140,8 @@ pub enum IntegrationError {
     Grafana(#[from] grafana::GrafanaParseError),
     #[error("invalid SigNoz payload: {0}")]
     SigNoz(#[from] signoz::AlertParseError),
+    #[error("invalid n8n payload: {0}")]
+    N8n(#[from] crate::n8n::N8nError),
     #[error("missing required field {field} at {path}")]
     MissingRequired { field: &'static str, path: String },
 }

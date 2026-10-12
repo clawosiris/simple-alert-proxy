@@ -11,6 +11,7 @@ from tests.system.harness import (
     ADMIN_PASSWORD,
     INBOUND_TOKEN,
     MANAGEMENT_TOKEN,
+    N8N_TOKEN,
     ProxyProcess,
     ScriptedReceiver,
     ScriptedResponse,
@@ -71,6 +72,7 @@ class BinaryEndToEndTests(unittest.TestCase):
         environment: dict[str, str] | None = None,
         port: int | None = None,
         receiver_kind: str = "generic_webhook",
+        include_n8n: bool = False,
     ) -> ProxyProcess:
         port = port or reserve_port()
         write_config(
@@ -86,6 +88,7 @@ class BinaryEndToEndTests(unittest.TestCase):
             max_body_bytes=max_body_bytes,
             tls=tls,
             receiver_kind=receiver_kind,
+            include_n8n=include_n8n,
         )
         scheme = "https" if tls else "http"
         service = ProxyProcess(
@@ -244,6 +247,69 @@ class BinaryEndToEndTests(unittest.TestCase):
 
         self.assertEqual(service.stop(), 0)
         self.services.remove(service)
+
+    def test_n8n_bidirectional_single_and_batch_contract(self) -> None:
+        service = self.start_proxy(
+            receiver_kind="n8n_webhook",
+            include_n8n=True,
+            environment={"SYSTEM_E2E_N8N_TOKEN": N8N_TOKEN},
+        )
+        single = {
+            "status": "firing",
+            "severity": "critical",
+            "title": "Checkout error rate is high",
+            "body": "Error rate exceeded 5% for ten minutes",
+            "fingerprint": "checkout-error-rate",
+            "group_key": "checkout-production",
+            "starts_at": "2026-10-11T06:00:00Z",
+            "ends_at": None,
+            "labels": {"service": "checkout", "environment": "production"},
+            "annotations": {"runbook": "Investigate recent checkout deploys"},
+            "links": {"source": "https://n8n.example.test/executions/123"},
+        }
+        unauthorized = request(
+            service.base_url, "POST", "/webhooks/n8n", payload=single
+        )
+        self.assertEqual(unauthorized.status, 401)
+        accepted = request(
+            service.base_url,
+            "POST",
+            "/webhooks/n8n",
+            payload={
+                "events": [
+                    single,
+                    {
+                        "status": "resolved",
+                        "severity": "warning",
+                        "title": "Worker backlog recovered",
+                        "fingerprint": "worker-backlog",
+                        "labels": {"environment": "production"},
+                    },
+                ]
+            },
+            headers={"authorization": f"Bearer {INBOUND_TOKEN}"},
+        )
+        self.assertEqual(accepted.status, 202, accepted.body)
+
+        captures = self.receiver.wait_for_requests(2)
+        deliveries = self.wait_for_deliveries(service, 2, "succeeded")
+        events = self.management_json(service, "/api/alert-events")
+        self.assertEqual(len(events), 2)
+        self.assertEqual({event["source"] for event in events}, {"n8n"})
+        self.assertEqual(
+            {event["group_namespace"] for event in events}, {"integration/n8n"}
+        )
+        self.assertEqual(len(deliveries), 2)
+        for capture in captures:
+            self.assertEqual(capture["method"], "POST")
+            self.assertEqual(capture["headers"]["x-n8n-webhook-token"], "[REDACTED]")
+            self.assertEqual(
+                capture["headers"]["idempotency-key"],
+                capture["body"]["delivery"]["idempotency_key"],
+            )
+            self.assertEqual(capture["body"]["contract"], "simple-alert-proxy.n8n.v1")
+            self.assertEqual(capture["body"]["kind"], "event")
+            self.assertNotIn("raw_payload", capture["body"]["event"])
 
     def test_grouped_batch_and_pending_restart_recovery(self) -> None:
         port = reserve_port()
