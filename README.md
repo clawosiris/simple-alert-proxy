@@ -1,10 +1,10 @@
 # simple-alert-proxy
 
 `simple-alert-proxy` is a compact Rust alert webhook gateway. It accepts SigNoz,
-Grafana, CloudEvents 1.0, and generic JSON alert webhooks, normalizes them into
-canonical alert events, routes them to chat or webhook targets, persists
-delivery state in SQLite, and serves a small operator UI for inspecting and
-acting on alerts.
+Grafana, gvmd Generic Webhook v1, n8n, CloudEvents 1.0, and generic JSON alert
+webhooks, normalizes them into canonical alert events, routes them to chat or
+webhook targets, persists delivery state in SQLite, and serves a small operator
+UI for inspecting and acting on alerts.
 
 The current mainline implementation keeps the original SigNoz-to-Google-Chat
 behavior as a compatibility path while adding source-agnostic integrations,
@@ -15,6 +15,7 @@ scheduling, and optional advisory intelligence scaffolding.
 
 - SigNoz compatibility endpoint at `POST /webhooks/signoz`
 - First-class Grafana webhook endpoint support through configured integrations
+- First-class gvmd Generic Webhook v1 task and SecInfo input
 - CloudEvents 1.0 structured and binary JSON input and outbound delivery
 - Generic JSON integrations at `POST /webhooks/{integration}`
 - Config-only mapping into canonical alert events
@@ -248,6 +249,13 @@ integrations:
     path: "/webhooks/grafana"
     auth:
       bearer_token: "replace-me"
+
+  greenbone:
+    type: "builtin"
+    preset: "gvmd"
+    path: "/webhooks/gvmd"
+    auth:
+      bearer_token: "replace-me"
 ```
 
 The built-in operator UI supports local user login backed by SQLite sessions.
@@ -287,6 +295,7 @@ are:
 - `signoz`
 - `alertmanager`
 - `grafana`
+- `gvmd`
 - `n8n`
 
 Generic JSON integrations use dotted paths or JSON pointers to map payload
@@ -621,9 +630,9 @@ records. It does not call an intelligence provider or generate advisories.
 
 Built-in integrations are configured under `integrations` and keep parser logic
 for payload shapes that need source-specific handling. SigNoz,
-Alertmanager-compatible, and Grafana payloads use this path so `alerts[]`,
-common labels/annotations, rule metadata, links, and source-specific event
-cardinality keep their documented behavior.
+Alertmanager-compatible, Grafana, gvmd, and n8n payloads use this path so their
+source-specific event shapes, metadata, and cardinality keep documented
+behavior.
 
 Generic JSON integrations do not require Rust changes for simple payload shapes.
 Each integration maps fields from an incoming JSON document into the canonical
@@ -675,6 +684,35 @@ curl -X POST http://127.0.0.1:8080/webhooks/openvas-example \
   -H 'authorization: Bearer replace-me' \
   --data @examples/generic-json-webhook.json
 ```
+
+### gvmd Generic Webhook v1
+
+The built-in `gvmd` profile accepts Greenbone data contract `version: 1` at the
+JSON body root. It supports task run-status, new SecInfo, updated SecInfo, and
+SecInfo `TEST_ALERT` payloads without requiring `event.status` on SecInfo
+events. Configure gvmd to send the Generic profile with `Content-Type:
+application/json`:
+
+```yaml
+integrations:
+  greenbone:
+    type: builtin
+    preset: gvmd
+    path: /webhooks/gvmd
+    auth:
+      bearer_token: replace-me
+```
+
+```bash
+curl -X POST http://127.0.0.1:8080/webhooks/gvmd \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer replace-me' \
+  --data @examples/gvmd/webhook-generic-task.json
+```
+
+See [gvmd Generic Webhook v1](docs/GVMD.md) for the pinned upstream contract,
+normalization, identity/grouping rules, validation behavior, and all four
+tracked fixtures.
 
 ### n8n
 

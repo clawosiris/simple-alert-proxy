@@ -179,6 +179,7 @@ class ContainerEndToEndTests(unittest.TestCase):
             local_users=False,
             receiver_kind="n8n_webhook",
             include_n8n=True,
+            include_gvmd=True,
         )
         first = f"sap-http-{uuid.uuid4().hex[:8]}"
         self.start_container(
@@ -204,13 +205,39 @@ class ContainerEndToEndTests(unittest.TestCase):
             headers={"authorization": f"Bearer {INBOUND_TOKEN}"},
         )
         self.assertEqual(intake.status, 202, intake.body)
-        self.receiver.wait_for_requests(1)
+        gvmd_fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[2]
+                / "examples"
+                / "gvmd"
+                / "webhook-generic-new-secinfo.json"
+            ).read_text()
+        )
+        gvmd_intake = request(
+            base_url,
+            "POST",
+            "/webhooks/gvmd",
+            payload=gvmd_fixture,
+            headers={"authorization": f"Bearer {INBOUND_TOKEN}"},
+        )
+        self.assertEqual(gvmd_intake.status, 202, gvmd_intake.body)
+        captures = self.receiver.wait_for_requests(2)
         events = eventually(
             lambda: self.api_json(base_url, "/api/alert-events"),
-            lambda records: len(records) == 1,
-            description="container-persisted event",
+            lambda records: len(records) == 2,
+            description="container-persisted events",
         )
-        self.assertEqual(events[0]["fingerprint"], "container-http")
+        self.assertEqual({event["source"] for event in events}, {"n8n", "gvmd"})
+        self.assertTrue(
+            any(event["fingerprint"] == "container-http" for event in events)
+        )
+        self.assertTrue(
+            any(
+                capture["body"]["event"]["labels"].get("gvmd_event_kind")
+                == "secinfo_new"
+                for capture in captures
+            )
+        )
         self.stop_container(first)
 
         self.run_engine("rm", first)
@@ -223,7 +250,8 @@ class ContainerEndToEndTests(unittest.TestCase):
         )
         wait_for_container_http("127.0.0.1", host_port)
         persisted = self.api_json(base_url, "/api/alert-events")
-        self.assertEqual([event["fingerprint"] for event in persisted], ["container-http"])
+        self.assertEqual(len(persisted), 2)
+        self.assertEqual({event["source"] for event in persisted}, {"n8n", "gvmd"})
         self.stop_container(restarted)
 
         self.run_engine("rm", restarted)

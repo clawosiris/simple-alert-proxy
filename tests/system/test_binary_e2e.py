@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import unittest
@@ -73,6 +74,7 @@ class BinaryEndToEndTests(unittest.TestCase):
         port: int | None = None,
         receiver_kind: str = "generic_webhook",
         include_n8n: bool = False,
+        include_gvmd: bool = False,
     ) -> ProxyProcess:
         port = port or reserve_port()
         write_config(
@@ -89,6 +91,7 @@ class BinaryEndToEndTests(unittest.TestCase):
             tls=tls,
             receiver_kind=receiver_kind,
             include_n8n=include_n8n,
+            include_gvmd=include_gvmd,
         )
         scheme = "https" if tls else "http"
         service = ProxyProcess(
@@ -310,6 +313,76 @@ class BinaryEndToEndTests(unittest.TestCase):
             self.assertEqual(capture["body"]["contract"], "simple-alert-proxy.n8n.v1")
             self.assertEqual(capture["body"]["kind"], "event")
             self.assertNotIn("raw_payload", capture["body"]["event"])
+
+    def test_gvmd_generic_v1_task_and_secinfo_contract(self) -> None:
+        service = self.start_proxy(include_gvmd=True)
+        fixture_root = Path(__file__).resolve().parents[2] / "examples" / "gvmd"
+        task = json.loads((fixture_root / "webhook-generic-task.json").read_text())
+        secinfo = json.loads(
+            (fixture_root / "webhook-generic-new-secinfo.json").read_text()
+        )
+
+        unauthorized = request(
+            service.base_url, "POST", "/webhooks/gvmd", payload=task
+        )
+        self.assertEqual(unauthorized.status, 401)
+        wrong_media_type = request(
+            service.base_url,
+            "POST",
+            "/webhooks/gvmd",
+            body=json.dumps(task).encode(),
+            headers={
+                "authorization": f"Bearer {INBOUND_TOKEN}",
+                "content-type": "text/plain",
+            },
+        )
+        self.assertEqual(wrong_media_type.status, 415)
+
+        self.post_alert(service, "/webhooks/gvmd", task)
+        persisted_at_accept = self.management_json(service, "/api/alert-events")
+        self.assertEqual(len(persisted_at_accept), 1)
+        self.assertEqual(persisted_at_accept[0]["source"], "gvmd")
+        self.assertEqual(
+            persisted_at_accept[0]["raw_payload"]["event"]["status"], "Done"
+        )
+
+        self.post_alert(service, "/webhooks/gvmd", secinfo)
+        captures = self.receiver.wait_for_requests(2)
+        self.wait_for_deliveries(service, 2, "succeeded")
+        events = self.management_json(service, "/api/alert-events")
+        self.assertEqual(len(events), 2)
+        self.assertEqual({event["source"] for event in events}, {"gvmd"})
+        normalized = [capture["body"]["event"] for capture in captures]
+        self.assertEqual(
+            {event["labels"]["gvmd_event_kind"] for event in normalized},
+            {"task_run_status_changed", "secinfo_new"},
+        )
+        task_event = next(
+            event
+            for event in normalized
+            if event["labels"]["gvmd_event_kind"] == "task_run_status_changed"
+        )
+        self.assertEqual(task_event["status"], "firing")
+        self.assertEqual(task_event["labels"]["gvmd_task_status"], "Done")
+        secinfo_event = next(
+            event
+            for event in normalized
+            if event["labels"]["gvmd_event_kind"] == "secinfo_new"
+        )
+        self.assertEqual(secinfo_event["labels"]["gvmd_secinfo_type"], "nvt")
+        self.assertEqual(secinfo_event["labels"]["gvmd_secinfo_count"], "2")
+
+        unsupported = dict(task)
+        unsupported["version"] = 2
+        rejected = request(
+            service.base_url,
+            "POST",
+            "/webhooks/gvmd",
+            payload=unsupported,
+            headers={"authorization": f"Bearer {INBOUND_TOKEN}"},
+        )
+        self.assertEqual(rejected.status, 400)
+        self.assertIn("expected version 1", rejected.json()["error"])
 
     def test_grouped_batch_and_pending_restart_recovery(self) -> None:
         port = reserve_port()

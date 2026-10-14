@@ -37,6 +37,7 @@ mod cloudevents_outbound;
 mod config;
 mod google_chat;
 mod grafana;
+mod gvmd;
 mod integration;
 mod n8n;
 mod notification;
@@ -1154,8 +1155,14 @@ async fn handle_webhook(
                 config.auth.as_ref().or(state.config.server.auth.as_ref()),
                 &headers,
             )?;
-            let payload =
-                serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?;
+            let payload = if config.preset == "gvmd" {
+                require_json_content_type(&headers)?;
+                serde_json::from_slice::<Value>(&body).map_err(|error| {
+                    integration::IntegrationError::from(gvmd::GvmdError::malformed_json(error))
+                })?
+            } else {
+                serde_json::from_slice::<Value>(&body).map_err(signoz::AlertParseError::from)?
+            };
             if state.config.debug.log_alerts {
                 log_debug_json(
                     "incoming builtin alert",
@@ -1240,7 +1247,27 @@ fn process_builtin_alerts(
                 n8n::normalize(name, payload).map_err(integration::IntegrationError::from)?;
             process_generic_events(state, &events)
         }
+        "gvmd" => {
+            let events =
+                gvmd::normalize(name, payload).map_err(integration::IntegrationError::from)?;
+            process_generic_events(state, &events)
+        }
         _ => Err(integration::IntegrationError::Unknown(preset.to_string()).into()),
+    }
+}
+
+fn require_json_content_type(headers: &HeaderMap) -> Result<(), WebhookError> {
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if media_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        Ok(())
+    } else {
+        Err(WebhookError::UnsupportedMediaType(
+            "gvmd integrations require Content-Type application/json",
+        ))
     }
 }
 
@@ -2137,6 +2164,8 @@ enum WebhookError {
     Integration(#[from] integration::IntegrationError),
     #[error("invalid CloudEvents input: {0}")]
     CloudEvents(#[from] cloudevents::CloudEventsError),
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(&'static str),
     #[error("storage failed: {0}")]
     Storage(#[from] anyhow::Error),
     #[error("delivery failed: {0}")]
@@ -2166,6 +2195,7 @@ impl IntoResponse for WebhookError {
             WebhookError::CloudEvents(cloudevents::CloudEventsError::UnsupportedMediaType(_)) => {
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             }
+            WebhookError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             WebhookError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             WebhookError::Delivery(_) => StatusCode::BAD_GATEWAY,
         };
@@ -3417,6 +3447,173 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gvmd_builtin_authenticates_persists_routes_and_delivers_task_and_secinfo() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let webhook_url = spawn_mock_google_chat(Arc::clone(&received)).await;
+        let mut config = test_config("http://127.0.0.1:1");
+        config.management.allow_unauthenticated = true;
+        config.notification_batching.enabled = false;
+        config.integrations = BTreeMap::from([(
+            "greenbone".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "gvmd".to_string(),
+                path: "/webhooks/gvmd".to_string(),
+                auth: Some(AuthConfig {
+                    bearer_token: "gvmd-inbound-token".to_string(),
+                }),
+            }),
+        )]);
+        config.routing.routes.clear();
+        config.routing.default_receiver = Some("target".to_string());
+        config.receivers = BTreeMap::from([(
+            "target".to_string(),
+            ReceiverConfig::GenericWebhook(GenericWebhookReceiverConfig {
+                webhook_url,
+                owner_team: None,
+                timeout_secs: 10,
+                template: None,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        let request = |fixture: &'static str, token: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/webhooks/gvmd")
+                .header(header::CONTENT_TYPE, "application/json; charset=utf-8");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            builder.body(Body::from(fixture)).unwrap()
+        };
+
+        let unauthorized = app
+            .clone()
+            .oneshot(request(
+                include_str!("../examples/gvmd/webhook-generic-task.json"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let task = app
+            .clone()
+            .oneshot(request(
+                include_str!("../examples/gvmd/webhook-generic-task.json"),
+                Some("gvmd-inbound-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(task.status(), StatusCode::ACCEPTED);
+
+        let persisted_after_accept = get_api_json(app.clone(), "/api/alert-events").await;
+        assert_eq!(persisted_after_accept.as_array().unwrap().len(), 1);
+        assert_eq!(persisted_after_accept[0]["integration"], "greenbone");
+        assert_eq!(persisted_after_accept[0]["source"], "gvmd");
+        assert_eq!(persisted_after_accept[0]["status"], "firing");
+        assert_eq!(persisted_after_accept[0]["raw_payload"]["version"], 1);
+        assert_eq!(
+            persisted_after_accept[0]["raw_payload"]["event"]["status"],
+            "Done"
+        );
+        let queued_after_accept = get_api_json(app.clone(), "/api/deliveries").await;
+        assert_eq!(queued_after_accept.as_array().unwrap().len(), 1);
+
+        let secinfo = app
+            .clone()
+            .oneshot(request(
+                include_str!("../examples/gvmd/webhook-generic-new-secinfo.json"),
+                Some("gvmd-inbound-token"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(secinfo.status(), StatusCode::ACCEPTED);
+
+        wait_for_received_count(&received, 2).await;
+        wait_for_succeeded_deliveries(app.clone(), 2).await;
+        let received = received.lock().unwrap();
+        assert!(received.iter().any(|payload| {
+            payload["event"]["labels"]["gvmd_event_kind"] == "task_run_status_changed"
+                && payload["event"]["status"] == "firing"
+                && payload["event"]["labels"]["gvmd_task_status"] == "Done"
+        }));
+        assert!(received.iter().any(|payload| {
+            payload["event"]["labels"]["gvmd_event_kind"] == "secinfo_new"
+                && payload["event"]["labels"]["gvmd_secinfo_type"] == "nvt"
+                && payload["event"]["labels"]["gvmd_secinfo_count"] == "2"
+        }));
+    }
+
+    #[tokio::test]
+    async fn gvmd_builtin_rejects_wrong_media_type_version_and_event_shape() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.server.auth = None;
+        config.integrations = BTreeMap::from([(
+            "greenbone".to_string(),
+            IntegrationConfig::Builtin(BuiltinIntegrationConfig {
+                preset: "gvmd".to_string(),
+                path: "/webhooks/gvmd".to_string(),
+                auth: None,
+            }),
+        )]);
+        let app = build_app(Arc::new(config), "/webhooks/signoz".to_string()).unwrap();
+        let task: Value =
+            serde_json::from_str(include_str!("../examples/gvmd/webhook-generic-task.json"))
+                .unwrap();
+        let request = |payload: Value, content_type: Option<&str>| {
+            let mut builder = Request::builder().method("POST").uri("/webhooks/gvmd");
+            if let Some(content_type) = content_type {
+                builder = builder.header(header::CONTENT_TYPE, content_type);
+            }
+            builder.body(Body::from(payload.to_string())).unwrap()
+        };
+
+        for content_type in [None, Some("text/plain")] {
+            let response = app
+                .clone()
+                .oneshot(request(task.clone(), content_type))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+
+        let mut unsupported = task.clone();
+        unsupported["version"] = Value::from(2);
+        let unsupported = app
+            .clone()
+            .oneshot(request(unsupported, Some("application/json")))
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(unsupported.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("expected version 1")
+        );
+
+        let mut malformed = task;
+        malformed["event"]["name"] = Value::String("Ticket received".to_string());
+        let malformed = app
+            .oneshot(request(malformed, Some("application/json")))
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(malformed.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("event.name must be one of")
+        );
     }
 
     #[tokio::test]

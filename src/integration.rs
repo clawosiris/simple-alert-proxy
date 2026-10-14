@@ -142,6 +142,8 @@ pub enum IntegrationError {
     SigNoz(#[from] signoz::AlertParseError),
     #[error("invalid n8n payload: {0}")]
     N8n(#[from] crate::n8n::N8nError),
+    #[error("invalid gvmd Generic Webhook v1 payload: {0}")]
+    Gvmd(#[from] crate::gvmd::GvmdError),
     #[error("missing required field {field} at {path}")]
     MissingRequired { field: &'static str, path: String },
 }
