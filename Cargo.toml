@@ -14,7 +14,7 @@ cloudevents-sdk = { version = "0.9", features = ["http-binding", "reqwest"] }
 minijinja = { version = "2.24", default-features = false, features = ["builtins", "fuel", "json", "serde", "std_collections"] }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
